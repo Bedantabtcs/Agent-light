@@ -14,7 +14,10 @@ let package = Package(
         .target(name: "AgentLightProtocol"),
         .target(name: "AgentLightCore", dependencies: ["AgentLightProtocol"]),
         .executableTarget(name: "AgentLightApp"),
-        .executableTarget(name: "AgentLightRelay", dependencies: ["AgentLightProtocol"]),
+        .executableTarget(
+            name: "AgentLightRelay",
+            dependencies: ["AgentLightCore", "AgentLightProtocol"]
+        ),
         .testTarget(name: "AgentLightProtocolTests", dependencies: ["AgentLightProtocol"]),
         .testTarget(name: "AgentLightCoreTests", dependencies: ["AgentLightCore"])
     ],
