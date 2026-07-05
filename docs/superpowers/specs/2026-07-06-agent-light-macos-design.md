@@ -82,7 +82,7 @@ The physical bulb receives one static command per meaningful state transition. A
 
 ### 6.1 Source Mapping
 
-- **Codex:** `UserPromptSubmit` maps to Thinking; `PreToolUse` maps to Working; `PostToolUse` returns to Thinking; `PermissionRequest` maps to Needs You; `Stop` maps to Completed; reported failures map to Error; session end maps to Idle.
+- **Codex:** `UserPromptSubmit` maps to Thinking; `PreToolUse` maps to Working; `PostToolUse` returns to Thinking; `PermissionRequest` maps to Needs You; `Stop` maps to Completed; reported failures map to Error. When the terminal hold expires, the session becomes Idle because the current Codex hook surface does not expose a separate session-end event.
 - **Claude Code:** `UserPromptSubmit` maps to Thinking; `PreToolUse` maps to Working; `PostToolUse` returns to Thinking; `PermissionRequest` or `Notification.agent_needs_input` maps to Needs You; `Stop` or `Notification.agent_completed` maps to Completed; `StopFailure` maps to Error; session end maps to Idle.
 - **Cursor:** `beforeSubmitPrompt` maps to Thinking; `preToolUse` and concrete before-execution hooks map to Working; post-execution hooks return to Thinking; `stop.status` maps to Completed or Error; session end maps to Idle. Needs You is reported only when Cursor exposes an explicit waiting or approval signal. Version 1 does not infer a permission wait from process state.
 
