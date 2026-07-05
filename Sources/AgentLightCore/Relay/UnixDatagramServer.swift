@@ -5,18 +5,25 @@ public actor UnixDatagramServer {
     public typealias Handler = @Sendable (Data) async -> Void
 
     private let path: String
+    private let maximumDatagramBytes: Int
     private var descriptor: Int32?
     private var readTask: Task<Void, Never>?
+    private var socketIdentity: SocketIdentity?
 
     public init(path: String) {
         self.path = path
+        maximumDatagramBytes = 4_096
+    }
+
+    init(path: String, maximumDatagramBytes: Int) {
+        self.path = path
+        self.maximumDatagramBytes = maximumDatagramBytes
     }
 
     deinit {
         readTask?.cancel()
-        if let descriptor {
-            Darwin.shutdown(descriptor, SHUT_RDWR)
-            Darwin.unlink(path)
+        if let socketIdentity {
+            removeSocketIfOwned(path: path, identity: socketIdentity)
         }
     }
 
@@ -31,11 +38,14 @@ public actor UnixDatagramServer {
             throw UnixDatagramError.systemCall(name: "socket", code: errno)
         }
 
-        var didBind = false
+        var boundIdentity: SocketIdentity?
+        var didStart = false
         defer {
-            if !didBind {
+            if !didStart {
                 Darwin.close(socketDescriptor)
-                Darwin.unlink(path)
+                if let boundIdentity {
+                    removeSocketIfOwned(path: path, identity: boundIdentity)
+                }
             }
         }
 
@@ -53,48 +63,70 @@ public actor UnixDatagramServer {
             throw UnixDatagramError.systemCall(name: "bind", code: errno)
         }
 
+        boundIdentity = try requiredSocketIdentity(at: path)
         guard Darwin.chmod(path, S_IRUSR | S_IWUSR) == 0 else {
             throw UnixDatagramError.systemCall(name: "chmod", code: errno)
         }
 
-        didBind = true
+        didStart = true
         descriptor = socketDescriptor
+        socketIdentity = boundIdentity
+        let maximumDatagramBytes = self.maximumDatagramBytes
         readTask = Task.detached(priority: .userInitiated) {
             await Self.readDatagrams(
                 from: socketDescriptor,
+                maximumDatagramBytes: maximumDatagramBytes,
                 handler: handler
             )
         }
     }
 
-    public func stop() {
-        readTask?.cancel()
-        if let descriptor {
-            Darwin.shutdown(descriptor, SHUT_RDWR)
+    public func stop() async {
+        if let readTask {
+            readTask.cancel()
+            await readTask.value
         }
-        Darwin.unlink(path)
+        if let socketIdentity {
+            removeSocketIfOwned(path: path, identity: socketIdentity)
+        }
         descriptor = nil
         readTask = nil
+        socketIdentity = nil
     }
 
     private nonisolated static func readDatagrams(
         from descriptor: Int32,
+        maximumDatagramBytes: Int,
         handler: @escaping Handler
     ) async {
         defer {
             Darwin.close(descriptor)
         }
 
-        var buffer = [UInt8](repeating: 0, count: 4_096)
+        var buffer = [UInt8](repeating: 0, count: maximumDatagramBytes)
         while !Task.isCancelled {
-            let receivedByteCount = buffer.withUnsafeMutableBytes { bytes in
-                Darwin.recv(descriptor, bytes.baseAddress, bytes.count, 0)
+            var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+            let pollResult = Darwin.poll(&pollDescriptor, 1, 50)
+            if pollResult < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                return
+            }
+            guard pollResult > 0 else {
+                continue
+            }
+            guard pollDescriptor.revents & Int16(POLLIN) != 0 else {
+                return
             }
 
-            if receivedByteCount >= 0 {
+            switch receiveDatagram(from: descriptor, into: &buffer) {
+            case let .data(data):
                 guard !Task.isCancelled else { return }
-                await handler(Data(buffer.prefix(receivedByteCount)))
-            } else if errno != EINTR {
+                await handler(data)
+            case .retry, .truncated:
+                continue
+            case .failed:
                 return
             }
         }
@@ -173,4 +205,62 @@ private func unixDatagramAddress(for path: String) throws -> sockaddr_un {
         destination.copyBytes(from: pathBytes)
     }
     return address
+}
+
+private struct SocketIdentity: Equatable, Sendable {
+    let device: dev_t
+    let inode: ino_t
+}
+
+private enum DatagramReceiveResult {
+    case data(Data)
+    case retry
+    case truncated
+    case failed
+}
+
+private func receiveDatagram(
+    from descriptor: Int32,
+    into buffer: inout [UInt8]
+) -> DatagramReceiveResult {
+    buffer.withUnsafeMutableBytes { bytes in
+        var vector = iovec(iov_base: bytes.baseAddress, iov_len: bytes.count)
+        var message = msghdr()
+        let receivedByteCount = withUnsafeMutablePointer(to: &vector) { vectorPointer in
+            message.msg_iov = vectorPointer
+            message.msg_iovlen = 1
+            return Darwin.recvmsg(descriptor, &message, MSG_DONTWAIT)
+        }
+
+        if receivedByteCount < 0 {
+            if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR {
+                return .retry
+            }
+            return .failed
+        }
+        guard message.msg_flags & MSG_TRUNC == 0 else {
+            return .truncated
+        }
+        return .data(Data(bytes.prefix(receivedByteCount)))
+    }
+}
+
+private func requiredSocketIdentity(at path: String) throws -> SocketIdentity {
+    var fileStatus = stat()
+    guard Darwin.lstat(path, &fileStatus) == 0 else {
+        throw UnixDatagramError.systemCall(name: "lstat", code: errno)
+    }
+    return SocketIdentity(device: fileStatus.st_dev, inode: fileStatus.st_ino)
+}
+
+private func removeSocketIfOwned(path: String, identity: SocketIdentity) {
+    var fileStatus = stat()
+    guard Darwin.lstat(path, &fileStatus) == 0 else {
+        return
+    }
+    let currentIdentity = SocketIdentity(device: fileStatus.st_dev, inode: fileStatus.st_ino)
+    guard currentIdentity == identity, fileStatus.st_mode & S_IFMT == S_IFSOCK else {
+        return
+    }
+    Darwin.unlink(path)
 }

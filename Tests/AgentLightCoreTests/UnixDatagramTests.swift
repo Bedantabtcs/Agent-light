@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import AgentLightCore
@@ -63,4 +64,94 @@ final class UnixDatagramTests: XCTestCase {
         await fulfillment(of: [received], timeout: 1)
         await replacement.stop()
     }
+
+    func testStopWhileReceiveIsBlockedReleasesHandlerTask() async throws {
+        let path = temporarySocketPath()
+        let server = UnixDatagramServer(path: path)
+        weak var retainedToken: HandlerLifetimeToken?
+
+        do {
+            let token = HandlerLifetimeToken()
+            retainedToken = token
+            try await server.start { [token] _ in
+                withExtendedLifetime(token) {}
+            }
+        }
+
+        XCTAssertNotNil(retainedToken)
+        await server.stop()
+        XCTAssertNil(retainedToken)
+    }
+
+    func testRepeatedStartStopDoesNotLeakDescriptors() async throws {
+        let initialDescriptorCount = try openDescriptorCount()
+        let server = UnixDatagramServer(path: temporarySocketPath())
+
+        for _ in 0..<8 {
+            weak var retainedToken: HandlerLifetimeToken?
+            do {
+                let token = HandlerLifetimeToken()
+                retainedToken = token
+                try await server.start { [token] _ in
+                    withExtendedLifetime(token) {}
+                }
+            }
+            await server.stop()
+            XCTAssertNil(retainedToken)
+        }
+
+        XCTAssertEqual(try openDescriptorCount(), initialDescriptorCount)
+    }
+
+    func testOversizedDatagramIsRejectedWithoutDeliveringTruncatedData() async throws {
+        let path = temporarySocketPath()
+        let server = UnixDatagramServer(path: path, maximumDatagramBytes: 16)
+        let validReceived = expectation(description: "valid datagram received")
+        let truncatedReceived = expectation(description: "truncated datagram not received")
+        truncatedReceived.isInverted = true
+
+        try await server.start { data in
+            if data == Data("valid".utf8) {
+                validReceived.fulfill()
+            } else {
+                truncatedReceived.fulfill()
+            }
+        }
+
+        try UnixDatagramSender.send(Data(repeating: 0x41, count: 17), to: path)
+        try UnixDatagramSender.send(Data("valid".utf8), to: path)
+        await fulfillment(of: [validReceived, truncatedReceived], timeout: 1)
+        await server.stop()
+    }
+
+    func testStopDoesNotUnlinkSocketThatReplacedOwnedPath() async throws {
+        let path = temporarySocketPath()
+        let original = UnixDatagramServer(path: path)
+        let replacement = UnixDatagramServer(path: path)
+        let replacementReceived = expectation(description: "replacement received")
+
+        try await original.start { _ in }
+        XCTAssertEqual(Darwin.unlink(path), 0)
+        try await replacement.start { _ in
+            replacementReceived.fulfill()
+        }
+
+        await original.stop()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        try UnixDatagramSender.send(Data("replacement".utf8), to: path)
+        await fulfillment(of: [replacementReceived], timeout: 1)
+        await replacement.stop()
+    }
+
+    private func temporarySocketPath() -> String {
+        FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString + ".sock").path
+    }
+
+    private func openDescriptorCount() throws -> Int {
+        try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
+    }
 }
+
+private final class HandlerLifetimeToken: @unchecked Sendable {}
