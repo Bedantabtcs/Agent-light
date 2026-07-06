@@ -1,23 +1,17 @@
 import Darwin
+import AgentLightProtocol
 import Foundation
 
 public actor UnixDatagramServer {
     public typealias Handler = @Sendable (Data) async -> Void
 
     private let path: String
-    private let maximumDatagramBytes: Int
     private var descriptor: Int32?
     private var readTask: Task<Void, Never>?
     private var socketIdentity: SocketIdentity?
 
     public init(path: String) {
         self.path = path
-        maximumDatagramBytes = 4_096
-    }
-
-    init(path: String, maximumDatagramBytes: Int) {
-        self.path = path
-        self.maximumDatagramBytes = maximumDatagramBytes
     }
 
     deinit {
@@ -71,7 +65,7 @@ public actor UnixDatagramServer {
         didStart = true
         descriptor = socketDescriptor
         socketIdentity = boundIdentity
-        let maximumDatagramBytes = self.maximumDatagramBytes
+        let maximumDatagramBytes = RelayEnvelope.maximumEncodedBytes
         readTask = Task.detached(priority: .userInitiated) {
             await Self.readDatagrams(
                 from: socketDescriptor,

@@ -1,4 +1,5 @@
 import Darwin
+import AgentLightProtocol
 import Foundation
 import XCTest
 @testable import AgentLightCore
@@ -103,24 +104,48 @@ final class UnixDatagramTests: XCTestCase {
         XCTAssertEqual(try openDescriptorCount(), initialDescriptorCount)
     }
 
-    func testOversizedDatagramIsRejectedWithoutDeliveringTruncatedData() async throws {
+    func testPlatformBoundaryDeliversMaximumRelayDatagram() async throws {
         let path = temporarySocketPath()
-        let server = UnixDatagramServer(path: path, maximumDatagramBytes: 16)
-        let validReceived = expectation(description: "valid datagram received")
-        let truncatedReceived = expectation(description: "truncated datagram not received")
-        truncatedReceived.isInverted = true
+        let server = UnixDatagramServer(path: path)
+        let received = expectation(description: "maximum datagram received")
+        let payload = Data(repeating: 0x41, count: RelayEnvelope.maximumEncodedBytes)
 
         try await server.start { data in
-            if data == Data("valid".utf8) {
-                validReceived.fulfill()
-            } else {
-                truncatedReceived.fulfill()
-            }
+            XCTAssertEqual(data, payload)
+            received.fulfill()
         }
 
-        try UnixDatagramSender.send(Data(repeating: 0x41, count: 17), to: path)
-        try UnixDatagramSender.send(Data("valid".utf8), to: path)
-        await fulfillment(of: [validReceived, truncatedReceived], timeout: 1)
+        XCTAssertEqual(RelayEnvelope.maximumEncodedBytes, 2_048)
+        try UnixDatagramSender.send(payload, to: path)
+        await fulfillment(of: [received], timeout: 1)
+        await server.stop()
+    }
+
+    func testPayloadAbovePlatformBoundaryIsNotDelivered() async throws {
+        let path = temporarySocketPath()
+        let server = UnixDatagramServer(path: path)
+        let oversizedReceived = expectation(description: "oversized datagram not received")
+        oversizedReceived.isInverted = true
+
+        try await server.start { _ in
+            oversizedReceived.fulfill()
+        }
+
+        let payload = Data(repeating: 0x41, count: RelayEnvelope.maximumEncodedBytes + 1)
+        do {
+            try UnixDatagramSender.send(payload, to: path)
+        } catch let error as UnixDatagramError {
+            guard case let .systemCall(name, code) = error else {
+                XCTFail("Unexpected transport error: \(error)")
+                await server.stop()
+                return
+            }
+            XCTAssertEqual(name, "sendto")
+            XCTAssertEqual(code, EMSGSIZE)
+        } catch {
+            XCTFail("Unexpected transport error: \(error)")
+        }
+        await fulfillment(of: [oversizedReceived], timeout: 1)
         await server.stop()
     }
 

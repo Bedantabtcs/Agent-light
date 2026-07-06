@@ -43,7 +43,8 @@ final class RelayEncodingTests: XCTestCase {
         )
         XCTAssertNil(object["prompt"])
         XCTAssertNil(object["token"])
-        XCTAssertLessThanOrEqual(encoded.count, 4_096)
+        XCTAssertEqual(RelayEnvelope.maximumEncodedBytes, 2_048)
+        XCTAssertLessThanOrEqual(encoded.count, RelayEnvelope.maximumEncodedBytes)
     }
 
     func testSanitizerUsesArgumentSessionWhenInputHasNoSession() throws {

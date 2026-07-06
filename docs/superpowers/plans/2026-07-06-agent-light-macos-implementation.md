@@ -640,7 +640,7 @@ public enum UnixDatagramSender {
 }
 ~~~
 
-Use Darwin socket(AF_UNIX, SOCK_DGRAM, 0), unlink only the configured socket path, bind with mode 0600, read datagrams into a 4096-byte buffer, and close the descriptor on every exit path. Reject paths that do not fit sockaddr_un.sun_path. The server read loop must run in one owned Task and invoke the Sendable handler for each received datagram.
+Use Darwin socket(AF_UNIX, SOCK_DGRAM, 0), unlink only the configured socket path, bind with mode 0600, read datagrams into a 2048-byte buffer, and close the descriptor on every exit path. Reject paths that do not fit sockaddr_un.sun_path. The server read loop must run in one owned Task and invoke the Sendable handler for each received datagram.
 
 ~~~swift
 // Sources/AgentLightRelay/RelayInputSanitizer.swift
@@ -705,7 +705,7 @@ struct RelayArguments {
 enum RelayInputError: Error { case inputTooLarge, missingSession, invalidArguments }
 ~~~
 
-RelayMain must read at most 1 MiB plus one byte, encode only RelayEnvelope, reject encoded envelopes above 4096 bytes, attempt one local send, and exit EXIT_SUCCESS for success and every error. It must never print hook input or errors.
+RelayMain must read at most 1 MiB plus one byte, encode only RelayEnvelope, reject encoded envelopes above 2048 bytes, attempt one local send, and exit EXIT_SUCCESS for success and every error. It must never print hook input or errors.
 
 - [ ] **Step 4: Verify transport and relay builds**
 

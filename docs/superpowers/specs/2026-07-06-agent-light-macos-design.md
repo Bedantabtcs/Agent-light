@@ -126,7 +126,7 @@ Each module exposes a protocol suitable for deterministic unit tests. UI code de
 - Agent configs invoke the relay with the event source and event name; event JSON is read from standard input.
 - The relay allowlists fields, rejects oversized or malformed payloads, and connects only to the user-owned Unix socket.
 - The socket and its parent directory use user-only permissions.
-- The relay accepts at most 1 MiB of raw hook input and emits a normalized envelope no larger than 4 KiB.
+- The relay accepts at most 1 MiB of raw hook input and emits a normalized envelope no larger than 2 KiB.
 - The relay uses a 100 ms connection timeout and a 200 ms total delivery timeout, then exits with status 0 whether delivery succeeds or fails.
 - No TCP listener, privileged helper, kernel extension, or long-running daemon is required in version 1.
 

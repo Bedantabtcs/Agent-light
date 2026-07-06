@@ -13,7 +13,7 @@ enum RelayMain {
                 nowMilliseconds: Int64(Date().timeIntervalSince1970 * 1_000)
             )
             let encodedEnvelope = try JSONEncoder().encode(envelope)
-            guard encodedEnvelope.count <= 4_096 else {
+            guard encodedEnvelope.count <= RelayEnvelope.maximumEncodedBytes else {
                 exit(EXIT_SUCCESS)
             }
             try UnixDatagramSender.send(encodedEnvelope, to: AppIdentity.socketPath)

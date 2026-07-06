@@ -1,6 +1,8 @@
 import Foundation
 
 public struct RelayEnvelope: Codable, Equatable, Sendable {
+    public static let maximumEncodedBytes = 2_048
+
     public let version: Int
     public let integrationID: String
     public let source: AgentSource
