@@ -29,8 +29,11 @@ public enum IntegrationError: Error, Equatable {
     case eventMustBeArray(String)
     case unsupportedCursorVersion
     case unsafeDestination(String)
+    case destinationChanged(String)
     case fileOperation(String)
     case verificationFailed(String)
+    case committedWithCleanupFailure([String])
+    case rollbackFailed([String])
 }
 
 public struct IntegrationConfigEditor: Sendable {
@@ -180,6 +183,9 @@ public struct IntegrationConfigEditor: Sendable {
             if !filtered.isEmpty {
                 group["hooks"] = .array(filtered)
                 result.append(.object(group))
+            } else if Set(group.keys) != ["hooks"] {
+                group["hooks"] = .array([])
+                result.append(.object(group))
             }
         }
         return (result, removedAny)
@@ -236,9 +242,205 @@ public struct IntegrationConfigurationPaths: Equatable, Sendable {
     }
 }
 
+struct IntegrationFileIdentity: Equatable, Sendable {
+    let device: UInt64
+    let inode: UInt64
+    let size: Int64
+    let mode: mode_t
+    let modifiedSeconds: Int
+    let modifiedNanoseconds: Int
+    let changedSeconds: Int
+    let changedNanoseconds: Int
+}
+
+struct IntegrationFileRecord: Equatable, Sendable {
+    let data: Data
+    let identity: IntegrationFileIdentity
+
+    var mode: mode_t { identity.mode & mode_t(0o7777) }
+}
+
+enum IntegrationFileSnapshot: Equatable, Sendable {
+    case missing
+    case file(IntegrationFileRecord)
+
+    var data: Data {
+        switch self {
+        case .missing: Data()
+        case let .file(record): record.data
+        }
+    }
+
+    func matchesDisplacedVersion(of expected: IntegrationFileSnapshot) -> Bool {
+        switch (self, expected) {
+        case (.missing, .missing):
+            true
+        case let (.file(actual), .file(expected)):
+            actual.data == expected.data
+                && actual.identity.device == expected.identity.device
+                && actual.identity.inode == expected.identity.inode
+                && actual.identity.size == expected.identity.size
+                && actual.identity.mode == expected.identity.mode
+                && actual.identity.modifiedSeconds == expected.identity.modifiedSeconds
+                && actual.identity.modifiedNanoseconds == expected.identity.modifiedNanoseconds
+        default:
+            false
+        }
+    }
+}
+
+protocol IntegrationFileOperating: Sendable {
+    func snapshot(at url: URL) throws -> IntegrationFileSnapshot
+    func createDirectory(at url: URL) throws
+    func writeProtected(_ data: Data, to url: URL) throws
+    func replace(
+        from source: URL,
+        to destination: URL,
+        expecting snapshot: IntegrationFileSnapshot
+    ) throws
+    func remove(at url: URL) throws
+    func setMode(_ mode: mode_t, at url: URL) throws
+    func syncDirectory(at url: URL) throws
+}
+
+struct POSIXIntegrationFileOperations: IntegrationFileOperating {
+    func snapshot(at url: URL) throws -> IntegrationFileSnapshot {
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        if descriptor < 0 {
+            if errno == ENOENT { return .missing }
+            if errno == ELOOP { throw IntegrationError.unsafeDestination(url.path) }
+            throw posixError("open configuration snapshot")
+        }
+        defer { _ = close(descriptor) }
+
+        let before = try metadata(for: descriptor, path: url.path)
+        guard before.mode & S_IFMT == S_IFREG else {
+            throw IntegrationError.unsafeDestination(url.path)
+        }
+        let data = try readAll(from: descriptor)
+        let after = try metadata(for: descriptor, path: url.path)
+        guard before == after else { throw IntegrationError.destinationChanged(url.path) }
+        return .file(IntegrationFileRecord(data: data, identity: before))
+    }
+
+    func createDirectory(at url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    }
+
+    func writeProtected(_ data: Data, to url: URL) throws {
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
+        guard descriptor >= 0 else { throw posixError("create protected temporary file") }
+        var closeNeeded = true
+        defer {
+            if closeNeeded { _ = close(descriptor) }
+        }
+
+        try data.withUnsafeBytes { rawBuffer in
+            var offset = 0
+            while offset < rawBuffer.count {
+                let address = rawBuffer.baseAddress?.advanced(by: offset)
+                let written = Darwin.write(descriptor, address, rawBuffer.count - offset)
+                guard written > 0 else { throw posixError("write protected temporary file") }
+                offset += written
+            }
+        }
+        guard fsync(descriptor) == 0 else { throw posixError("fsync protected temporary file") }
+        guard close(descriptor) == 0 else { throw posixError("close protected temporary file") }
+        closeNeeded = false
+    }
+
+    func replace(
+        from source: URL,
+        to destination: URL,
+        expecting snapshot: IntegrationFileSnapshot
+    ) throws {
+        switch snapshot {
+        case .missing:
+            guard renamex_np(source.path, destination.path, UInt32(RENAME_EXCL)) == 0 else {
+                if errno == EEXIST || errno == ENOTEMPTY {
+                    throw IntegrationError.destinationChanged(destination.path)
+                }
+                throw posixError("create configuration atomically")
+            }
+        case .file:
+            guard renamex_np(source.path, destination.path, UInt32(RENAME_SWAP)) == 0 else {
+                if errno == ENOENT { throw IntegrationError.destinationChanged(destination.path) }
+                throw posixError("exchange configuration atomically")
+            }
+            do {
+                guard try self.snapshot(at: source).matchesDisplacedVersion(of: snapshot) else {
+                    throw IntegrationError.destinationChanged(destination.path)
+                }
+            } catch {
+                let comparisonError = error
+                guard renamex_np(source.path, destination.path, UInt32(RENAME_SWAP)) == 0 else {
+                    throw IntegrationError.rollbackFailed([
+                        "atomic exchange comparison: \(comparisonError)",
+                        "atomic exchange restoration: \(posixError("restore exchanged configuration"))"
+                    ])
+                }
+                throw comparisonError
+            }
+        }
+    }
+
+    func remove(at url: URL) throws {
+        if unlink(url.path) != 0, errno != ENOENT {
+            throw posixError("remove configuration artifact")
+        }
+    }
+
+    func setMode(_ mode: mode_t, at url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw posixError("open configuration for mode change") }
+        defer { _ = close(descriptor) }
+        guard fchmod(descriptor, mode) == 0 else { throw posixError("change configuration mode") }
+        guard fsync(descriptor) == 0 else { throw posixError("fsync configuration mode") }
+    }
+
+    func syncDirectory(at url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard descriptor >= 0 else { throw posixError("open configuration directory") }
+        defer { _ = close(descriptor) }
+        guard fsync(descriptor) == 0 else { throw posixError("fsync configuration directory") }
+    }
+
+    private func metadata(for descriptor: Int32, path: String) throws -> IntegrationFileIdentity {
+        var value = stat()
+        guard fstat(descriptor, &value) == 0 else { throw posixError("fstat \(path)") }
+        return IntegrationFileIdentity(
+            device: UInt64(value.st_dev),
+            inode: UInt64(value.st_ino),
+            size: value.st_size,
+            mode: value.st_mode,
+            modifiedSeconds: value.st_mtimespec.tv_sec,
+            modifiedNanoseconds: value.st_mtimespec.tv_nsec,
+            changedSeconds: value.st_ctimespec.tv_sec,
+            changedNanoseconds: value.st_ctimespec.tv_nsec
+        )
+    }
+
+    private func readAll(from descriptor: Int32) throws -> Data {
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { rawBuffer in
+                Darwin.read(descriptor, rawBuffer.baseAddress, rawBuffer.count)
+            }
+            if count == 0 { return result }
+            guard count > 0 else {
+                if errno == EINTR { continue }
+                throw posixError("read configuration snapshot")
+            }
+            result.append(contentsOf: buffer.prefix(count))
+        }
+    }
+}
+
 public struct IntegrationInstaller: IntegrationInstalling {
     public let relayPath: String
     public let paths: IntegrationConfigurationPaths
+    private let fileOperations: any IntegrationFileOperating
 
     public init(
         relayPath: String,
@@ -246,6 +448,17 @@ public struct IntegrationInstaller: IntegrationInstalling {
     ) {
         self.relayPath = relayPath
         self.paths = paths
+        fileOperations = POSIXIntegrationFileOperations()
+    }
+
+    init(
+        relayPath: String,
+        paths: IntegrationConfigurationPaths,
+        fileOperations: any IntegrationFileOperating
+    ) {
+        self.relayPath = relayPath
+        self.paths = paths
+        self.fileOperations = fileOperations
     }
 
     public init(relayPath: String, homeDirectory: URL) {
@@ -254,7 +467,7 @@ public struct IntegrationInstaller: IntegrationInstalling {
 
     public func preview() async throws -> [IntegrationPreview] {
         try paths.all.map { configuration in
-            let before = try existingData(at: configuration.url)
+            let before = try fileOperations.snapshot(at: configuration.url).data
             let after = try IntegrationConfigEditor(
                 source: configuration.source,
                 relayPath: relayPath
@@ -269,51 +482,38 @@ public struct IntegrationInstaller: IntegrationInstalling {
     }
 
     public func install() async throws {
-        try apply { editor, data in try editor.install(into: data) }
+        try apply(includeMissing: true) { editor, data in try editor.install(into: data) }
     }
 
     public func repair() async throws {
-        try apply { editor, data in try editor.install(into: data) }
+        try apply(includeMissing: true) { editor, data in try editor.install(into: data) }
     }
 
     public func uninstall() async throws {
-        let existingConfigurations = paths.all.filter {
-            FileManager.default.fileExists(atPath: $0.url.path)
-        }
-        try apply(configurations: existingConfigurations) { editor, data in
-            try editor.uninstall(from: data)
-        }
+        try apply(includeMissing: false) { editor, data in try editor.uninstall(from: data) }
     }
 
     private func apply(
-        configurations: [IntegrationConfiguration]? = nil,
+        includeMissing: Bool,
         transform: (IntegrationConfigEditor, Data) throws -> Data
     ) throws {
-        let selected = configurations ?? paths.all
-        let changes = try selected.map { configuration in
-            let before = try existingData(at: configuration.url)
+        let changes = try paths.all.compactMap { configuration -> AtomicConfigurationChange? in
+            let before = try fileOperations.snapshot(at: configuration.url)
+            if !includeMissing, before == .missing { return nil }
             let editor = IntegrationConfigEditor(source: configuration.source, relayPath: relayPath)
             return AtomicConfigurationChange(
                 destination: configuration.url,
                 before: before,
-                destinationExisted: FileManager.default.fileExists(atPath: configuration.url.path),
-                after: try transform(editor, before)
+                after: try transform(editor, before.data)
             )
         }
-        try AtomicConfigurationWriter().apply(changes)
-    }
-
-    private func existingData(at url: URL) throws -> Data {
-        guard FileManager.default.fileExists(atPath: url.path) else { return Data() }
-        try validateRegularFile(at: url)
-        return try Data(contentsOf: url, options: [.mappedIfSafe])
+        try AtomicConfigurationWriter(fileOperations: fileOperations).apply(changes)
     }
 }
 
 private struct AtomicConfigurationChange {
     let destination: URL
-    let before: Data
-    let destinationExisted: Bool
+    let before: IntegrationFileSnapshot
     let after: Data
 }
 
@@ -321,153 +521,202 @@ private struct PreparedConfigurationChange {
     let change: AtomicConfigurationChange
     let staged: URL
     let rollback: URL?
-    let originalMode: mode_t?
 }
 
 private struct AtomicConfigurationWriter {
+    let fileOperations: any IntegrationFileOperating
+
     func apply(_ changes: [AtomicConfigurationChange]) throws {
         var prepared: [PreparedConfigurationChange] = []
-        var committedCount = 0
+        var renamedCount = 0
 
         do {
             for change in changes {
                 prepared.append(try prepare(change))
             }
             for item in prepared {
-                guard rename(item.staged.path, item.change.destination.path) == 0 else {
-                    throw posixError("rename staged configuration")
+                try verifyUnchanged(item.change.before, at: item.change.destination)
+                try fileOperations.replace(
+                    from: item.staged,
+                    to: item.change.destination,
+                    expecting: item.change.before
+                )
+                renamedCount += 1
+                if case .file = item.change.before {
+                    try fileOperations.setMode(0o600, at: item.staged)
                 }
-                committedCount += 1
-                try syncDirectory(item.change.destination.deletingLastPathComponent())
-                try verify(item.change.after, at: item.change.destination)
-            }
-            for item in prepared {
-                if let rollback = item.rollback {
-                    try removeIfPresent(rollback)
-                }
+                try fileOperations.syncDirectory(at: item.change.destination.deletingLastPathComponent())
+                try verify(item.change.after, mode: 0o600, at: item.change.destination)
             }
         } catch {
-            for item in prepared.prefix(committedCount).reversed() {
-                try? restore(item)
-            }
-            for item in prepared {
-                try? removeIfPresent(item.staged)
-                if let rollback = item.rollback {
-                    try? removeIfPresent(rollback)
-                }
-            }
-            throw error
+            let failures = rollback(
+                prepared: prepared,
+                renamedCount: renamedCount,
+                originalError: error
+            )
+            if failures.isEmpty { throw error }
+            throw IntegrationError.rollbackFailed(failures)
+        }
+
+        let cleanupFailures = cleanupCommittedArtifacts(prepared)
+        if !cleanupFailures.isEmpty {
+            throw IntegrationError.committedWithCleanupFailure(cleanupFailures)
         }
     }
 
     private func prepare(_ change: AtomicConfigurationChange) throws -> PreparedConfigurationChange {
         let directory = change.destination.deletingLastPathComponent()
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        if change.destinationExisted {
-            try validateRegularFile(at: change.destination)
-        }
-
+        try fileOperations.createDirectory(at: directory)
         let nonce = UUID().uuidString
         let base = change.destination.lastPathComponent
         let staged = directory.appending(path: ".\(base).agent-light-staged-\(nonce)")
-        let rollback = change.destinationExisted
-            ? directory.appending(path: ".\(base).agent-light-rollback-\(nonce)")
-            : nil
-        let originalMode = change.destinationExisted ? try fileMode(at: change.destination) : nil
+        let rollback: URL?
+        switch change.before {
+        case .missing:
+            rollback = nil
+        case .file:
+            rollback = directory.appending(path: ".\(base).agent-light-rollback-\(nonce)")
+        }
 
         do {
-            try writeProtected(change.after, to: staged)
-            try verify(change.after, at: staged)
+            try fileOperations.writeProtected(change.after, to: staged)
+            try verify(change.after, mode: 0o600, at: staged)
             if let rollback {
-                try writeProtected(change.before, to: rollback)
-                try verify(change.before, at: rollback)
+                try fileOperations.writeProtected(change.before.data, to: rollback)
+                try verify(change.before.data, mode: 0o600, at: rollback)
             }
-            return PreparedConfigurationChange(
-                change: change,
-                staged: staged,
-                rollback: rollback,
-                originalMode: originalMode
-            )
+            return PreparedConfigurationChange(change: change, staged: staged, rollback: rollback)
         } catch {
-            try? removeIfPresent(staged)
-            if let rollback { try? removeIfPresent(rollback) }
+            var failures = ["original: \(error)"]
+            failures.append(contentsOf: cleanupArtifacts([staged, rollback].compactMap { $0 }))
+            if failures.count > 1 { throw IntegrationError.rollbackFailed(failures) }
             throw error
         }
     }
 
-    private func restore(_ item: PreparedConfigurationChange) throws {
-        if let rollback = item.rollback {
-            guard rename(rollback.path, item.change.destination.path) == 0 else {
-                throw posixError("restore configuration")
-            }
-            if let originalMode = item.originalMode,
-               chmod(item.change.destination.path, originalMode) != 0 {
-                throw posixError("restore configuration mode")
-            }
-        } else if unlink(item.change.destination.path) != 0, errno != ENOENT {
-            throw posixError("remove new configuration during rollback")
-        }
-        try syncDirectory(item.change.destination.deletingLastPathComponent())
+    private func verifyUnchanged(_ expected: IntegrationFileSnapshot, at url: URL) throws {
+        let current = try fileOperations.snapshot(at: url)
+        guard current == expected else { throw IntegrationError.destinationChanged(url.path) }
     }
 
-    private func verify(_ expectedData: Data, at url: URL) throws {
-        try validateRegularFile(at: url)
-        let actualData = try Data(contentsOf: url, options: [.mappedIfSafe])
+    private func verify(_ expectedData: Data, mode: mode_t, at url: URL) throws {
+        guard case let .file(record) = try fileOperations.snapshot(at: url) else {
+            throw IntegrationError.verificationFailed(url.path)
+        }
         guard
-            try JSONValue.decode(actualData) == JSONValue.decode(expectedData),
-            try fileMode(at: url) & mode_t(0o777) == mode_t(0o600)
+            record.data == expectedData,
+            record.mode & mode_t(0o777) == mode,
+            try JSONValue.decode(record.data) == JSONValue.decode(expectedData)
         else {
             throw IntegrationError.verificationFailed(url.path)
         }
     }
-}
 
-private func validateRegularFile(at url: URL) throws {
-    var metadata = stat()
-    guard lstat(url.path, &metadata) == 0 else { throw posixError("inspect \(url.path)") }
-    guard metadata.st_mode & S_IFMT == S_IFREG else {
-        throw IntegrationError.unsafeDestination(url.path)
+    private func rollback(
+        prepared: [PreparedConfigurationChange],
+        renamedCount: Int,
+        originalError: Error
+    ) -> [String] {
+        var failures: [String] = []
+        var failedRestorationArtifacts: Set<URL> = []
+
+        for item in prepared.prefix(renamedCount).reversed() {
+            do {
+                try restore(item)
+            } catch {
+                failures.append("restore \(item.change.destination.path): \(error)")
+                if let rollback = item.rollback {
+                    failedRestorationArtifacts.insert(rollback)
+                }
+            }
+        }
+
+        var removable: [URL] = []
+        for item in prepared {
+            removable.append(item.staged)
+            if let rollback = item.rollback, !failedRestorationArtifacts.contains(rollback) {
+                removable.append(rollback)
+            }
+        }
+        failures.append(contentsOf: cleanupArtifacts(removable))
+        if !failures.isEmpty {
+            failures.insert("original: \(originalError)", at: 0)
+        }
+        return failures
     }
-}
 
-private func fileMode(at url: URL) throws -> mode_t {
-    var metadata = stat()
-    guard lstat(url.path, &metadata) == 0 else { throw posixError("inspect mode for \(url.path)") }
-    return metadata.st_mode & mode_t(0o7777)
-}
-
-private func writeProtected(_ data: Data, to url: URL) throws {
-    let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode_t(0o600))
-    guard descriptor >= 0 else { throw posixError("create protected temporary file") }
-    var closeNeeded = true
-    defer {
-        if closeNeeded { _ = close(descriptor) }
+    private func restore(_ item: PreparedConfigurationChange) throws {
+        let installedSnapshot = try fileOperations.snapshot(at: item.change.destination)
+        try verifySnapshot(
+            installedSnapshot,
+            expectedData: item.change.after,
+            mode: 0o600,
+            path: item.change.destination.path
+        )
+        switch item.change.before {
+        case .missing:
+            try fileOperations.remove(at: item.change.destination)
+        case let .file(record):
+            guard let rollback = item.rollback else {
+                throw IntegrationError.verificationFailed("missing rollback for \(item.change.destination.path)")
+            }
+            try fileOperations.replace(
+                from: rollback,
+                to: item.change.destination,
+                expecting: installedSnapshot
+            )
+            try fileOperations.setMode(record.mode, at: item.change.destination)
+            guard case let .file(restored) = try fileOperations.snapshot(at: item.change.destination),
+                  restored.data == record.data,
+                  restored.mode == record.mode
+            else {
+                throw IntegrationError.verificationFailed("restore \(item.change.destination.path)")
+            }
+        }
+        try fileOperations.syncDirectory(at: item.change.destination.deletingLastPathComponent())
     }
 
-    try data.withUnsafeBytes { rawBuffer in
-        var offset = 0
-        while offset < rawBuffer.count {
-            let baseAddress = rawBuffer.baseAddress?.advanced(by: offset)
-            let written = Darwin.write(descriptor, baseAddress, rawBuffer.count - offset)
-            guard written > 0 else { throw posixError("write protected temporary file") }
-            offset += written
+    private func verifySnapshot(
+        _ snapshot: IntegrationFileSnapshot,
+        expectedData: Data,
+        mode: mode_t,
+        path: String
+    ) throws {
+        guard case let .file(record) = snapshot else {
+            throw IntegrationError.verificationFailed(path)
+        }
+        guard
+            record.data == expectedData,
+            record.mode & mode_t(0o777) == mode,
+            try JSONValue.decode(record.data) == JSONValue.decode(expectedData)
+        else {
+            throw IntegrationError.verificationFailed(path)
         }
     }
-    guard fsync(descriptor) == 0 else { throw posixError("fsync protected temporary file") }
-    guard close(descriptor) == 0 else { throw posixError("close protected temporary file") }
-    closeNeeded = false
-}
 
-private func syncDirectory(_ url: URL) throws {
-    let descriptor = open(url.path, O_RDONLY | O_DIRECTORY)
-    guard descriptor >= 0 else { throw posixError("open configuration directory") }
-    defer { _ = close(descriptor) }
-    guard fsync(descriptor) == 0 else { throw posixError("fsync configuration directory") }
-}
+    private func cleanupCommittedArtifacts(_ prepared: [PreparedConfigurationChange]) -> [String] {
+        cleanupArtifacts(prepared.flatMap { [$0.staged, $0.rollback].compactMap { $0 } })
+    }
 
-private func removeIfPresent(_ url: URL) throws {
-    if unlink(url.path) != 0, errno != ENOENT {
-        throw posixError("remove temporary configuration")
+    private func cleanupArtifacts(_ artifacts: [URL]) -> [String] {
+        var failures: [String] = []
+        var changedDirectories: Set<URL> = []
+        for artifact in artifacts {
+            do {
+                try fileOperations.remove(at: artifact)
+                changedDirectories.insert(artifact.deletingLastPathComponent())
+            } catch {
+                failures.append("remove \(artifact.path): \(error)")
+            }
+        }
+        for directory in changedDirectories {
+            do {
+                try fileOperations.syncDirectory(at: directory)
+            } catch {
+                failures.append("sync \(directory.path): \(error)")
+            }
+        }
+        return failures
     }
 }
 

@@ -18,6 +18,33 @@ final class IntegrationInstallerTests: XCTestCase {
         )
     }
 
+    func testJSONNumbersPreserveExactLargeIntegerFractionAndExponentLexemes() throws {
+        let largeInteger = "12345678901234567890123456789012345678901234567890"
+        let fraction = "-0.0012300"
+        let exponent = "6.02214076e+23"
+        let original = Data(
+            "{\"large\":\(largeInteger),\"fraction\":\(fraction),\"exponent\":\(exponent)}".utf8
+        )
+
+        let encoded = try JSONValue.decode(original).encodedString()
+
+        XCTAssertTrue(encoded.contains(largeInteger))
+        XCTAssertTrue(encoded.contains(fraction))
+        XCTAssertTrue(encoded.contains(exponent))
+        XCTAssertEqual(try JSONValue.decode(Data(encoded.utf8)), try JSONValue.decode(original))
+    }
+
+    func testEquivalentJSONNumberLexemesCompareSemanticallyWithoutChangingEncoding() throws {
+        let integer = try JSONValue.decode(Data("1".utf8))
+        let fraction = try JSONValue.decode(Data("1.00".utf8))
+        let exponent = try JSONValue.decode(Data("10e-1".utf8))
+
+        XCTAssertEqual(integer, fraction)
+        XCTAssertEqual(integer, exponent)
+        XCTAssertEqual(try fraction.encodedString(), "1.00")
+        XCTAssertEqual(try exponent.encodedString(), "10e-1")
+    }
+
     func testSourceSpecificSchemasContainOnlyDocumentedEvents() throws {
         let expectedEvents: [AgentSource: Set<String>] = [
             .codex: ["UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop"],
@@ -85,6 +112,18 @@ final class IntegrationInstallerTests: XCTestCase {
         )
     }
 
+    func testRemovingLastOwnedHandlerPreservesGroupWithUnrelatedFields() throws {
+        let marker = AppIdentity.integrationIdentifier
+        let original = Data(#"{"hooks":{"Stop":[{"matcher":"custom","hooks":[{"type":"command","command":"relay --integration-id \#(marker) --source codex --event Stop"}]}]}}"#.utf8)
+        let expected = Data(#"{"hooks":{"Stop":[{"matcher":"custom","hooks":[]}]}}"#.utf8)
+        let editor = IntegrationConfigEditor(source: .codex, relayPath: "/tmp/AgentLightRelay")
+
+        XCTAssertEqual(
+            try JSONValue.decode(editor.uninstall(from: original)),
+            try JSONValue.decode(expected)
+        )
+    }
+
     func testInstallerPreviewDoesNotWriteAndInstallRepairUninstallAreAtomicAndPrivate() async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
@@ -131,6 +170,280 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
     }
 
+    func testStagingFailureLeavesDestinationUnchangedAndCleansArtifacts() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let original = Data(#"{"original":true}"#.utf8)
+        try write(original, to: paths.codex, mode: 0o640)
+        let operations = FaultInjectingFileOperations(failFirstStagedWriteAfterSuccess: true)
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.install())
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), original)
+        XCTAssertEqual(try mode(at: paths.codex), mode_t(0o640))
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testConcurrentModificationBeforeRenameIsNotOverwritten() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        try write(Data(#"{"original":true}"#.utf8), to: paths.codex)
+        let concurrent = Data(#"{"concurrent":true}"#.utf8)
+        let operations = FaultInjectingFileOperations(
+            mutation: .replaceFile(url: paths.codex, data: concurrent)
+        )
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        do {
+            try await installer.install()
+            XCTFail("Expected concurrent modification to abort installation")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, .destinationChanged(paths.codex.path))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), concurrent)
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testFileCreatedAfterMissingSnapshotIsNotOverwritten() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let concurrent = Data(#"{"created-concurrently":true}"#.utf8)
+        let operations = FaultInjectingFileOperations(
+            mutation: .replaceFile(url: paths.codex, data: concurrent)
+        )
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.install())
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), concurrent)
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testInPlaceModificationBeforeRenameIsNotOverwritten() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        try write(Data(#"{"original":true}"#.utf8), to: paths.codex)
+        let concurrent = Data(#"{"modified-in-place":true}"#.utf8)
+        let operations = FaultInjectingFileOperations(
+            mutation: .modifyFileInPlace(url: paths.codex, data: concurrent)
+        )
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.install())
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), concurrent)
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testReplacementAfterPreRenameCheckIsAtomicallyRejected() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        try write(Data(#"{"original":true}"#.utf8), to: paths.codex)
+        let concurrent = Data(#"{"last-moment-replacement":true}"#.utf8)
+        let operations = FaultInjectingFileOperations(
+            mutationBeforeRename: .replaceFile(url: paths.codex, data: concurrent)
+        )
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.install())
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), concurrent)
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testCreationAfterMissingPreRenameCheckIsAtomicallyRejected() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let concurrent = Data(#"{"last-moment-creation":true}"#.utf8)
+        let operations = FaultInjectingFileOperations(
+            mutationBeforeRename: .replaceFile(url: paths.codex, data: concurrent)
+        )
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.install())
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), concurrent)
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testSymlinkSubstitutionBeforeRenameIsNotOverwritten() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        try write(Data(#"{"original":true}"#.utf8), to: paths.codex)
+        let victim = root.appending(path: "victim.json")
+        let victimData = Data(#"{"victim":true}"#.utf8)
+        try victimData.write(to: victim)
+        let operations = FaultInjectingFileOperations(
+            mutation: .replaceWithSymlink(url: paths.codex, destination: victim)
+        )
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.install())
+
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: paths.codex.path), victim.path)
+        XCTAssertEqual(try Data(contentsOf: victim), victimData)
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testSecondRenameFailureRollsBackBytesAndOriginalMode() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let codexOriginal = Data(#"{"codex":true}"#.utf8)
+        let claudeOriginal = Data(#"{"claude":true}"#.utf8)
+        try write(codexOriginal, to: paths.codex, mode: 0o640)
+        try write(claudeOriginal, to: paths.claudeCode, mode: 0o600)
+        let operations = FaultInjectingFileOperations(failRenameCall: 2)
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.install())
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), codexOriginal)
+        XCTAssertEqual(try mode(at: paths.codex), mode_t(0o640))
+        XCTAssertEqual(try Data(contentsOf: paths.claudeCode), claudeOriginal)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.cursor.path))
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testPostRenameVerificationFailureRollsBackDestination() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let original = Data(#"{"original":true}"#.utf8)
+        try write(original, to: paths.codex, mode: 0o640)
+        let operations = FaultInjectingFileOperations(failVerificationAt: paths.codex)
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.install())
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), original)
+        XCTAssertEqual(try mode(at: paths.codex), mode_t(0o640))
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testCleanupFailureReportsCommittedStateAndPreservesProtectedRollbackArtifact() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        try write(Data(#"{"original":true}"#.utf8), to: paths.codex)
+        let operations = FaultInjectingFileOperations(failRollbackCleanup: true)
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        do {
+            try await installer.install()
+            XCTFail("Expected committed cleanup failure")
+        } catch let error as IntegrationError {
+            guard case let .committedWithCleanupFailure(failures) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertFalse(failures.isEmpty)
+        }
+
+        XCTAssertTrue(String(decoding: try Data(contentsOf: paths.codex), as: UTF8.self).contains(AppIdentity.integrationIdentifier))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.claudeCode.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.cursor.path))
+        let artifacts = try temporaryArtifacts(in: root)
+        XCTAssertEqual(artifacts.count, 1)
+        XCTAssertEqual(try mode(at: try XCTUnwrap(artifacts.first)), mode_t(0o600))
+    }
+
+    func testRollbackRestorationFailureIsReportedAndPreservesBackup() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        try write(Data(#"{"original":true}"#.utf8), to: paths.codex, mode: 0o640)
+        let operations = FaultInjectingFileOperations(
+            failVerificationAt: paths.codex,
+            failRollbackRename: true
+        )
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        do {
+            try await installer.install()
+            XCTFail("Expected rollback restoration failure")
+        } catch let error as IntegrationError {
+            guard case let .rollbackFailed(failures) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertFalse(failures.isEmpty)
+        }
+
+        let artifacts = try temporaryArtifacts(in: root)
+        let rollbackArtifacts = artifacts.filter { $0.lastPathComponent.contains("rollback") }
+        XCTAssertEqual(rollbackArtifacts.count, 1)
+        XCTAssertEqual(try mode(at: try XCTUnwrap(rollbackArtifacts.first)), mode_t(0o600))
+    }
+
+    private func temporaryRoot() -> URL {
+        FileManager.default.temporaryDirectory
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+    }
+
+    private func write(_ data: Data, to url: URL, mode: mode_t = 0o600) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url)
+        guard chmod(url.path, mode) == 0 else { throw POSIXError(.EIO) }
+    }
+
+    private func mode(at url: URL) throws -> mode_t {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { throw POSIXError(.ENOENT) }
+        return metadata.st_mode & mode_t(0o777)
+    }
+
     private func temporaryArtifacts(in root: URL) throws -> [URL] {
         guard FileManager.default.fileExists(atPath: root.path) else { return [] }
         guard let enumerator = FileManager.default.enumerator(
@@ -142,6 +455,150 @@ final class IntegrationInstallerTests: XCTestCase {
         return enumerator.compactMap { $0 as? URL }.filter {
             $0.lastPathComponent.contains("agent-light")
         }
+    }
+}
+
+private final class FaultInjectingFileOperations: IntegrationFileOperating, @unchecked Sendable {
+    enum Mutation: Sendable {
+        case replaceFile(url: URL, data: Data)
+        case modifyFileInPlace(url: URL, data: Data)
+        case replaceWithSymlink(url: URL, destination: URL)
+
+        var target: URL {
+            switch self {
+            case let .replaceFile(url, _),
+                 let .modifyFileInPlace(url, _),
+                 let .replaceWithSymlink(url, _):
+                url
+            }
+        }
+    }
+
+    private let base = POSIXIntegrationFileOperations()
+    private let lock = NSLock()
+    private let mutation: Mutation?
+    private let mutationBeforeRename: Mutation?
+    private let failFirstStagedWriteAfterSuccess: Bool
+    private let failRenameCall: Int?
+    private let failVerificationAt: URL?
+    private let failRollbackCleanup: Bool
+    private let failRollbackRename: Bool
+    private var destinationSnapshots: [String: Int] = [:]
+    private var stagedWriteFailed = false
+    private var renameMutationApplied = false
+    private var renameCount = 0
+
+    init(
+        mutation: Mutation? = nil,
+        mutationBeforeRename: Mutation? = nil,
+        failFirstStagedWriteAfterSuccess: Bool = false,
+        failRenameCall: Int? = nil,
+        failVerificationAt: URL? = nil,
+        failRollbackCleanup: Bool = false,
+        failRollbackRename: Bool = false
+    ) {
+        self.mutation = mutation
+        self.mutationBeforeRename = mutationBeforeRename
+        self.failFirstStagedWriteAfterSuccess = failFirstStagedWriteAfterSuccess
+        self.failRenameCall = failRenameCall
+        self.failVerificationAt = failVerificationAt
+        self.failRollbackCleanup = failRollbackCleanup
+        self.failRollbackRename = failRollbackRename
+    }
+
+    func snapshot(at url: URL) throws -> IntegrationFileSnapshot {
+        let count = withLock {
+            destinationSnapshots[url.path, default: 0] += 1
+            return destinationSnapshots[url.path, default: 0]
+        }
+        if count == 2, let mutation, mutation.target == url {
+            try applyMutation(mutation)
+        }
+        if count == 3, failVerificationAt == url {
+            throw IntegrationError.verificationFailed("injected: \(url.path)")
+        }
+        return try base.snapshot(at: url)
+    }
+
+    func createDirectory(at url: URL) throws {
+        try base.createDirectory(at: url)
+    }
+
+    func writeProtected(_ data: Data, to url: URL) throws {
+        try base.writeProtected(data, to: url)
+        let shouldFail = withLock {
+            guard
+                failFirstStagedWriteAfterSuccess,
+                !stagedWriteFailed,
+                url.lastPathComponent.contains("staged")
+            else {
+                return false
+            }
+            stagedWriteFailed = true
+            return true
+        }
+        if shouldFail {
+            throw IntegrationError.fileOperation("injected staging failure")
+        }
+    }
+
+    func replace(
+        from source: URL,
+        to destination: URL,
+        expecting snapshot: IntegrationFileSnapshot
+    ) throws {
+        if failRollbackRename, source.lastPathComponent.contains("rollback") {
+            throw IntegrationError.fileOperation("injected rollback rename failure")
+        }
+        let call = withLock {
+            renameCount += 1
+            return renameCount
+        }
+        let renameMutation = withLock { () -> Mutation? in
+            guard !renameMutationApplied, mutationBeforeRename?.target == destination else { return nil }
+            renameMutationApplied = true
+            return mutationBeforeRename
+        }
+        if let renameMutation {
+            try applyMutation(renameMutation)
+        }
+        if call == failRenameCall {
+            throw IntegrationError.fileOperation("injected rename failure")
+        }
+        try base.replace(from: source, to: destination, expecting: snapshot)
+    }
+
+    func remove(at url: URL) throws {
+        if failRollbackCleanup, url.lastPathComponent.contains("rollback") {
+            throw IntegrationError.fileOperation("injected cleanup failure")
+        }
+        try base.remove(at: url)
+    }
+
+    func setMode(_ mode: mode_t, at url: URL) throws {
+        try base.setMode(mode, at: url)
+    }
+
+    func syncDirectory(at url: URL) throws {
+        try base.syncDirectory(at: url)
+    }
+
+    private func applyMutation(_ mutation: Mutation) throws {
+        switch mutation {
+        case let .replaceFile(url, data):
+            try data.write(to: url, options: .atomic)
+        case let .modifyFileInPlace(url, data):
+            try data.write(to: url)
+        case let .replaceWithSymlink(url, destination):
+            try FileManager.default.removeItem(at: url)
+            try FileManager.default.createSymbolicLink(at: url, withDestinationURL: destination)
+        }
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
     }
 }
 
