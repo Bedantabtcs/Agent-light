@@ -195,3 +195,76 @@ Coverage added for suspended restore/event reconciliation, pause-drain and suspe
 
 - `renameatx_np` CAS semantics are macOS-specific, matching this package's macOS 14 deployment target.
 - No live bulb or process-kill filesystem test was run; deterministic actor and POSIX fault tests cover the reviewed logical and atomic boundaries.
+
+---
+
+## Remaining Review Fix Batch: Owned Reconnect, Cancellable Retries, and Durable Clear
+
+### Root Causes and Corrections
+
+- Reconnect previously performed health checks and applies directly from the public actor method. Concurrent reconnects duplicated health operations, pause/stop could restore while a reconnect apply remained blocked, and reconnect work bypassed the command throttle. Reconnect health now runs in one coalesced cancellable task that captures dependencies rather than the actor; health and any follow-up apply each use a one-second window. Reconnect apply reuses the owned throttle task, and pause/stop cancel and drain both stages before restoration.
+- Retry currency was checked only before an attempt. A failure could register or finish an obsolete 500 ms/one-second sleep after a newer event or lifecycle request. Retry paths now check cancellation/currency immediately after failure, before sleeping, after sleeping, and after every dependency await. New events cancel an in-flight apply retry; lifecycle transitions cancel owned capture/recovery retry tasks.
+- The production classifier treated every `TuyaClientError.apiFailure` as transient. Generic business/API failures are now permanent at the orchestrator boundary; only explicit transport, selected connectivity `URLError` values, HTTP 408/429, and HTTP 5xx retry. Tuya authentication refresh remains inside `TuyaClient`.
+- Actor-owned lifecycle and restore tasks retained the actor while awaiting dependencies. Lifecycle and restore serialization now use completion latches. The invoking task owns the actor wait; the actor retains only latch state, and reconnect/lifecycle dependency tasks do not capture the actor.
+- Save marked a replacement committed and removed the displaced record before directory fsync and parent verification. The displaced record now remains in the opened directory until the new destination is directory-synced and the path still identifies the same parent. Cleanup is a separate best-effort phase; its failure does not report a committed save as uncommitted.
+- Clear unlinked the record before its removal was durably committed and had no ownership comparison. `MonitoringRecoveryStoring.clear(expecting:)` now compare-and-swaps the exact expected record into a quarantine name, directory-syncs and parent-verifies that rename as the clear commit, and only then performs best-effort tombstone cleanup. A retry cannot clear a later replacement.
+- Private-file validation previously masked only `0o777`, allowing setuid/setgid/sticky bits. Validation now masks permission and special bits together and accepts exactly owner read/write (`0600`) on an owned, single-link regular file.
+- Production-only seams were reduced: the public orchestrator initializer exposes only the required light and recovery-store dependencies; coordinator, clock, jitter, classifier, lifecycle counters, and subscriber barriers remain internal test seams. `MonitoringOrchestrating` remains unchanged.
+
+### Deterministic RED
+
+- Production classifier:
+  - Command: `swift test --filter MonitoringOrchestratorTests/testProductionClassifierDoesNotRetryGenericAPIFailure`
+  - Result: exit 1; `XCTAssertFalse` failed because generic `.apiFailure` was classified transient.
+  - Log: `/tmp/task8-fix2-red-classifier.log`.
+- Stale retry sleep registration:
+  - Command: `swift test --filter MonitoringOrchestratorTests/testNewEventCancelsRetryBeforeBlockedSleepRegistration`
+  - Result: exit 1; expected sleeps `[1s]`, observed `[1s, 500ms]` after a newer desired event.
+  - Log: `/tmp/task8-fix2-red-stale-retry.log`.
+- Concurrent reconnect:
+  - Command: `swift test --filter MonitoringOrchestratorTests/testConcurrentReconnectsShareOneHealthOperation`
+  - Result: exit 1; expected one health match, observed two.
+  - Log: `/tmp/task8-fix2-red-concurrent-reconnect.log`.
+- Conditional clear contract:
+  - Command: `swift test --filter FileMonitoringRecoveryStoreTests`
+  - Result: exit 1; compilation failed at three wished-for `clear(expecting:)` calls because only unconditional `clear()` existed.
+  - Log: `/tmp/task8-fix2-red-store-contract.log`.
+- Reconnect throttle/drain:
+  - Command: `perl -e 'alarm 5; exec @ARGV' swift test --filter MonitoringOrchestratorTests/testReconnectApplyUsesThrottleAndPauseDrainsItBeforeRestore`
+  - Result: bounded exit 142 while waiting for the required reconnect command-window sleep; the old implementation entered apply directly.
+  - Log: `/tmp/task8-fix2-red-reconnect-throttle-drain.log`.
+
+### GREEN and Race Repetition
+
+- Focused command: `swift test --filter 'MonitoringOrchestratorTests|FileMonitoringRecoveryStoreTests'`
+  - Result: exit 0; 75 tests passed, 0 failures.
+  - Log: `/tmp/task8-fix2-focused-green-final.log`.
+- Critical-race repetition: concurrent blocked start, stale retry registration, reconnect-pause drain, reconnect-stop drain, blocked-restore deallocation, and reconnect-health cancellation each passed 20/20 under five-second external bounds; 120/120 total.
+  - Log: `/tmp/task8-fix2-repeat-summary.log`.
+- Full command: `swift test`
+  - Result: exit 0; 174 tests passed, 0 failures.
+  - Log: `/tmp/task8-fix2-full-test-final.log`.
+- Release command: `swift build -c release`
+  - Result: exit 0.
+  - Log: `/tmp/task8-fix2-release-build.log`.
+- `git diff --check`: exit 0 with no output.
+- Security scan: no debug output, TODO/FIXME markers, forced casts/tries, dynamic evaluation, hardcoded credential literals, or commented-out production code.
+  - Log: `/tmp/task8-fix2-security-scan.log`.
+
+### Added Fault and Ownership Coverage
+
+- Blocked reconnect apply followed by pause and by stop, asserting physical apply finishes before restore starts.
+- Concurrent reconnect coalescing and one-second health/apply windows.
+- Blocked sleep registration for stale desired-state and lifecycle retries, proving obsolete 500 ms delay registration is cancelled and replacement work receives only its new one-second window.
+- Blocked start and restore deallocation with cancellation and weak-reference release.
+- Directory-fsync failure after replacement preserves both old and new decodable records.
+- Save parent replacement after commit sync preserves the displaced record in the opened directory.
+- Conditional-clear directory-fsync failure preserves the exact quarantined record.
+- Conditional-clear cleanup failure followed by a replacement proves retry cannot delete the replacement.
+- Parent replacement after clear commit preserves the quarantined record in the opened directory.
+- Exact private-mode validation rejects setuid, setgid, and sticky bits in addition to group/other permissions, unsafe type, owner, and link count.
+
+### Remaining Concerns
+
+- No live bulb or process-kill filesystem test was run. Deterministic dependency barriers and POSIX fault injection cover the reviewed ownership and commit boundaries.
+- `renameatx_np` remains macOS-specific, consistent with the macOS 14 package target.

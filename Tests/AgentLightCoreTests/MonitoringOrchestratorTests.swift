@@ -6,22 +6,17 @@ import XCTest
 final class MonitoringOrchestratorTests: XCTestCase {
     func testConcurrentStartsShareOneOwnershipCaptureAndBothSucceed() async {
         let light = RecordingLightController()
+        await light.setCaptureBlocked(true)
         let orchestrator = makeOrchestrator(light: light)
-
-        let results = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
-            for _ in 0..<2 {
-                group.addTask {
-                    do {
-                        try await orchestrator.start()
-                        return true
-                    } catch {
-                        return false
-                    }
-                }
-            }
-            var values: [Bool] = []
-            for await value in group { values.append(value) }
-            return values
+        let first = Task { try await orchestrator.start() }
+        await light.waitForOperationCount(1)
+        let second = Task { try await orchestrator.start() }
+        await light.releaseCapture()
+        let firstResult = await first.result
+        let secondResult = await second.result
+        let results = [firstResult, secondResult].map { result in
+            if case .success = result { return true }
+            return false
         }
 
         XCTAssertEqual(results, [true, true])
@@ -228,7 +223,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 1 })
 
         let pause = Task { await orchestrator.pause() }
-        await Task.yield()
+        await orchestrator.waitForLifecycleRequestNumber(2)
         await XCTAssertAsyncEqual(await light.restoreCount(), 0)
         await light.releaseApply()
         await pause.value
@@ -249,7 +244,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
         let first = Task { await orchestrator.pause() }
         let second = Task { await orchestrator.pause() }
-        for _ in 0..<20 { await Task.yield() }
+        await orchestrator.waitForLifecycleRequestNumber(3)
         await XCTAssertAsyncEqual(await light.restoreCount(), 0)
         await light.releaseApply()
         await first.value
@@ -271,7 +266,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let idle = Task {
             await orchestrator.accept(makeEvent(session: "old", state: .idle))
         }
-        for _ in 0..<20 { await Task.yield() }
+        await XCTAssertAsyncTrue(await eventually { (await orchestrator.currentSnapshot()).state == .idle })
         await orchestrator.accept(makeEvent(session: "new", state: .thinking))
         await light.releaseApply()
         await idle.value
@@ -290,7 +285,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let pause = Task { await orchestrator.pause() }
         await XCTAssertAsyncTrue(await eventually { await light.restoreCount() == 1 })
         let resume = Task { try await orchestrator.resume() }
-        for _ in 0..<20 { await Task.yield() }
+        await orchestrator.waitForLifecycleRequestNumber(3)
         await orchestrator.accept(makeEvent(state: .thinking))
         await clock.advance(by: .seconds(1))
         await XCTAssertAsyncEqual(await light.appliedStates(), [])
@@ -385,6 +380,30 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 2 })
+        await XCTAssertAsyncEqual(await light.appliedStates(), [desired(.thinking), desired(.working)])
+    }
+
+    func testNewEventCancelsRetryBeforeBlockedSleepRegistration() async throws {
+        let light = RecordingLightController(applyResults: [.failure(.transient), .success(())])
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
+        await clock.blockNextSleepRegistration()
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await clock.waitUntilSleepRegistrationIsBlocked()
+
+        await orchestrator.accept(makeEvent(state: .working))
+        await clock.releaseSleepRegistration()
+        await clock.waitUntilBlockedSleepRegistrationCompletes()
+        await clock.waitForSleepCount(2)
+
+        await XCTAssertAsyncEqual(await clock.requestedSleeps, [.seconds(1), .seconds(1)])
+        await XCTAssertAsyncEqual(await light.appliedStates(), [desired(.thinking)])
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(3)
         await XCTAssertAsyncEqual(await light.appliedStates(), [desired(.thinking), desired(.working)])
     }
 
@@ -500,7 +519,11 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncTrue(await eventually { (await orchestrator.currentSnapshot()).connection == .disconnected })
         await orchestrator.accept(makeEvent(state: .working))
 
-        await orchestrator.reconnect()
+        let reconnect = Task { await orchestrator.reconnect() }
+        await clock.waitForSleepCount(2)
+        await clock.advance(by: .seconds(1))
+        await reconnect.value
+        await clock.waitForSleepCount(3)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 2 })
@@ -523,6 +546,43 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
         XCTAssertNil(weakOrchestrator)
         await XCTAssertAsyncTrue(await eventually { await clock.sleeperCount() == 0 })
+    }
+
+    func testBlockedStartReleasesOrchestratorAfterDependencyUnblocks() async {
+        let light = RecordingLightController()
+        await light.setCaptureBlocked(true)
+        var orchestrator: MonitoringOrchestrator? = makeOrchestrator(light: light)
+        weak var weakOrchestrator = orchestrator
+        let start = Task { [weak orchestrator] in
+            try? await orchestrator?.start()
+        }
+        await light.waitForOperationCount(1)
+
+        orchestrator = nil
+        start.cancel()
+        await light.releaseCapture()
+        await start.value
+
+        XCTAssertNil(weakOrchestrator)
+    }
+
+    func testBlockedRestoreReleasesOrchestratorAfterDependencyUnblocks() async throws {
+        let light = RecordingLightController()
+        var orchestrator: MonitoringOrchestrator? = makeOrchestrator(light: light)
+        weak var weakOrchestrator = orchestrator
+        try await orchestrator?.start()
+        await light.setRestoreBlocked(true)
+        let pause = Task { [weak orchestrator] in
+            await orchestrator?.pause()
+        }
+        await light.waitForOperationCount(2)
+
+        orchestrator = nil
+        pause.cancel()
+        await light.releaseRestore()
+        await pause.value
+
+        XCTAssertNil(weakOrchestrator)
     }
 
     func testEventAcceptedDuringRestoreWaitsThenAppliesCurrentWinner() async throws {
@@ -565,7 +625,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
             try await orchestrator.resume()
             await resumed.markCompleted()
         }
-        for _ in 0..<20 { await Task.yield() }
+        await orchestrator.waitForLifecycleRequestNumber(3)
         await XCTAssertAsyncEqual(await resumed.value(), false)
 
         await light.releaseApply()
@@ -586,9 +646,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let clock = ManualClock()
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         let initialStart = Task { try? await orchestrator.start() }
-        await XCTAssertAsyncTrue(await eventually {
-            await light.operations.filter { $0 == .capture }.count == 1
-        })
+        await light.waitForOperationCount(1)
 
         let pause = Task { await orchestrator.pause() }
         await XCTAssertAsyncTrue(await eventually {
@@ -624,13 +682,17 @@ final class MonitoringOrchestratorTests: XCTestCase {
     func testReconnectRetriesPendingClearWithoutRepeatingPhysicalRestore() async throws {
         let light = RecordingLightController()
         let store = MemoryRecoveryStore(clearFailures: [.permanent])
-        let orchestrator = makeOrchestrator(light: light, store: store)
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, store: store, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .idle))
         await XCTAssertAsyncEqual(await light.restoreCount(), 1)
         await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).connection, .disconnected)
 
-        await orchestrator.reconnect()
+        let reconnect = Task { await orchestrator.reconnect() }
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await reconnect.value
 
         await XCTAssertAsyncEqual(await light.restoreCount(), 1)
         await XCTAssertAsyncNil(await store.storedRecord())
@@ -666,6 +728,32 @@ final class MonitoringOrchestratorTests: XCTestCase {
         try await start.value
 
         await XCTAssertAsyncEqual(await light.operations.filter { $0 == .capture }.count, 3)
+    }
+
+    func testPauseCancelsBaselineRetryBeforeSleepRegistration() async {
+        let light = RecordingLightController()
+        await light.enqueueCaptureErrors([URLError(.timedOut)])
+        let clock = ManualClock()
+        await clock.blockNextSleepRegistration()
+        let orchestrator = MonitoringOrchestrator(
+            light: light,
+            recoveryStore: MemoryRecoveryStore(),
+            clock: clock,
+            jitter: { _ in .zero }
+        )
+        let start = Task { try? await orchestrator.start() }
+        await light.waitForOperationCount(1)
+        await clock.waitUntilSleepRegistrationIsBlocked()
+
+        let pause = Task { await orchestrator.pause() }
+        await orchestrator.waitForLifecycleRequestNumber(2)
+        await clock.releaseSleepRegistration()
+        await clock.waitUntilBlockedSleepRegistrationCompletes()
+        _ = await start.value
+        await pause.value
+
+        await XCTAssertAsyncEqual(await clock.requestedSleeps, [])
+        await XCTAssertAsyncEqual(await light.operations.captureCount, 1)
     }
 
     func testRecoveryMatchRetriesURLErrorWithProductionClassifier() async throws {
@@ -732,9 +820,12 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await light.enqueueCaptureErrors([URLError(.notConnectedToInternet), URLError(.timedOut)])
 
         await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
-        await XCTAssertAsyncTrue(await eventually { await light.operations.captureCount == 2 })
+        await light.waitForOperationCount(3)
+        await clock.waitForSleepCount(2)
         await clock.advance(by: .milliseconds(500))
+        await clock.waitForSleepCount(3)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates() == [desired(.working)] })
@@ -761,12 +852,153 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await light.setMatchBlocked(true)
 
         let reconnect = Task { await orchestrator.reconnect() }
-        await XCTAssertAsyncTrue(await eventually { await light.operations.matchCount >= 1 })
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
         await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).connection, .disconnected)
         await light.releaseMatch()
         await reconnect.value
 
         await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).connection, .connected)
+    }
+
+    func testConcurrentReconnectsShareOneHealthOperation() async throws {
+        let light = RecordingLightController(applyResults: [.success(()), .failure(.permanent)])
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(2)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(3)
+        await light.setMatchBlocked(true)
+
+        let first = Task { await orchestrator.reconnect() }
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+        let second = Task { await orchestrator.reconnect() }
+        await orchestrator.waitForReconnectWaiterCount(1)
+
+        await XCTAssertAsyncEqual(await light.operations.matchCount, 1)
+        await light.releaseMatch()
+        await first.value
+        await second.value
+    }
+
+    func testPauseCancelsReconnectHealthDelayWithoutAdvancingClock() async throws {
+        let light = RecordingLightController(applyResults: [.failure(.permanent)])
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+
+        let reconnect = Task { await orchestrator.reconnect() }
+        await clock.waitForSleepCount(2)
+        await orchestrator.pause()
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(await light.operations.matchCount, 0)
+        await XCTAssertAsyncEqual(await clock.sleeperCount(), 0)
+    }
+
+    func testReconnectApplyUsesThrottleAndPauseDrainsItBeforeRestore() async throws {
+        let light = RecordingLightController(
+            applyResults: [.success(()), .failure(.permanent), .success(())],
+            matchResults: [.success(false)]
+        )
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(2)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(3)
+        await light.setApplyBlocked(true)
+
+        let reconnect = Task { await orchestrator.reconnect() }
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+        await clock.waitForSleepCount(4)
+        await XCTAssertAsyncEqual(await light.appliedStates().count, 2)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(5)
+        let pause = Task { await orchestrator.pause() }
+        await light.releaseApply()
+        await pause.value
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(
+            await light.physicalPhases.suffix(4),
+            [
+                .applyStarted(desired(.working)),
+                .applyFinished(desired(.working)),
+                .restoreStarted(.testBaseline),
+                .restoreFinished(.testBaseline)
+            ]
+        )
+    }
+
+    func testReconnectApplyIsDrainedBeforeStopRestores() async throws {
+        let light = RecordingLightController(
+            applyResults: [.success(()), .failure(.permanent), .success(())],
+            matchResults: [.success(false)]
+        )
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(2)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(3)
+        await light.setApplyBlocked(true)
+
+        let reconnect = Task { await orchestrator.reconnect() }
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+        await clock.waitForSleepCount(4)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(5)
+        let stop = Task { await orchestrator.stop() }
+        await light.releaseApply()
+        await stop.value
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(
+            await light.physicalPhases.suffix(4),
+            [
+                .applyStarted(desired(.working)),
+                .applyFinished(desired(.working)),
+                .restoreStarted(.testBaseline),
+                .restoreFinished(.testBaseline)
+            ]
+        )
+    }
+
+    func testProductionClassifierDoesNotRetryGenericAPIFailure() {
+        XCTAssertFalse(MonitoringOrchestrator.defaultTransientClassifier(TuyaClientError.apiFailure))
+        XCTAssertTrue(MonitoringOrchestrator.defaultTransientClassifier(TuyaClientError.transport))
+        XCTAssertTrue(MonitoringOrchestrator.defaultTransientClassifier(TuyaClientError.httpStatus(429)))
+        XCTAssertTrue(MonitoringOrchestrator.defaultTransientClassifier(TuyaClientError.httpStatus(503)))
+        XCTAssertFalse(MonitoringOrchestrator.defaultTransientClassifier(TuyaClientError.httpStatus(400)))
+        XCTAssertFalse(MonitoringOrchestrator.defaultTransientClassifier(TuyaClientError.authenticationFailure))
     }
 
     func testOlderAcceptCannotInstallTerminalTimerAfterNewerSameSessionEvent() async throws {
@@ -784,7 +1016,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         try await orchestrator.start()
 
         let older = Task { await orchestrator.accept(makeEvent(session: "same", state: .completed)) }
-        await Task.yield()
+        await coordinator.waitUntilAcceptIsBlocked()
         await orchestrator.accept(makeEvent(session: "same", state: .working))
         await coordinator.releaseAccept()
         await older.value
@@ -943,7 +1175,8 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let url = directory.appendingPathComponent("monitoring-recovery.json")
         let operations = FaultInjectingRecoveryPOSIXOperations()
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
-        try await store.save(MonitoringRecoveryRecord(baseline: .testBaseline))
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline)
+        try await store.save(original)
         let concurrent = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.error))
         let concurrentBytes = try encoded(concurrent)
         operations.beforeRenameExclusive = {
@@ -951,7 +1184,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         }
 
         await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
-            try await store.clear()
+            try await store.clear(expecting: original)
         }
 
         XCTAssertEqual(try Data(contentsOf: url), concurrentBytes)
@@ -975,7 +1208,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [url.lastPathComponent])
     }
 
-    func testUnlinkFailureAfterSwapPreservesNewRecordAndRecoveryArtifact() async throws {
+    func testUnlinkFailureAfterCommittedSavePreservesNewRecordAndRecoveryArtifactWithoutFailure() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("monitoring-recovery.json")
@@ -985,12 +1218,142 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
         operations.failNextUnlink = true
 
+        try await store.save(replacement)
+
+        await XCTAssertAsyncEqual(try await store.load(), replacement)
+        XCTAssertGreaterThan(try FileManager.default.contentsOfDirectory(atPath: directory.path).count, 1)
+    }
+
+    func testDirectorySyncFailureAfterReplacementPreservesBothRecoveryRecords() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+        try await store.save(original)
+        operations.failNextDirectorySync = true
+
         await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
             try await store.save(replacement)
         }
 
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let records = try artifacts.map { try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: $0)) }
+        XCTAssertEqual(records.count, 2)
+        XCTAssertTrue(records.contains(original))
+        XCTAssertTrue(records.contains(replacement))
+    }
+
+    func testLoadRejectsSetIDAndStickyPermissionBits() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline)
+        try encoded(record).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        operations.overrideNextRegularMode = S_IFREG | S_IRUSR | S_IWUSR | S_ISUID | S_ISGID | S_ISVTX
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.unsafeFile) {
+            _ = try await store.load()
+        }
+    }
+
+    func testConditionalClearCleanupFailureCannotDeleteLaterReplacement() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+        try await store.save(original)
+        operations.failNextUnlink = true
+
+        try await store.clear(expecting: original)
+        try await store.save(replacement)
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.clear(expecting: original)
+        }
+
         await XCTAssertAsyncEqual(try await store.load(), replacement)
-        XCTAssertGreaterThan(try FileManager.default.contentsOfDirectory(atPath: directory.path).count, 1)
+    }
+
+    func testConditionalClearDirectorySyncFailurePreservesQuarantinedRecord() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        try await store.save(original)
+        operations.failNextDirectorySync = true
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
+            try await store.clear(expecting: original)
+        }
+
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        XCTAssertEqual(artifacts.count, 1)
+        XCTAssertEqual(try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: artifacts[0])), original)
+    }
+
+    func testSaveParentReplacementAfterCommitSyncPreservesDisplacedRecord() async throws {
+        let parent = try temporaryDirectory()
+        let movedParent = parent.appendingPathExtension("opened")
+        defer {
+            try? FileManager.default.removeItem(at: parent)
+            try? FileManager.default.removeItem(at: movedParent)
+        }
+        let url = parent.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+        try await store.save(original)
+        operations.afterNextDirectorySync = {
+            try FileManager.default.moveItem(at: parent, to: movedParent)
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        }
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.save(replacement)
+        }
+
+        let artifacts = try FileManager.default.contentsOfDirectory(at: movedParent, includingPropertiesForKeys: nil)
+        let records = try artifacts.map { try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: $0)) }
+        XCTAssertEqual(records.count, 2)
+        XCTAssertTrue(records.contains(original))
+        XCTAssertTrue(records.contains(replacement))
+    }
+
+    func testClearParentReplacementAfterCommitSyncPreservesQuarantinedRecord() async throws {
+        let parent = try temporaryDirectory()
+        let movedParent = parent.appendingPathExtension("opened")
+        defer {
+            try? FileManager.default.removeItem(at: parent)
+            try? FileManager.default.removeItem(at: movedParent)
+        }
+        let url = parent.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        try await store.save(record)
+        operations.afterNextDirectorySync = {
+            try FileManager.default.moveItem(at: parent, to: movedParent)
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        }
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.clear(expecting: record)
+        }
+
+        let artifacts = try FileManager.default.contentsOfDirectory(at: movedParent, includingPropertiesForKeys: nil)
+        XCTAssertEqual(artifacts.count, 1)
+        XCTAssertEqual(try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: artifacts[0])), record)
     }
 
     func testTemporaryNameCollisionRetriesWithoutChangingCollisionFile() async throws {
@@ -1031,7 +1394,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
 
         let clear = Task {
             withUnsafeCurrentTask { $0?.cancel() }
-            try await store.clear()
+            try await store.clear(expecting: original)
         }
         await XCTAssertTaskIsCancelled(clear)
         await XCTAssertAsyncEqual(try await store.load(), original)
@@ -1111,9 +1474,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         try await store.save(record)
         operations.failNextUnlink = true
 
-        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
-            try await store.clear()
-        }
+        try await store.clear(expecting: record)
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
         let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
@@ -1184,9 +1545,12 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
     var beforeRenameExclusive: (() throws -> Void)?
     var beforeRead: (() throws -> Void)?
     var failNextFileSync = false
+    var failNextDirectorySync = false
     var failNextUnlink = false
     var failNextRenameExclusive = false
     var overrideNextRegularOwner: uid_t?
+    var overrideNextRegularMode: mode_t?
+    var afterNextDirectorySync: (() throws -> Void)?
 
     func openDirectory(path: String) throws -> Int32 {
         try base.openDirectory(path: path)
@@ -1204,14 +1568,17 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
         let metadata = try base.metadata(for: descriptor)
         return locked {
             guard metadata.mode & S_IFMT == S_IFREG,
-                  let owner = overrideNextRegularOwner else {
+                  overrideNextRegularOwner != nil || overrideNextRegularMode != nil else {
                 return metadata
             }
+            let owner = overrideNextRegularOwner ?? metadata.owner
+            let mode = overrideNextRegularMode ?? metadata.mode
             overrideNextRegularOwner = nil
+            overrideNextRegularMode = nil
             return MonitoringRecoveryFileMetadata(
                 device: metadata.device,
                 inode: metadata.inode,
-                mode: metadata.mode,
+                mode: mode,
                 owner: owner,
                 linkCount: metadata.linkCount
             )
@@ -1236,13 +1603,26 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
     }
 
     func synchronize(_ descriptor: Int32, kind: MonitoringRecoveryDescriptorKind) throws {
-        let shouldFail = locked {
-            guard kind == .file, failNextFileSync else { return false }
-            failNextFileSync = false
-            return true
+        let shouldFail = locked { () -> Bool in
+            if kind == .file, failNextFileSync {
+                failNextFileSync = false
+                return true
+            }
+            if kind == .directory, failNextDirectorySync {
+                failNextDirectorySync = false
+                return true
+            }
+            return false
         }
         if shouldFail { throw MonitoringRecoveryPOSIXError.system(EIO) }
         try base.synchronize(descriptor, kind: kind)
+        if kind == .directory {
+            let hook = locked { () -> (() throws -> Void)? in
+                defer { afterNextDirectorySync = nil }
+                return afterNextDirectorySync
+            }
+            try hook?()
+        }
     }
 
     func swap(at directory: Int32, _ first: String, _ second: String) throws {

@@ -1,6 +1,6 @@
 import AgentLightProtocol
 
-public protocol SessionCoordinating: Sendable {
+protocol SessionCoordinating: Sendable {
     func accept(_ event: AgentEvent) async
     func expireTerminalState(sessionID: String, sequence: UInt64) async
     func currentWinner() async -> AgentEvent?

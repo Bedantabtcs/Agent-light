@@ -11,7 +11,7 @@ public protocol TuyaLightControlling: Sendable {
 public protocol MonitoringRecoveryStoring: Sendable {
     func load() async throws -> MonitoringRecoveryRecord?
     func save(_ record: MonitoringRecoveryRecord) async throws
-    func clear() async throws
+    func clear(expecting record: MonitoringRecoveryRecord) async throws
 }
 
 public struct MonitoringRecoveryRecord: Codable, Equatable, Sendable {
@@ -305,10 +305,10 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         )
         let temporary = try createTemporary(in: directory.descriptor, destination: location.fileName)
         var preserveTemporary = false
-        var committed = false
+        var installed = false
         defer {
             operations.close(temporary.descriptor)
-            if !committed, !preserveTemporary {
+            if !installed, !preserveTemporary {
                 try? operations.unlink(at: directory.descriptor, name: temporary.name)
             }
         }
@@ -333,6 +333,7 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             } catch {
                 throw MonitoringRecoveryStoreError.ioFailure
             }
+            installed = true
             let displaced = try existingIdentity(
                 directory: directory.descriptor,
                 name: temporary.name
@@ -345,17 +346,29 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
                         location.fileName
                     )
                     try? operations.unlink(at: directory.descriptor, name: temporary.name)
+                    installed = false
                 } catch {
                     preserveTemporary = true
                 }
                 throw MonitoringRecoveryStoreError.concurrentModification
             }
-            committed = true
             do {
-                try operations.unlink(at: directory.descriptor, name: temporary.name)
+                try operations.synchronize(directory.descriptor, kind: .directory)
             } catch {
                 preserveTemporary = true
                 throw MonitoringRecoveryStoreError.ioFailure
+            }
+            do {
+                try verifyParent(location.parentPath, matches: directory.metadata)
+            } catch {
+                preserveTemporary = true
+                throw error
+            }
+            do {
+                try operations.unlink(at: directory.descriptor, name: temporary.name)
+                try operations.synchronize(directory.descriptor, kind: .directory)
+            } catch {
+                preserveTemporary = true
             }
         } else {
             do {
@@ -364,31 +377,33 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
                     from: temporary.name,
                     to: location.fileName
                 )
-                committed = true
+                installed = true
             } catch MonitoringRecoveryPOSIXError.alreadyExists {
                 throw MonitoringRecoveryStoreError.concurrentModification
             } catch {
                 throw MonitoringRecoveryStoreError.ioFailure
             }
+            do {
+                try operations.synchronize(directory.descriptor, kind: .directory)
+            } catch {
+                throw MonitoringRecoveryStoreError.ioFailure
+            }
+            try verifyParent(location.parentPath, matches: directory.metadata)
         }
-
-        do {
-            try operations.synchronize(directory.descriptor, kind: .directory)
-        } catch {
-            throw MonitoringRecoveryStoreError.ioFailure
-        }
-        try verifyParent(location.parentPath, matches: directory.metadata)
     }
 
-    public func clear() throws {
+    public func clear(expecting expected: MonitoringRecoveryRecord) throws {
         try Task.checkCancellation()
         let location = try validatedLocation()
         let directory = try openValidatedDirectory(location.parentPath)
         defer { operations.close(directory.descriptor) }
-        guard let original = try existingIdentity(
+        guard let original = try existingRecord(
             directory: directory.descriptor,
             name: location.fileName
         ) else { return }
+        guard original.record == expected else {
+            throw MonitoringRecoveryStoreError.concurrentModification
+        }
         try verifyParent(location.parentPath, matches: directory.metadata)
 
         var tombstone: String?
@@ -418,8 +433,8 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             }
         }
 
-        let moved = try existingIdentity(directory: directory.descriptor, name: tombstone)
-        guard moved == original else {
+        let moved = try existingRecord(directory: directory.descriptor, name: tombstone)
+        guard moved?.identity == original.identity, moved?.record == expected else {
             do {
                 try operations.renameExclusive(
                     at: directory.descriptor,
@@ -447,13 +462,17 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             throw CancellationError()
         }
         do {
-            try operations.unlink(at: directory.descriptor, name: tombstone)
-            preserveTombstone = true
             try operations.synchronize(directory.descriptor, kind: .directory)
         } catch {
             throw MonitoringRecoveryStoreError.ioFailure
         }
         try verifyParent(location.parentPath, matches: directory.metadata)
+        do {
+            try operations.unlink(at: directory.descriptor, name: tombstone)
+            try operations.synchronize(directory.descriptor, kind: .directory)
+        } catch {
+            preserveTombstone = true
+        }
     }
 
     private struct Location {
@@ -469,6 +488,11 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
     private struct TemporaryFile {
         let descriptor: Int32
         let name: String
+    }
+
+    private struct ExistingRecord {
+        let identity: MonitoringRecoveryFileIdentity
+        let record: MonitoringRecoveryRecord
     }
 
     private func validatedLocation() throws -> Location {
@@ -530,6 +554,40 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         return metadata.identity
     }
 
+    private func existingRecord(directory: Int32, name: String) throws -> ExistingRecord? {
+        let descriptor: Int32
+        do {
+            guard let opened = try operations.openExisting(at: directory, name: name) else {
+                return nil
+            }
+            descriptor = opened
+        } catch {
+            throw mappedOpenError(error)
+        }
+        defer { operations.close(descriptor) }
+        let metadata = try metadataOrIO(descriptor)
+        try validateFile(metadata)
+        let data: Data
+        do {
+            data = try operations.read(from: descriptor, maximumBytes: Self.maximumRecordBytes + 1)
+        } catch {
+            throw MonitoringRecoveryStoreError.ioFailure
+        }
+        guard data.count <= Self.maximumRecordBytes else {
+            throw MonitoringRecoveryStoreError.recordTooLarge
+        }
+        do {
+            return ExistingRecord(
+                identity: metadata.identity,
+                record: try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: data)
+            )
+        } catch let error as MonitoringRecoveryStoreError {
+            throw error
+        } catch {
+            throw MonitoringRecoveryStoreError.malformedRecord
+        }
+    }
+
     private func createTemporary(in directory: Int32, destination: String) throws -> TemporaryFile {
         for _ in 0..<Self.maximumTemporaryNameAttempts {
             let name = try validatedTemporaryName(destination: destination)
@@ -578,9 +636,10 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
     }
 
     private func validateFile(_ metadata: MonitoringRecoveryFileMetadata) throws {
+        let permissionAndSpecialBits = S_IRWXU | S_IRWXG | S_IRWXO | S_ISUID | S_ISGID | S_ISVTX
         guard metadata.mode & S_IFMT == S_IFREG,
               metadata.owner == geteuid(),
-              metadata.mode & 0o777 == 0o600,
+              metadata.mode & permissionAndSpecialBits == S_IRUSR | S_IWUSR,
               metadata.linkCount == 1 else {
             throw MonitoringRecoveryStoreError.unsafeFile
         }
