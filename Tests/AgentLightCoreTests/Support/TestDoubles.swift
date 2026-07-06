@@ -152,14 +152,18 @@ actor RecordingLightController: TuyaLightControlling {
     private var matchResults: [Result<Bool, TestLightError>]
     private var blockedApply: [CheckedContinuation<Void, Never>] = []
     private var blockedRestore: [CheckedContinuation<Void, Never>] = []
-    private var blockedCapture: [CheckedContinuation<Void, Never>] = []
-    private var blockedMatch: [CheckedContinuation<Void, Never>] = []
+    private var blockedCapture: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var blockedMatch: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var shouldBlockApply = false
     private var shouldBlockRestore = false
     private var shouldBlockCapture = false
     private var shouldBlockMatch = false
     private var captureErrors: [any Error] = []
     private var matchErrors: [any Error] = []
+    private var captureCancellationCount = 0
+    private var matchCancellationCount = 0
+    private var captureCancellationWaiters: [UUID: (Int, CheckedContinuation<Void, Never>)] = [:]
+    private var matchCancellationWaiters: [UUID: (Int, CheckedContinuation<Void, Never>)] = [:]
     private(set) var operations: [Operation] = []
     private(set) var physicalPhases: [PhysicalPhase] = []
     private var operationWaiters: [UUID: (Int, CheckedContinuation<Void, Never>)] = [:]
@@ -182,8 +186,13 @@ actor RecordingLightController: TuyaLightControlling {
         operations.append(.capture)
         resumeOperationWaiters()
         if shouldBlockCapture {
-            await withCheckedContinuation { continuation in
-                blockedCapture.append(continuation)
+            let id = UUID()
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    blockedCapture[id] = continuation
+                }
+            } onCancel: {
+                Task { await self.cancelBlockedCapture(id: id) }
             }
         }
         if !captureErrors.isEmpty {
@@ -214,8 +223,13 @@ actor RecordingLightController: TuyaLightControlling {
         operations.append(.match(state))
         resumeOperationWaiters()
         if shouldBlockMatch {
-            await withCheckedContinuation { continuation in
-                blockedMatch.append(continuation)
+            let id = UUID()
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    blockedMatch[id] = continuation
+                }
+            } onCancel: {
+                Task { await self.cancelBlockedMatch(id: id) }
             }
         }
         if !matchErrors.isEmpty {
@@ -270,9 +284,9 @@ actor RecordingLightController: TuyaLightControlling {
 
     func releaseCapture() {
         shouldBlockCapture = false
-        let continuations = blockedCapture
+        let continuations = blockedCapture.values
         blockedCapture.removeAll()
-        for continuation in continuations { continuation.resume() }
+        for continuation in continuations { continuation.resume(returning: ()) }
     }
 
     func setMatchBlocked(_ blocked: Bool) {
@@ -281,9 +295,9 @@ actor RecordingLightController: TuyaLightControlling {
 
     func releaseMatch() {
         shouldBlockMatch = false
-        let continuations = blockedMatch
+        let continuations = blockedMatch.values
         blockedMatch.removeAll()
-        for continuation in continuations { continuation.resume() }
+        for continuation in continuations { continuation.resume(returning: ()) }
     }
 
     func enqueueCaptureErrors(_ errors: [any Error]) {
@@ -316,10 +330,65 @@ actor RecordingLightController: TuyaLightControlling {
         }
     }
 
+    func waitForCaptureCancellationCount(_ count: Int) async {
+        if captureCancellationCount >= count { return }
+        let id = UUID()
+        await withCheckedContinuation { continuation in
+            captureCancellationWaiters[id] = (count, continuation)
+        }
+    }
+
+    func waitForMatchCancellationCount(_ count: Int) async {
+        if matchCancellationCount >= count { return }
+        let id = UUID()
+        await withCheckedContinuation { continuation in
+            matchCancellationWaiters[id] = (count, continuation)
+        }
+    }
+
+    func captureCancellations() -> Int {
+        captureCancellationCount
+    }
+
+    func matchCancellations() -> Int {
+        matchCancellationCount
+    }
+
     private func resumeOperationWaiters() {
         let ready = operationWaiters.filter { operations.count >= $0.value.0 }
         for (id, waiter) in ready {
             operationWaiters[id] = nil
+            waiter.1.resume()
+        }
+    }
+
+    private func cancelBlockedCapture(id: UUID) {
+        guard let continuation = blockedCapture.removeValue(forKey: id) else { return }
+        captureCancellationCount += 1
+        continuation.resume(throwing: CancellationError())
+        resumeCancellationWaiters(
+            count: captureCancellationCount,
+            waiters: &captureCancellationWaiters
+        )
+    }
+
+    private func cancelBlockedMatch(id: UUID) {
+        guard let continuation = blockedMatch.removeValue(forKey: id) else { return }
+        matchCancellationCount += 1
+        continuation.resume(throwing: CancellationError())
+        resumeCancellationWaiters(
+            count: matchCancellationCount,
+            waiters: &matchCancellationWaiters
+        )
+    }
+
+    private func resumeCancellationWaiters(
+        count: Int,
+        waiters: inout [UUID: (Int, CheckedContinuation<Void, Never>)]
+    ) {
+        let ready = waiters.filter { count >= $0.value.0 }
+        for (id, waiter) in ready {
+            waiters[id] = nil
             waiter.1.resume()
         }
     }
@@ -334,6 +403,32 @@ actor CompletionFlag {
 
     func value() -> Bool {
         completed
+    }
+}
+
+actor CompletionCounter {
+    private var count = 0
+    private var waiters: [UUID: (Int, CheckedContinuation<Void, Never>)] = [:]
+
+    func increment() {
+        count += 1
+        let ready = waiters.filter { count >= $0.value.0 }
+        for (id, waiter) in ready {
+            waiters[id] = nil
+            waiter.1.resume()
+        }
+    }
+
+    func value() -> Int {
+        count
+    }
+
+    func waitForCount(_ target: Int) async {
+        if count >= target { return }
+        let id = UUID()
+        await withCheckedContinuation { continuation in
+            waiters[id] = (target, continuation)
+        }
     }
 }
 

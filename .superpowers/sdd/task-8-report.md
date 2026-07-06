@@ -268,3 +268,16 @@ Coverage added for suspended restore/event reconciliation, pause-drain and suspe
 
 - No live bulb or process-kill filesystem test was run. Deterministic dependency barriers and POSIX fault injection cover the reviewed ownership and commit boundaries.
 - `renameatx_np` remains macOS-specific, consistent with the macOS 14 package target.
+
+---
+
+## Correction 2: Unified Reconnect Ownership and Caller Cancellation
+
+- Replaced split reconnect health/apply latches with one reconnect operation, explicit phases, per-caller waiters, and one terminal resolver.
+- Reconnect remains disconnected until the current winner applies; no-winner and deduplication succeed, failure stays disconnected, and supersession retains the operation for the newest winner.
+- Pause, stop, and final-waiter cancellation drain health delay, command delay, and physical apply before restoration or completion.
+- Cancelled shared start/reconnect callers resolve independently while remaining callers keep one shared dependency operation. A sole cancelled start drains capture and cannot later activate.
+- Added 13 deterministic reconnect/lifecycle tests without `Task.yield()` ordering.
+- Verification passed: 68 orchestrator tests, 107 relevant tests, 207 full tests, 200/200 bounded race repetitions, release build, diff check, and security scan.
+
+Full evidence: `.superpowers/sdd/task-8-correction-2-report.md`. Remaining concerns are unchanged: no live bulb or process-kill test was run.

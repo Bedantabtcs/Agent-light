@@ -80,20 +80,11 @@ private final class MonitoringSubscriberRegistry: @unchecked Sendable {
 private actor MonitoringOperationCompletion {
     private var isFinished = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
-    private var waiterCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     func wait() async {
         if isFinished { return }
         await withCheckedContinuation { continuation in
             waiters.append(continuation)
-            resumeWaiterCountWaiters()
-        }
-    }
-
-    func waitUntilWaiterCount(_ count: Int) async {
-        if waiters.count >= count { return }
-        await withCheckedContinuation { continuation in
-            waiterCountWaiters.append((count, continuation))
         }
     }
 
@@ -103,12 +94,6 @@ private actor MonitoringOperationCompletion {
         let current = waiters
         waiters.removeAll()
         for waiter in current { waiter.resume() }
-    }
-
-    private func resumeWaiterCountWaiters() {
-        let ready = waiterCountWaiters.filter { waiters.count >= $0.0 }
-        waiterCountWaiters.removeAll { waiters.count >= $0.0 }
-        for waiter in ready { waiter.1.resume() }
     }
 }
 
@@ -124,6 +109,32 @@ private actor MonitoringResultCompletion {
     }
 
     func finish(_ result: Bool) {
+        guard self.result == nil else { return }
+        self.result = result
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume(returning: result) }
+    }
+}
+
+private enum MonitoringLifecycleWaiterResult: Sendable {
+    case success
+    case failure
+    case cancelled
+}
+
+private actor MonitoringLifecycleWaiterCompletion {
+    private var result: MonitoringLifecycleWaiterResult?
+    private var waiters: [CheckedContinuation<MonitoringLifecycleWaiterResult, Never>] = []
+
+    func wait() async -> MonitoringLifecycleWaiterResult {
+        if let result { return result }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func finish(_ result: MonitoringLifecycleWaiterResult) {
         guard self.result == nil else { return }
         self.result = result
         let current = waiters
@@ -169,6 +180,31 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         case failed
     }
 
+    private struct ReconnectOperation: Sendable {
+        enum Phase: Equatable, Sendable {
+            case health
+            case commandWindow
+            case applying
+        }
+
+        let id: UUID
+        var phase: Phase
+        var waiters: [UUID: MonitoringOperationCompletion]
+        let completion: MonitoringOperationCompletion
+    }
+
+    private enum ReconnectTerminal: Sendable {
+        case connected
+        case disconnected
+        case lifecycleCancelled
+    }
+
+    private struct LifecycleResolution: Sendable {
+        let activeWaiters: [MonitoringLifecycleWaiterCompletion]
+        let activeResult: MonitoringLifecycleWaiterResult
+        let cancelledWaiters: [MonitoringLifecycleWaiterCompletion]
+    }
+
     private struct TerminalTimer: Sendable {
         let id: UUID
         let task: Task<Void, Never>
@@ -189,8 +225,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private var lifecycleTail: MonitoringResultCompletion?
     private var lifecycleTailID: UUID?
     private var currentTransitionKind: LifecycleOperation?
-    private var currentTransitionCompletion: MonitoringResultCompletion?
     private var currentTransitionID: UUID?
+    private var lifecycleTransitionWaiters: [UUID: [UUID: MonitoringLifecycleWaiterCompletion]] = [:]
+    private var lifecycleCancelledWaiters: [UUID: [MonitoringLifecycleWaiterCompletion]] = [:]
+    private var lifecycleTransitionRequests: [UUID: UInt64] = [:]
+    private var lifecycleTransitionKinds: [UUID: LifecycleOperation] = [:]
+    private var lifecycleWaiterCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var nextSequence: UInt64 = 0
     private var latestSessionSequence: [String: UInt64] = [:]
     private var baseline: BulbBaseline?
@@ -203,16 +243,16 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private var throttleID: UUID?
     private var throttleOperationStarted = false
     private var throttleRescheduleRequested = false
-    private var reconnectCompletion: MonitoringOperationCompletion?
-    private var reconnectApplyCompletion: MonitoringOperationCompletion?
-    private var reconnectApplyPending = false
+    private var reconnectOperation: ReconnectOperation?
+    private var reconnectWaiterCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var reconnectHealthTask: Task<ReconnectHealthOutcome, Never>?
-    private var reconnectHealthID: UUID?
     private var lifecycleRetryID: UUID?
     private var cancelLifecycleRetry: (@Sendable () -> Void)?
     private var terminalTasks: [String: TerminalTimer] = [:]
     private var lastApplied: DesiredLightState?
+    private var lastAppliedWaiters: [(DesiredLightState, CheckedContinuation<Void, Never>)] = []
     private var connection: LightConnectionStatus = .connected
+    private var connectionWaiters: [(LightConnectionStatus, CheckedContinuation<Void, Never>)] = []
     private var snapshot = MonitoringSnapshot(state: .idle, sessions: [], connection: .connected)
 
     public init(
@@ -267,7 +307,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
 
     public func start() async throws {
         if mode == .active, lifecycleTail == nil { return }
-        try await enqueueLifecycle(.activate)
+        try await awaitLifecycle(.activate)
     }
 
     public func resume() async throws {
@@ -275,16 +315,16 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     public func pause() async {
-        try? await enqueueLifecycle(.pause)
+        try? await awaitLifecycle(.pause)
     }
 
     public func stop() async {
-        try? await enqueueLifecycle(.stop)
+        try? await awaitLifecycle(.stop)
     }
 
     public func recoverIfNeeded() async throws {
         guard mode == .inactive else { return }
-        try await enqueueLifecycle(.recover)
+        try await awaitLifecycle(.recover)
     }
 
     public func accept(_ event: AgentEvent) async {
@@ -321,10 +361,17 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         guard mode == .active, generation == token else { return }
 
         if accepted.state == .idle, await coordinator.currentWinner() == nil {
+            let reconnectID = reconnectOperation?.id
             await cancelThrottleAndWait()
             guard mode == .active, generation == token else { return }
             if await coordinator.currentWinner() == nil {
-                _ = await restoreCurrentOwnership()
+                let restored = await restoreCurrentOwnership()
+                if let reconnectID, reconnectOperation?.id == reconnectID {
+                    await finishReconnect(
+                        id: reconnectID,
+                        terminal: restored ? .connected : .disconnected
+                    )
+                }
             } else {
                 scheduleThrottleIfNeeded()
             }
@@ -334,24 +381,64 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     public func reconnect() async {
-        if let reconnectCompletion {
-            await reconnectCompletion.wait()
-            return
+        guard mode == .active, connection == .disconnected else { return }
+        let waiterID = UUID()
+        let waiterCompletion = MonitoringOperationCompletion()
+        let operationID: UUID
+        let startsOperation: Bool
+        if var operation = reconnectOperation {
+            operation.waiters[waiterID] = waiterCompletion
+            reconnectOperation = operation
+            operationID = operation.id
+            startsOperation = false
+        } else {
+            operationID = UUID()
+            reconnectOperation = ReconnectOperation(
+                id: operationID,
+                phase: .health,
+                waiters: [waiterID: waiterCompletion],
+                completion: MonitoringOperationCompletion()
+            )
+            startsOperation = true
         }
-        let completion = MonitoringOperationCompletion()
-        reconnectCompletion = completion
-        await performReconnect()
-        if reconnectCompletion === completion {
-            reconnectCompletion = nil
+        resumeReconnectWaiterCountWaiters()
+
+        await withTaskCancellationHandler {
+            if startsOperation {
+                Task { [weak self] in
+                    await self?.performReconnect(id: operationID)
+                }
+            }
+            await waiterCompletion.wait()
+        } onCancel: { [weak self] in
+            Task { [weak self] in
+                await self?.cancelReconnectWaiter(
+                    operationID: operationID,
+                    waiterID: waiterID
+                )
+            }
         }
-        await completion.finish()
     }
 
-    private func performReconnect() async {
-        guard mode == .active, connection == .disconnected else { return }
+    private func performReconnect(id: UUID) async {
+        guard reconnectOperation?.id == id,
+              mode == .active,
+              connection == .disconnected else {
+            await finishReconnect(id: id, terminal: .lifecycleCancelled)
+            return
+        }
         let token = generation
         if clearPending {
-            guard await retryPendingClear(), generation == token, mode == .active else { return }
+            guard await retryPendingClear() else {
+                await finishReconnect(id: id, terminal: .disconnected)
+                return
+            }
+            guard reconnectOperation?.id == id,
+                  generation == token,
+                  mode == .active else {
+                await finishReconnect(id: id, terminal: .lifecycleCancelled)
+                return
+            }
         }
 
         let light = self.light
@@ -359,7 +446,6 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         let jitter = self.jitter
         let isTransient = self.isTransient
         let lastApplied = self.lastApplied
-        let healthID = UUID()
         let healthTask = Task<ReconnectHealthOutcome, Never> {
             do {
                 try await clock.sleep(for: .seconds(1))
@@ -387,37 +473,43 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             }
         }
         reconnectHealthTask = healthTask
-        reconnectHealthID = healthID
         let health = await healthTask.value
-        if reconnectHealthID == healthID {
+        if reconnectOperation?.id == id {
             reconnectHealthTask = nil
-            reconnectHealthID = nil
         }
-        guard generation == token, mode == .active else { return }
+        guard reconnectOperation?.id == id else { return }
+        guard generation == token, mode == .active else {
+            await finishReconnect(id: id, terminal: .lifecycleCancelled)
+            return
+        }
 
         switch health {
-        case .matching, .healthy:
-            connection = .connected
-            await refreshSnapshot()
-            scheduleThrottleIfNeeded()
-        case .mismatching:
-            guard let winner = await coordinator.currentWinner(),
-                  winner.state.color != nil,
-                  generation == token,
-                  mode == .active else {
-                return
-            }
-            let applyCompletion = MonitoringOperationCompletion()
-            reconnectApplyCompletion = applyCompletion
-            reconnectApplyPending = true
-            scheduleThrottleIfNeeded()
-            await applyCompletion.wait()
+        case .matching, .mismatching, .healthy:
+            await continueReconnectAfterHealth(id: id, generation: token)
         case .failed:
-            if generation == token, mode == .active {
-                connection = .disconnected
-                await refreshSnapshot()
-            }
+            await finishReconnect(id: id, terminal: .disconnected)
         }
+    }
+
+    private func continueReconnectAfterHealth(id: UUID, generation token: UInt64) async {
+        let winner = await coordinator.currentWinner()
+        guard reconnectOperation?.id == id,
+              generation == token,
+              mode == .active else {
+            await finishReconnect(id: id, terminal: .lifecycleCancelled)
+            return
+        }
+        guard let winner, let color = winner.state.color else {
+            await finishReconnect(id: id, terminal: .connected)
+            return
+        }
+        let desired = DesiredLightState(color: color)
+        guard desired != lastApplied else {
+            await finishReconnect(id: id, terminal: .connected)
+            return
+        }
+        reconnectOperation?.phase = .commandWindow
+        scheduleThrottleIfNeeded()
     }
 
     public func updates() -> AsyncStream<MonitoringSnapshot> {
@@ -452,8 +544,32 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
     }
 
+    func waitForLifecycleWaiterCount(_ count: Int) async {
+        if lifecycleTransitionWaiters.values.contains(where: { $0.count >= count }) { return }
+        await withCheckedContinuation { continuation in
+            lifecycleWaiterCountWaiters.append((count, continuation))
+        }
+    }
+
     func waitForReconnectWaiterCount(_ count: Int) async {
-        await reconnectCompletion?.waitUntilWaiterCount(count)
+        if let reconnectOperation, reconnectOperation.waiters.count >= count { return }
+        await withCheckedContinuation { continuation in
+            reconnectWaiterCountWaiters.append((count, continuation))
+        }
+    }
+
+    func waitForLastApplied(_ state: DesiredLightState) async {
+        if lastApplied == state { return }
+        await withCheckedContinuation { continuation in
+            lastAppliedWaiters.append((state, continuation))
+        }
+    }
+
+    func waitForConnection(_ status: LightConnectionStatus) async {
+        if connection == status { return }
+        await withCheckedContinuation { continuation in
+            connectionWaiters.append((status, continuation))
+        }
     }
 
     nonisolated static func productionJitter(for base: Duration, sample: Double) -> Duration {
@@ -485,11 +601,33 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
     }
 
-    private func enqueueLifecycle(_ operation: LifecycleOperation) async throws {
+    private func awaitLifecycle(_ operation: LifecycleOperation) async throws {
+        let waiterID = UUID()
+        let waiterCompletion = MonitoringLifecycleWaiterCompletion()
+        try await withTaskCancellationHandler {
+            try await enqueueLifecycle(
+                operation,
+                waiterID: waiterID,
+                waiterCompletion: waiterCompletion
+            )
+        } onCancel: { [weak self] in
+            Task { [weak self] in
+                await self?.cancelLifecycleWaiter(waiterID)
+            }
+        }
+    }
+
+    private func enqueueLifecycle(
+        _ operation: LifecycleOperation,
+        waiterID: UUID,
+        waiterCompletion: MonitoringLifecycleWaiterCompletion
+    ) async throws {
         if operation == .activate,
            currentTransitionKind == .activate,
-           let currentTransitionCompletion {
-            try resolveTransitionResult(await currentTransitionCompletion.wait() ? .success : .failure)
+           let currentTransitionID {
+            lifecycleTransitionWaiters[currentTransitionID, default: [:]][waiterID] = waiterCompletion
+            resumeLifecycleWaiterCountWaiters()
+            try resolveLifecycleWaiterResult(await waiterCompletion.wait())
             return
         }
 
@@ -518,9 +656,40 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         lifecycleTail = completion
         lifecycleTailID = id
         currentTransitionKind = operation
-        currentTransitionCompletion = completion
         currentTransitionID = id
+        lifecycleTransitionWaiters[id] = [waiterID: waiterCompletion]
+        lifecycleTransitionRequests[id] = request
+        lifecycleTransitionKinds[id] = operation
+        resumeLifecycleWaiterCountWaiters()
 
+        Task { [weak self] in
+            guard let resolution = await self?.runLifecycle(
+                operation,
+                request: request,
+                id: id,
+                predecessor: predecessor,
+                completion: completion
+            ) else {
+                await waiterCompletion.finish(.failure)
+                return
+            }
+            for waiter in resolution.activeWaiters {
+                await waiter.finish(resolution.activeResult)
+            }
+            for waiter in resolution.cancelledWaiters {
+                await waiter.finish(.cancelled)
+            }
+        }
+        try resolveLifecycleWaiterResult(await waiterCompletion.wait())
+    }
+
+    private func runLifecycle(
+        _ operation: LifecycleOperation,
+        request: UInt64,
+        id: UUID,
+        predecessor: MonitoringResultCompletion?,
+        completion: MonitoringResultCompletion
+    ) async -> LifecycleResolution {
         _ = await predecessor?.wait()
         let result = await performLifecycle(operation, request: request)
         let succeeded: Bool
@@ -529,21 +698,71 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         case .failure: succeeded = false
         }
         await completion.finish(succeeded)
+        let waiterResult: MonitoringLifecycleWaiterResult = succeeded ? .success : .failure
+        let activeWaiters = lifecycleTransitionWaiters[id].map { Array($0.values) } ?? []
+        let cancelledWaiters = lifecycleCancelledWaiters[id] ?? []
+        lifecycleTransitionWaiters[id] = nil
+        lifecycleCancelledWaiters[id] = nil
+        lifecycleTransitionRequests[id] = nil
+        lifecycleTransitionKinds[id] = nil
         if currentTransitionID == id {
             currentTransitionKind = nil
-            currentTransitionCompletion = nil
             currentTransitionID = nil
         }
         if lifecycleTailID == id {
             lifecycleTail = nil
             lifecycleTailID = nil
         }
-        try resolveTransitionResult(result)
+        return LifecycleResolution(
+            activeWaiters: activeWaiters,
+            activeResult: waiterResult,
+            cancelledWaiters: cancelledWaiters
+        )
     }
 
-    private func resolveTransitionResult(_ result: TransitionResult) throws {
-        if case .failure = result {
+    private func cancelLifecycleWaiter(_ waiterID: UUID) async {
+        guard let transition = lifecycleTransitionWaiters.first(where: {
+            $0.value[waiterID] != nil
+        }) else { return }
+        var waiters = transition.value
+        guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
+        lifecycleTransitionWaiters[transition.key] = waiters
+        let cancelsOperation = waiters.isEmpty
+            && lifecycleTransitionRequests[transition.key] == lifecycleRequest
+        guard cancelsOperation else {
+            await waiter.finish(.cancelled)
+            return
+        }
+        lifecycleCancelledWaiters[transition.key, default: []].append(waiter)
+
+        cancelLifecycleRetry?()
+        lifecycleRequest &+= 1
+        generation &+= 1
+        if lifecycleTransitionKinds[transition.key] == .activate {
+            mode = .inactive
+        }
+        let readyRequestWaiters = lifecycleRequestWaiters.filter { lifecycleRequest >= $0.0 }
+        lifecycleRequestWaiters.removeAll { lifecycleRequest >= $0.0 }
+        for waiter in readyRequestWaiters { waiter.1.resume() }
+    }
+
+    private func resumeLifecycleWaiterCountWaiters() {
+        let maximum = lifecycleTransitionWaiters.values.map(\.count).max() ?? 0
+        let ready = lifecycleWaiterCountWaiters.filter { maximum >= $0.0 }
+        lifecycleWaiterCountWaiters.removeAll { maximum >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+    }
+
+    private func resolveLifecycleWaiterResult(
+        _ result: MonitoringLifecycleWaiterResult
+    ) throws {
+        switch result {
+        case .success:
+            return
+        case .failure:
             throw MonitoringOrchestratorError.operationFailed
+        case .cancelled:
+            throw CancellationError()
         }
     }
 
@@ -614,10 +833,8 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     private func performDeactivate(target: Mode, request: UInt64) async {
+        await cancelReconnectAndWait()
         await cancelThrottleAndWait()
-        if let reconnectCompletion {
-            await reconnectCompletion.wait()
-        }
         guard lifecycleRequest == request else { return }
         cancelTerminalTasks()
         await coordinator.reset()
@@ -683,8 +900,9 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     private func scheduleThrottleIfNeeded() {
+        let reconnectCanApply = reconnectOperation?.phase == .commandWindow
         guard mode == .active,
-              connection == .connected || reconnectApplyPending,
+              connection == .connected || reconnectCanApply,
               restoreCompletion == nil,
               !clearPending,
               throttleTask == nil else { return }
@@ -698,49 +916,78 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 await self?.cancelledThrottle(id: id)
                 return
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else {
+                await self?.cancelledThrottle(id: id)
+                return
+            }
             await self?.fireThrottle(id: id, generation: token)
         }
     }
 
     private func fireThrottle(id: UUID, generation token: UInt64) async {
+        let reconnectID = reconnectOperation?.phase == .commandWindow
+            ? reconnectOperation?.id
+            : nil
         guard throttleID == id,
               generation == token,
               mode == .active,
-              connection == .connected || reconnectApplyPending,
+              connection == .connected || reconnectID != nil,
               restoreCompletion == nil,
-              !clearPending else { return }
+              !clearPending else {
+            finishThrottle(id: id)
+            return
+        }
         let winner = await coordinator.currentWinner()
-        guard generation == token, mode == .active else { return }
+        guard throttleID == id, generation == token, mode == .active else {
+            finishThrottle(id: id)
+            return
+        }
         guard let winner, let color = winner.state.color else {
             finishThrottle(id: id)
-            _ = await restoreCurrentOwnership()
+            if let reconnectID {
+                await finishReconnect(id: reconnectID, terminal: .connected)
+            } else {
+                _ = await restoreCurrentOwnership()
+            }
             return
         }
         let desired = DesiredLightState(color: color)
         if desired == lastApplied {
             finishThrottle(id: id)
+            if let reconnectID {
+                await finishReconnect(id: reconnectID, terminal: .connected)
+            }
             return
         }
 
+        if let reconnectID, reconnectOperation?.id == reconnectID {
+            reconnectOperation?.phase = .applying
+        }
         throttleOperationStarted = true
         let outcome = await apply(desired, winnerSequence: winner.sequence, generation: token)
         throttleOperationStarted = false
         finishThrottle(id: id)
+
+        if let reconnectID, reconnectOperation?.id == reconnectID {
+            await resolveReconnectApply(
+                id: reconnectID,
+                outcome: outcome,
+                attemptedWinnerSequence: winner.sequence,
+                appliedState: desired,
+                generation: token
+            )
+            return
+        }
+
         switch outcome {
         case let .applied(state):
             lastApplied = state
+            resumeLastAppliedWaiters()
             connection = .connected
         case .superseded:
             break
         case .failed:
             connection = .disconnected
-        }
-        if reconnectApplyPending {
-            reconnectApplyPending = false
-            let completion = reconnectApplyCompletion
-            reconnectApplyCompletion = nil
-            await completion?.finish()
         }
         await refreshSnapshot()
         guard generation == token, mode == .active else { return }
@@ -1027,10 +1274,17 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         guard mode == .active, generation == token else { return }
         await refreshSnapshot()
         if await coordinator.currentWinner() == nil {
+            let reconnectID = reconnectOperation?.id
             await cancelThrottleAndWait()
             guard mode == .active, generation == token else { return }
             if await coordinator.currentWinner() == nil {
-                _ = await restoreCurrentOwnership()
+                let restored = await restoreCurrentOwnership()
+                if let reconnectID, reconnectOperation?.id == reconnectID {
+                    await finishReconnect(
+                        id: reconnectID,
+                        terminal: restored ? .connected : .disconnected
+                    )
+                }
             } else {
                 scheduleThrottleIfNeeded()
             }
@@ -1048,6 +1302,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     private func refreshSnapshot() async {
+        resumeConnectionWaiters()
         let sessions = await coordinator.snapshots()
         snapshot = MonitoringSnapshot(
             state: sessions.first?.state ?? .idle,
@@ -1055,6 +1310,119 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             connection: connection
         )
         subscribers.yield(snapshot)
+    }
+
+    private func resolveReconnectApply(
+        id: UUID,
+        outcome: SendOutcome,
+        attemptedWinnerSequence: UInt64,
+        appliedState: DesiredLightState,
+        generation token: UInt64
+    ) async {
+        guard reconnectOperation?.id == id else { return }
+        switch outcome {
+        case let .applied(state):
+            lastApplied = state
+            resumeLastAppliedWaiters()
+            await finishReconnect(id: id, terminal: .connected)
+        case .failed:
+            await finishReconnect(id: id, terminal: .disconnected)
+        case .superseded:
+            guard generation == token, mode == .active else {
+                await finishReconnect(id: id, terminal: .lifecycleCancelled)
+                return
+            }
+            if Task.isCancelled, !throttleRescheduleRequested {
+                await finishReconnect(id: id, terminal: .lifecycleCancelled)
+                return
+            }
+            let currentWinner = await coordinator.currentWinner()
+            guard reconnectOperation?.id == id,
+                  generation == token,
+                  mode == .active else {
+                await finishReconnect(id: id, terminal: .lifecycleCancelled)
+                return
+            }
+            guard let currentWinner, let color = currentWinner.state.color else {
+                await finishReconnect(id: id, terminal: .connected)
+                return
+            }
+            let currentDesired = DesiredLightState(color: color)
+            guard currentWinner.sequence != attemptedWinnerSequence || currentDesired != appliedState else {
+                await finishReconnect(id: id, terminal: .disconnected)
+                return
+            }
+            guard currentDesired != lastApplied else {
+                await finishReconnect(id: id, terminal: .connected)
+                return
+            }
+            throttleRescheduleRequested = false
+            reconnectOperation?.phase = .commandWindow
+            scheduleThrottleIfNeeded()
+        }
+    }
+
+    private func finishReconnect(id: UUID, terminal: ReconnectTerminal) async {
+        guard let operation = reconnectOperation, operation.id == id else { return }
+        reconnectOperation = nil
+        reconnectHealthTask = nil
+        switch terminal {
+        case .connected:
+            connection = .connected
+        case .disconnected:
+            connection = .disconnected
+        case .lifecycleCancelled:
+            break
+        }
+        await refreshSnapshot()
+        for waiter in operation.waiters.values {
+            await waiter.finish()
+        }
+        await operation.completion.finish()
+    }
+
+    private func resumeLastAppliedWaiters() {
+        guard let lastApplied else { return }
+        let ready = lastAppliedWaiters.filter { $0.0 == lastApplied }
+        lastAppliedWaiters.removeAll { $0.0 == lastApplied }
+        for waiter in ready { waiter.1.resume() }
+    }
+
+    private func resumeConnectionWaiters() {
+        let ready = connectionWaiters.filter { $0.0 == connection }
+        connectionWaiters.removeAll { $0.0 == connection }
+        for waiter in ready { waiter.1.resume() }
+    }
+
+    private func cancelReconnectWaiter(operationID: UUID, waiterID: UUID) async {
+        guard var operation = reconnectOperation,
+              operation.id == operationID,
+              let waiter = operation.waiters.removeValue(forKey: waiterID) else { return }
+        reconnectOperation = operation
+        await waiter.finish()
+        guard operation.waiters.isEmpty else { return }
+        await cancelReconnectAndWait(id: operationID)
+    }
+
+    private func cancelReconnectAndWait() async {
+        guard let id = reconnectOperation?.id else { return }
+        await cancelReconnectAndWait(id: id)
+    }
+
+    private func cancelReconnectAndWait(id: UUID) async {
+        guard reconnectOperation?.id == id else { return }
+        let healthTask = reconnectHealthTask
+        healthTask?.cancel()
+        _ = await healthTask?.value
+        await cancelThrottleAndWait()
+        await finishReconnect(id: id, terminal: .lifecycleCancelled)
+    }
+
+    private func resumeReconnectWaiterCountWaiters() {
+        let count = reconnectOperation?.waiters.count ?? 0
+        let ready = reconnectWaiterCountWaiters.filter { count >= $0.0 }
+        reconnectWaiterCountWaiters.removeAll { count >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
     }
 
     private func finishThrottle(id: UUID) {
@@ -1067,20 +1435,16 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private func cancelledThrottle(id: UUID) async {
         guard throttleID == id else { return }
         finishThrottle(id: id)
-        if reconnectApplyPending {
-            reconnectApplyPending = false
-            let completion = reconnectApplyCompletion
-            reconnectApplyCompletion = nil
-            await completion?.finish()
-        }
     }
 
     private func cancelThrottleAndWait() async {
         let task = throttleTask
+        let id = throttleID
         task?.cancel()
-        throttleID = nil
         await task?.value
-        throttleTask = nil
+        if let id {
+            finishThrottle(id: id)
+        }
     }
 
     private func cancelTerminalTasks() {
