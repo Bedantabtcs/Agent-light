@@ -396,12 +396,16 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
         case clear
     }
 
-    private var record: MonitoringRecoveryRecord?
+    private let revisionScope = UUID()
+    private var nextRevisionGeneration: UInt64 = 0
+    private var stored: StoredMonitoringRecovery?
     private var saveFailures: [TestLightError]
     private var saveFailureCalls: Set<Int>
     private var saveCallCount = 0
     private var clearFailures: [TestLightError]
     private(set) var operations: [Operation] = []
+    private(set) var successfulSaveRevisions: [MonitoringRecoveryRevision] = []
+    private(set) var clearExpectations: [StoredMonitoringRecovery] = []
 
     init(
         record: MonitoringRecoveryRecord? = nil,
@@ -409,18 +413,27 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
         saveFailureCalls: Set<Int> = [],
         clearFailures: [TestLightError] = []
     ) {
-        self.record = record
         self.saveFailures = saveFailures
         self.saveFailureCalls = saveFailureCalls
         self.clearFailures = clearFailures
+        if let record {
+            nextRevisionGeneration = 1
+            stored = StoredMonitoringRecovery(
+                record: record,
+                revision: MonitoringRecoveryRevision(
+                    scope: revisionScope,
+                    generation: nextRevisionGeneration
+                )
+            )
+        }
     }
 
-    func load() async throws -> MonitoringRecoveryRecord? {
+    func load() async throws -> StoredMonitoringRecovery? {
         operations.append(.load)
-        return record
+        return stored
     }
 
-    func save(_ record: MonitoringRecoveryRecord) async throws {
+    func save(_ record: MonitoringRecoveryRecord) async throws -> MonitoringRecoveryRevision {
         operations.append(.save(record))
         saveCallCount += 1
         if saveFailureCalls.remove(saveCallCount) != nil {
@@ -429,22 +442,34 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
         if !saveFailures.isEmpty {
             throw saveFailures.removeFirst()
         }
-        self.record = record
+        nextRevisionGeneration &+= 1
+        let revision = MonitoringRecoveryRevision(
+            scope: revisionScope,
+            generation: nextRevisionGeneration
+        )
+        stored = StoredMonitoringRecovery(record: record, revision: revision)
+        successfulSaveRevisions.append(revision)
+        return revision
     }
 
-    func clear(expecting expected: MonitoringRecoveryRecord) async throws {
+    func clear(expecting expected: StoredMonitoringRecovery) async throws {
         operations.append(.clear)
+        clearExpectations.append(expected)
         if !clearFailures.isEmpty {
             throw clearFailures.removeFirst()
         }
-        guard record == expected else {
+        guard stored == expected else {
             throw MonitoringRecoveryStoreError.concurrentModification
         }
-        record = nil
+        stored = nil
     }
 
     func storedRecord() -> MonitoringRecoveryRecord? {
-        record
+        stored?.record
+    }
+
+    func storedRecovery() -> StoredMonitoringRecovery? {
+        stored
     }
 }
 

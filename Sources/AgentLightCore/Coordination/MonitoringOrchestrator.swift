@@ -194,7 +194,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private var nextSequence: UInt64 = 0
     private var latestSessionSequence: [String: UInt64] = [:]
     private var baseline: BulbBaseline?
-    private var recoveryRecord: MonitoringRecoveryRecord?
+    private var storedRecovery: StoredMonitoringRecovery?
     private var adoptedBaseline: BulbBaseline?
     private var clearPending = false
     private var restoreCompletion: MonitoringResultCompletion?
@@ -579,7 +579,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
         guard lifecycleRequest == request else { throw CancellationError() }
 
-        if baseline != nil, recoveryRecord != nil {
+        if baseline != nil, storedRecovery != nil {
             mode = .active
             await refreshSnapshot()
             guard lifecycleRequest == request else { throw CancellationError() }
@@ -599,14 +599,15 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
         guard lifecycleRequest == request else { throw CancellationError() }
         let record = MonitoringRecoveryRecord(baseline: captured)
-        try await recoveryStore.save(record)
+        let revision = try await recoveryStore.save(record)
+        let stored = StoredMonitoringRecovery(record: record, revision: revision)
         guard lifecycleRequest == request else {
-            recoveryRecord = record
+            storedRecovery = stored
             clearPending = true
             throw CancellationError()
         }
         baseline = captured
-        recoveryRecord = record
+        storedRecovery = stored
         connection = .connected
         mode = .active
         await refreshSnapshot()
@@ -636,12 +637,13 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             }
             return
         }
-        guard let record = try await recoveryStore.load() else { return }
+        guard let stored = try await recoveryStore.load() else { return }
         guard lifecycleRequest == request else { throw CancellationError() }
+        let record = stored.record
         let commands = [record.lastCommand, record.pendingCommand].compactMap { $0 }
         if commands.isEmpty {
             adoptedBaseline = record.baseline
-            recoveryRecord = record
+            storedRecovery = stored
             clearPending = true
             guard await retryPendingClear(), lifecycleRequest == request else {
                 throw CancellationError()
@@ -657,7 +659,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             guard lifecycleRequest == request else { throw CancellationError() }
             if matches {
                 baseline = record.baseline
-                recoveryRecord = record
+                storedRecovery = stored
                 guard await restoreCurrentOwnership(), lifecycleRequest == request else {
                     throw MonitoringOrchestratorError.operationFailed
                 }
@@ -671,9 +673,9 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
         guard lifecycleRequest == request else { throw CancellationError() }
         let replacement = MonitoringRecoveryRecord(baseline: external)
-        try await recoveryStore.save(replacement)
+        let revision = try await recoveryStore.save(replacement)
         adoptedBaseline = external
-        recoveryRecord = replacement
+        storedRecovery = StoredMonitoringRecovery(record: replacement, revision: revision)
         clearPending = true
         guard await retryPendingClear(), lifecycleRequest == request else {
             throw MonitoringOrchestratorError.operationFailed
@@ -758,7 +760,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         do {
             try await ensureOwnership(generation: token)
             guard await isCurrent(desired, winnerSequence: winnerSequence, generation: token),
-                  let currentRecord = recoveryRecord else {
+                  let currentRecord = storedRecovery?.record else {
                 return .superseded
             }
             let pending = MonitoringRecoveryRecord(
@@ -766,8 +768,11 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 lastCommand: currentRecord.lastCommand,
                 pendingCommand: desired
             )
-            try await recoveryStore.save(pending)
-            recoveryRecord = pending
+            let pendingRevision = try await recoveryStore.save(pending)
+            storedRecovery = StoredMonitoringRecovery(
+                record: pending,
+                revision: pendingRevision
+            )
             guard await isCurrent(desired, winnerSequence: winnerSequence, generation: token) else {
                 return .superseded
             }
@@ -786,8 +791,11 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 baseline: pending.baseline,
                 lastCommand: desired
             )
-            try await recoveryStore.save(committed)
-            recoveryRecord = committed
+            let committedRevision = try await recoveryStore.save(committed)
+            storedRecovery = StoredMonitoringRecovery(
+                record: committed,
+                revision: committedRevision
+            )
             return .applied(desired)
         } catch is CancellationError {
             return .superseded
@@ -797,7 +805,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     private func ensureOwnership(generation token: UInt64) async throws {
-        if baseline != nil, recoveryRecord != nil { return }
+        if baseline != nil, storedRecovery != nil { return }
         guard generation == token, mode == .active, !clearPending, restoreCompletion == nil else {
             throw CancellationError()
         }
@@ -808,14 +816,15 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
         guard generation == token, mode == .active else { throw CancellationError() }
         let record = MonitoringRecoveryRecord(baseline: captured)
-        try await recoveryStore.save(record)
+        let revision = try await recoveryStore.save(record)
+        let stored = StoredMonitoringRecovery(record: record, revision: revision)
         guard generation == token, mode == .active else {
-            recoveryRecord = record
+            storedRecovery = stored
             clearPending = true
             throw CancellationError()
         }
         baseline = captured
-        recoveryRecord = record
+        storedRecovery = stored
     }
 
     private func isCurrent(
@@ -859,7 +868,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 restoreTaskID = nil
                 baseline = nil
                 lastApplied = nil
-                clearPending = recoveryRecord != nil
+                clearPending = storedRecovery != nil
             }
             let cleared = await retryPendingClear()
             if cleared, mode == .active {
@@ -885,10 +894,10 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         guard clearPending else { return true }
         do {
             try Task.checkCancellation()
-            guard let expectedRecord = recoveryRecord else { return true }
-            try await recoveryStore.clear(expecting: expectedRecord)
+            guard let expected = storedRecovery else { return true }
+            try await recoveryStore.clear(expecting: expected)
             clearPending = false
-            recoveryRecord = nil
+            storedRecovery = nil
             return true
         } catch {
             connection = .disconnected

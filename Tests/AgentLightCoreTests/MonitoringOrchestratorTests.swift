@@ -62,6 +62,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let clock = ManualClock()
         let orchestrator = makeOrchestrator(light: light, store: store, clock: clock)
         try await orchestrator.start()
+        let baselineOwnership = await store.storedRecovery()
 
         await orchestrator.accept(makeEvent(state: .thinking))
         await clock.advance(by: .seconds(1))
@@ -74,6 +75,8 @@ final class MonitoringOrchestratorTests: XCTestCase {
             await store.storedRecord(),
             MonitoringRecoveryRecord(baseline: .testBaseline)
         )
+        await XCTAssertAsyncEqual(await store.storedRecovery(), baselineOwnership)
+        await XCTAssertAsyncEqual(await store.successfulSaveRevisions.count, 1)
     }
 
     func testCommittedPersistenceFailureLeavesPendingCommandRecoverable() async throws {
@@ -92,6 +95,10 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncEqual(await light.appliedStates(), [desired(.working)])
         await XCTAssertAsyncEqual((await store.storedRecord())?.pendingCommand, desired(.working))
         await XCTAssertAsyncNil((await store.storedRecord())?.lastCommand)
+        let stored = await store.storedRecovery()
+        let revisions = await store.successfulSaveRevisions
+        XCTAssertEqual(revisions.count, 2)
+        XCTAssertEqual(stored?.revision, revisions.last)
     }
 
     func testRapidCrossAgentEventsUseLocalAcceptanceOrderAndNewestWins() async throws {
@@ -488,6 +495,48 @@ final class MonitoringOrchestratorTests: XCTestCase {
         XCTAssertNil(records[1].lastCommand)
         XCTAssertEqual(records[2].lastCommand, desired(.working))
         XCTAssertNil(records[2].pendingCommand)
+    }
+
+    func testRecoveryRevisionFlowsThroughPendingCommittedAndClear() async throws {
+        let light = RecordingLightController()
+        let store = MemoryRecoveryStore()
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, store: store, clock: clock)
+
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .working))
+        await clock.advance(by: .seconds(1))
+        await XCTAssertAsyncTrue(await eventually { await store.successfulSaveRevisions.count == 3 })
+        await orchestrator.pause()
+
+        let revisions = await store.successfulSaveRevisions
+        let clearExpectations = await store.clearExpectations
+        XCTAssertEqual(revisions.count, 3)
+        XCTAssertEqual(Set(revisions).count, 3)
+        XCTAssertEqual(clearExpectations.count, 1)
+        XCTAssertEqual(clearExpectations.first?.revision, revisions.last)
+        XCTAssertEqual(clearExpectations.first?.record.lastCommand, desired(.working))
+        XCTAssertNil(clearExpectations.first?.record.pendingCommand)
+    }
+
+    func testRecoveryRetainsLoadedRevisionAcrossClearRetry() async throws {
+        let record = MonitoringRecoveryRecord(
+            baseline: .testBaseline,
+            lastCommand: desired(.thinking)
+        )
+        let light = RecordingLightController(matchResults: [.success(true)])
+        let store = MemoryRecoveryStore(record: record, clearFailures: [.permanent])
+        let loadedValue = await store.storedRecovery()
+        let loaded = try XCTUnwrap(loadedValue)
+        let orchestrator = makeOrchestrator(light: light, store: store)
+
+        await XCTAssertThrowsErrorAsync { try await orchestrator.recoverIfNeeded() }
+        try await orchestrator.recoverIfNeeded()
+
+        let clearExpectations = await store.clearExpectations
+        XCTAssertEqual(clearExpectations, [loaded, loaded])
+        await XCTAssertAsyncNil(await store.storedRecovery())
+        await XCTAssertAsyncEqual(await light.restoreCount(), 1)
     }
 
     func testMultipleUpdateSubscribersReceiveInitialAndCurrentSnapshots() async throws {
@@ -1061,6 +1110,112 @@ final class MonitoringOrchestratorTests: XCTestCase {
 }
 
 final class FileMonitoringRecoveryStoreTests: XCTestCase {
+    func testClearRejectsByteIdenticalReplacementWithDifferentRevision() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let store = FileMonitoringRecoveryStore(url: url)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+        _ = try await store.save(record)
+        let loaded = try await store.load()
+        let stored = try XCTUnwrap(loaded)
+        let bytes = try Data(contentsOf: url)
+
+        try replaceInode(at: url, bytes: bytes)
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.clear(expecting: stored)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        XCTAssertEqual(try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: bytes), stored.record)
+    }
+
+    func testClearRejectsEarlierSaveRevisionForByteIdenticalGeneration() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let store = FileMonitoringRecoveryStore(url: url)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline)
+        let earlierRevision = try await store.save(record)
+        let currentRevision = try await store.save(record)
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.clear(
+                expecting: StoredMonitoringRecovery(record: record, revision: earlierRevision)
+            )
+        }
+
+        await XCTAssertAsyncEqual((try await store.load())?.record, record)
+        try await store.clear(
+            expecting: StoredMonitoringRecovery(record: record, revision: currentRevision)
+        )
+        await XCTAssertAsyncNil(try await store.load())
+    }
+
+    func testSaveAndLoadIssuedRevisionsClearTheirExactInstalledGenerations() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let store = FileMonitoringRecoveryStore(url: url)
+        let first = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let saveRevision = try await store.save(first)
+
+        try await store.clear(
+            expecting: StoredMonitoringRecovery(record: first, revision: saveRevision)
+        )
+        await XCTAssertAsyncNil(try await store.load())
+
+        let second = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+        _ = try await store.save(second)
+        let loadedValue = try await store.load()
+        let loaded = try XCTUnwrap(loadedValue)
+        try await store.clear(expecting: loaded)
+
+        await XCTAssertAsyncNil(try await store.load())
+    }
+
+    func testFreshStoreIssuesActorScopedRevisionForOpenedGeneration() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let firstStore = FileMonitoringRecoveryStore(url: url)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline)
+        let saveRevision = try await firstStore.save(record)
+        let reopenedStore = FileMonitoringRecoveryStore(url: url)
+
+        let reopenedValue = try await reopenedStore.load()
+        let reopened = try XCTUnwrap(reopenedValue)
+
+        XCTAssertNotEqual(reopened.revision, saveRevision)
+        try await reopenedStore.clear(expecting: reopened)
+        await XCTAssertAsyncNil(try await reopenedStore.load())
+    }
+
+    func testFailedSaveRetainsPriorRevisionAndCommittedSaveReturnsNewRevision() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let priorRevision = try await store.save(original)
+        let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+        operations.failNextFileSync = true
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
+            _ = try await store.save(replacement)
+        }
+
+        try await store.clear(
+            expecting: StoredMonitoringRecovery(record: original, revision: priorRevision)
+        )
+        let committedRevision = try await store.save(replacement)
+        XCTAssertNotEqual(committedRevision, priorRevision)
+        try await store.clear(
+            expecting: StoredMonitoringRecovery(record: replacement, revision: committedRevision)
+        )
+    }
+
     func testSaveUsesMode0600AndRoundTripsRecord() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1070,7 +1225,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
 
         try await store.save(record)
 
-        await XCTAssertAsyncEqual(try await store.load(), record)
+        await XCTAssertAsyncEqual((try await store.load())?.record, record)
         var info = stat()
         XCTAssertEqual(lstat(url.path, &info), 0)
         XCTAssertEqual(info.st_mode & 0o777, 0o600)
@@ -1086,7 +1241,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
 
         try await store.save(replacement)
 
-        await XCTAssertAsyncEqual(try await store.load(), replacement)
+        await XCTAssertAsyncEqual((try await store.load())?.record, replacement)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [url.lastPathComponent])
     }
 
@@ -1156,7 +1311,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
         let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
         let concurrent = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.error))
-        try await store.save(original)
+        _ = try await store.save(original)
         let concurrentBytes = try encoded(concurrent)
         operations.beforeSwap = {
             try replaceInode(at: url, bytes: concurrentBytes)
@@ -1176,7 +1331,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let operations = FaultInjectingRecoveryPOSIXOperations()
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
         let original = MonitoringRecoveryRecord(baseline: .testBaseline)
-        try await store.save(original)
+        let originalRevision = try await store.save(original)
         let concurrent = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.error))
         let concurrentBytes = try encoded(concurrent)
         operations.beforeRenameExclusive = {
@@ -1184,7 +1339,9 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         }
 
         await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
-            try await store.clear(expecting: original)
+            try await store.clear(
+                expecting: StoredMonitoringRecovery(record: original, revision: originalRevision)
+            )
         }
 
         XCTAssertEqual(try Data(contentsOf: url), concurrentBytes)
@@ -1204,7 +1361,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
             try await store.save(MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working)))
         }
 
-        await XCTAssertAsyncEqual(try await store.load(), original)
+        await XCTAssertAsyncEqual((try await store.load())?.record, original)
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [url.lastPathComponent])
     }
 
@@ -1218,10 +1375,16 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
         operations.failNextUnlink = true
 
-        try await store.save(replacement)
+        let replacementRevision = try await store.save(replacement)
 
-        await XCTAssertAsyncEqual(try await store.load(), replacement)
+        await XCTAssertAsyncEqual((try await store.load())?.record, replacement)
         XCTAssertGreaterThan(try FileManager.default.contentsOfDirectory(atPath: directory.path).count, 1)
+        try await store.clear(
+            expecting: StoredMonitoringRecovery(
+                record: replacement,
+                revision: replacementRevision
+            )
+        )
     }
 
     func testDirectorySyncFailureAfterReplacementPreservesBothRecoveryRecords() async throws {
@@ -1270,16 +1433,17 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
         let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
         let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
-        try await store.save(original)
+        let originalRevision = try await store.save(original)
+        let expected = StoredMonitoringRecovery(record: original, revision: originalRevision)
         operations.failNextUnlink = true
 
-        try await store.clear(expecting: original)
+        try await store.clear(expecting: expected)
         try await store.save(replacement)
         await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
-            try await store.clear(expecting: original)
+            try await store.clear(expecting: expected)
         }
 
-        await XCTAssertAsyncEqual(try await store.load(), replacement)
+        await XCTAssertAsyncEqual((try await store.load())?.record, replacement)
     }
 
     func testConditionalClearDirectorySyncFailurePreservesQuarantinedRecord() async throws {
@@ -1289,16 +1453,19 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let operations = FaultInjectingRecoveryPOSIXOperations()
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
         let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
-        try await store.save(original)
+        let originalRevision = try await store.save(original)
+        let expected = StoredMonitoringRecovery(record: original, revision: originalRevision)
         operations.failNextDirectorySync = true
 
         await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
-            try await store.clear(expecting: original)
+            try await store.clear(expecting: expected)
         }
 
         let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         XCTAssertEqual(artifacts.count, 1)
         XCTAssertEqual(try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: artifacts[0])), original)
+        try await store.clear(expecting: expected)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
     }
 
     func testSaveParentReplacementAfterCommitSyncPreservesDisplacedRecord() async throws {
@@ -1341,14 +1508,16 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let operations = FaultInjectingRecoveryPOSIXOperations()
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
         let record = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
-        try await store.save(record)
+        let revision = try await store.save(record)
         operations.afterNextDirectorySync = {
             try FileManager.default.moveItem(at: parent, to: movedParent)
             try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
         }
 
         await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
-            try await store.clear(expecting: record)
+            try await store.clear(
+                expecting: StoredMonitoringRecovery(record: record, revision: revision)
+            )
         }
 
         let artifacts = try FileManager.default.contentsOfDirectory(at: movedParent, includingPropertiesForKeys: nil)
@@ -1373,7 +1542,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
 
         try await store.save(record)
 
-        await XCTAssertAsyncEqual(try await store.load(), record)
+        await XCTAssertAsyncEqual((try await store.load())?.record, record)
         XCTAssertEqual(try Data(contentsOf: collision), Data("collision".utf8))
     }
 
@@ -1383,21 +1552,22 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let url = directory.appendingPathComponent("monitoring-recovery.json")
         let store = FileMonitoringRecoveryStore(url: url)
         let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
-        try await store.save(original)
+        let originalRevision = try await store.save(original)
+        let expected = StoredMonitoringRecovery(record: original, revision: originalRevision)
 
         let save = Task {
             withUnsafeCurrentTask { $0?.cancel() }
-            try await store.save(MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working)))
+            _ = try await store.save(MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working)))
         }
         await XCTAssertTaskIsCancelled(save)
-        await XCTAssertAsyncEqual(try await store.load(), original)
+        await XCTAssertAsyncEqual((try await store.load())?.record, original)
 
         let clear = Task {
             withUnsafeCurrentTask { $0?.cancel() }
-            try await store.clear(expecting: original)
+            try await store.clear(expecting: expected)
         }
         await XCTAssertTaskIsCancelled(clear)
-        await XCTAssertAsyncEqual(try await store.load(), original)
+        await XCTAssertAsyncEqual((try await store.load())?.record, original)
     }
 
     func testOpenedDescriptorLoadIsStableAcrossPathReplacement() async throws {
@@ -1413,7 +1583,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
             try replaceInode(at: url, bytes: try encoded(concurrent))
         }
 
-        await XCTAssertAsyncEqual(try await store.load(), original)
+        await XCTAssertAsyncEqual((try await store.load())?.record, original)
         XCTAssertEqual(try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: url)), concurrent)
     }
 
@@ -1471,10 +1641,12 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let operations = FaultInjectingRecoveryPOSIXOperations()
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
         let record = MonitoringRecoveryRecord(baseline: .testBaseline)
-        try await store.save(record)
+        let revision = try await store.save(record)
         operations.failNextUnlink = true
 
-        try await store.clear(expecting: record)
+        try await store.clear(
+            expecting: StoredMonitoringRecovery(record: record, revision: revision)
+        )
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
         let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)

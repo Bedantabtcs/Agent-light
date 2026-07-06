@@ -9,9 +9,30 @@ public protocol TuyaLightControlling: Sendable {
 }
 
 public protocol MonitoringRecoveryStoring: Sendable {
-    func load() async throws -> MonitoringRecoveryRecord?
-    func save(_ record: MonitoringRecoveryRecord) async throws
-    func clear(expecting record: MonitoringRecoveryRecord) async throws
+    func load() async throws -> StoredMonitoringRecovery?
+    @discardableResult
+    func save(_ record: MonitoringRecoveryRecord) async throws -> MonitoringRecoveryRevision
+    func clear(expecting stored: StoredMonitoringRecovery) async throws
+}
+
+public struct MonitoringRecoveryRevision: Hashable, Sendable {
+    private let scope: UUID
+    private let generation: UInt64
+
+    init(scope: UUID, generation: UInt64) {
+        self.scope = scope
+        self.generation = generation
+    }
+}
+
+public struct StoredMonitoringRecovery: Equatable, Sendable {
+    public let record: MonitoringRecoveryRecord
+    public let revision: MonitoringRecoveryRevision
+
+    public init(record: MonitoringRecoveryRecord, revision: MonitoringRecoveryRevision) {
+        self.record = record
+        self.revision = revision
+    }
 }
 
 public struct MonitoringRecoveryRecord: Codable, Equatable, Sendable {
@@ -222,6 +243,9 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
     private let url: URL
     private let operations: any MonitoringRecoveryPOSIXOperations
     private let temporaryName: @Sendable () -> String
+    private let revisionScope = UUID()
+    private var nextRevisionGeneration: UInt64 = 0
+    private var revisionOwnership: [MonitoringRecoveryRevision: RevisionOwnership] = [:]
 
     public init(url: URL) {
         self.url = url
@@ -243,7 +267,7 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         self.temporaryName = temporaryName
     }
 
-    public func load() throws -> MonitoringRecoveryRecord? {
+    public func load() throws -> StoredMonitoringRecovery? {
         try Task.checkCancellation()
         let location = try validatedLocation()
         let directory = try openValidatedDirectory(location.parentPath)
@@ -276,13 +300,17 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         }
         try verifyParent(location.parentPath, matches: directory.metadata)
         do {
-            return try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: data)
+            let record = try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: data)
+            invalidateDestinationRevisions(except: metadata.identity)
+            let revision = issueRevision(for: metadata.identity)
+            return StoredMonitoringRecovery(record: record, revision: revision)
         } catch {
             throw MonitoringRecoveryStoreError.malformedRecord
         }
     }
 
-    public func save(_ record: MonitoringRecoveryRecord) throws {
+    @discardableResult
+    public func save(_ record: MonitoringRecoveryRecord) throws -> MonitoringRecoveryRevision {
         try Task.checkCancellation()
         let data: Data
         do {
@@ -320,6 +348,8 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         } catch {
             throw MonitoringRecoveryStoreError.ioFailure
         }
+        let preparedMetadata = try metadataOrIO(temporary.descriptor)
+        try validateFile(preparedMetadata)
         try Task.checkCancellation()
         try verifyParent(location.parentPath, matches: directory.metadata)
 
@@ -390,18 +420,41 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             }
             try verifyParent(location.parentPath, matches: directory.metadata)
         }
+        guard let installedIdentity = try existingIdentity(
+            directory: directory.descriptor,
+            name: location.fileName
+        ), installedIdentity == preparedMetadata.identity else {
+            throw MonitoringRecoveryStoreError.concurrentModification
+        }
+        invalidateDestinationRevisions()
+        return issueRevision(for: installedIdentity)
     }
 
-    public func clear(expecting expected: MonitoringRecoveryRecord) throws {
+    public func clear(expecting expected: StoredMonitoringRecovery) throws {
         try Task.checkCancellation()
         let location = try validatedLocation()
         let directory = try openValidatedDirectory(location.parentPath)
         defer { operations.close(directory.descriptor) }
+        guard let ownership = revisionOwnership[expected.revision] else {
+            throw MonitoringRecoveryStoreError.concurrentModification
+        }
+        if case let .tombstone(name) = ownership.location {
+            try commitPendingClear(
+                expected: expected,
+                ownership: ownership,
+                tombstone: name,
+                location: location,
+                directory: directory
+            )
+            return
+        }
         guard let original = try existingRecord(
             directory: directory.descriptor,
             name: location.fileName
-        ) else { return }
-        guard original.record == expected else {
+        ) else {
+            throw MonitoringRecoveryStoreError.concurrentModification
+        }
+        guard original.identity == ownership.identity, original.record == expected.record else {
             throw MonitoringRecoveryStoreError.concurrentModification
         }
         try verifyParent(location.parentPath, matches: directory.metadata)
@@ -426,24 +479,21 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             }
         }
         guard let tombstone else { throw MonitoringRecoveryStoreError.ioFailure }
-        var preserveTombstone = true
-        defer {
-            if !preserveTombstone {
-                try? operations.unlink(at: directory.descriptor, name: tombstone)
-            }
-        }
+        revisionOwnership[expected.revision] = RevisionOwnership(
+            identity: ownership.identity,
+            location: .tombstone(tombstone)
+        )
 
         let moved = try existingRecord(directory: directory.descriptor, name: tombstone)
-        guard moved?.identity == original.identity, moved?.record == expected else {
+        guard moved?.identity == ownership.identity, moved?.record == expected.record else {
             do {
                 try operations.renameExclusive(
                     at: directory.descriptor,
                     from: tombstone,
                     to: location.fileName
                 )
-                preserveTombstone = false
+                revisionOwnership[expected.revision] = ownership
             } catch {
-                preserveTombstone = true
             }
             throw MonitoringRecoveryStoreError.concurrentModification
         }
@@ -455,23 +505,44 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
                     from: tombstone,
                     to: location.fileName
                 )
-                preserveTombstone = false
+                revisionOwnership[expected.revision] = ownership
             } catch {
-                preserveTombstone = true
             }
             throw CancellationError()
         }
+        try commitPendingClear(
+            expected: expected,
+            ownership: ownership,
+            tombstone: tombstone,
+            location: location,
+            directory: directory
+        )
+    }
+
+    private func commitPendingClear(
+        expected: StoredMonitoringRecovery,
+        ownership: RevisionOwnership,
+        tombstone: String,
+        location: Location,
+        directory: OpenDirectory
+    ) throws {
+        guard let moved = try existingRecord(directory: directory.descriptor, name: tombstone),
+              moved.identity == ownership.identity,
+              moved.record == expected.record else {
+            throw MonitoringRecoveryStoreError.concurrentModification
+        }
+        try Task.checkCancellation()
         do {
             try operations.synchronize(directory.descriptor, kind: .directory)
         } catch {
             throw MonitoringRecoveryStoreError.ioFailure
         }
         try verifyParent(location.parentPath, matches: directory.metadata)
+        invalidateRevisions(for: ownership.identity)
         do {
             try operations.unlink(at: directory.descriptor, name: tombstone)
             try operations.synchronize(directory.descriptor, kind: .directory)
         } catch {
-            preserveTombstone = true
         }
     }
 
@@ -493,6 +564,44 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
     private struct ExistingRecord {
         let identity: MonitoringRecoveryFileIdentity
         let record: MonitoringRecoveryRecord
+    }
+
+    private struct RevisionOwnership {
+        enum Location {
+            case destination
+            case tombstone(String)
+        }
+
+        let identity: MonitoringRecoveryFileIdentity
+        let location: Location
+    }
+
+    private func issueRevision(for identity: MonitoringRecoveryFileIdentity) -> MonitoringRecoveryRevision {
+        nextRevisionGeneration &+= 1
+        let revision = MonitoringRecoveryRevision(
+            scope: revisionScope,
+            generation: nextRevisionGeneration
+        )
+        revisionOwnership[revision] = RevisionOwnership(
+            identity: identity,
+            location: .destination
+        )
+        return revision
+    }
+
+    private func invalidateDestinationRevisions(
+        except identity: MonitoringRecoveryFileIdentity? = nil
+    ) {
+        revisionOwnership = revisionOwnership.filter { _, ownership in
+            guard case .destination = ownership.location else { return true }
+            return ownership.identity == identity
+        }
+    }
+
+    private func invalidateRevisions(for identity: MonitoringRecoveryFileIdentity) {
+        revisionOwnership = revisionOwnership.filter { _, ownership in
+            ownership.identity != identity
+        }
     }
 
     private func validatedLocation() throws -> Location {
