@@ -65,6 +65,22 @@ public actor TuyaClient {
         }
     }
 
+    public func specification() async throws -> TuyaSpecification {
+        let result = try await performAuthorizedRequest(
+            method: "GET",
+            pathComponents: ["v1.0", "devices", credentials.deviceID, "specifications"],
+            body: Data()
+        )
+        do {
+            return try JSONDecoder().decode(
+                TuyaSpecification.self,
+                from: result.encodedData()
+            )
+        } catch {
+            throw TuyaClientError.malformedResponse
+        }
+    }
+
     public func send(commands: [TuyaCommand]) async throws {
         let body: Data
         do {

@@ -213,6 +213,120 @@ final class TuyaClientTests: XCTestCase {
         ])
     }
 
+    func testSpecificationReturnsTypedSanitizedFixtureFromSignedDocumentedEndpoint() async throws {
+        let specificationJSON = try fixtureJSON(named: "tuya-standard-specification")
+        let transport = ScriptedTuyaTransport(steps: [
+            .json(200, tokenJSON("token", expiresIn: 7_200)),
+            .json(200, successJSON(result: specificationJSON))
+        ])
+        let client = makeClient(transport: transport)
+
+        let specification = try await client.specification()
+
+        XCTAssertEqual(specification.category, "dj")
+        XCTAssertEqual(specification.functions.map(\.code), [
+            "switch_led", "work_mode", "colour_data_v2", "bright_value_v2", "temp_value"
+        ])
+        let requests = await transport.recordedRequests()
+        let request = try XCTUnwrap(requests.first(where: isSpecificationRequest))
+        let components = try XCTUnwrap(request.url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)
+        })
+        XCTAssertEqual(components.percentEncodedPath, "/v1.0/devices/device-id/specifications")
+        XCTAssertTrue(isSignedRequest(request))
+    }
+
+    func testSpecificationAuthenticationFailureRefreshesOnceThroughAuthorizedPath() async throws {
+        let specificationJSON = try fixtureJSON(named: "tuya-nested-specification")
+        let transport = ScriptedTuyaTransport(steps: [
+            .json(200, tokenJSON("old-token", expiresIn: 7_200)),
+            .json(401, "unauthorized"),
+            .json(200, tokenJSON("new-token", expiresIn: 7_200)),
+            .json(200, successJSON(result: specificationJSON))
+        ])
+        let client = makeClient(transport: transport)
+
+        let specification = try await client.specification()
+
+        XCTAssertEqual(specification.functions.map(\.code), ["switch_led", "colour_data"])
+        let requests = await transport.recordedRequests()
+        XCTAssertEqual(requests.filter(isTokenRequest).count, 2)
+        XCTAssertEqual(requests.filter(isSpecificationRequest).count, 2)
+    }
+
+    func testSpecificationRejectsMalformedTypedResult() async {
+        let transport = ScriptedTuyaTransport(steps: [
+            .json(200, tokenJSON("token", expiresIn: 7_200)),
+            .json(200, successJSON(result: #"{"category":"dj","functions":[]}"#))
+        ])
+        let client = makeClient(transport: transport)
+
+        await XCTAssertThrowsTuyaError(.malformedResponse) {
+            try await client.specification()
+        }
+    }
+
+    func testSpecificationDeviceIDIsEncodedAsOnePathComponent() async throws {
+        let specificationJSON = try fixtureJSON(named: "tuya-standard-specification")
+        let transport = ScriptedTuyaTransport(steps: [
+            .json(200, tokenJSON("token", expiresIn: 7_200)),
+            .json(200, successJSON(result: specificationJSON))
+        ])
+        let client = TuyaClient(
+            credentials: TuyaCredentials(
+                endpoint: testEndpoint,
+                accessID: "access-id",
+                accessSecret: "access-secret",
+                deviceID: "device/../?agent-content"
+            ),
+            transport: transport,
+            now: { testDate },
+            nonce: { "nonce" }
+        )
+
+        _ = try await client.specification()
+
+        let requests = await transport.recordedRequests()
+        let request = try XCTUnwrap(requests.first(where: isSpecificationRequest))
+        let components = try XCTUnwrap(request.url.flatMap {
+            URLComponents(url: $0, resolvingAgainstBaseURL: false)
+        })
+        XCTAssertEqual(
+            components.percentEncodedPath,
+            "/v1.0/devices/device%2F..%2F%3Fagent-content/specifications"
+        )
+        XCTAssertNil(request.url?.query)
+    }
+
+    func testRestoreFromStringColorStatusSendsObjectPayloadWithPowerLast() async throws {
+        let specification = try JSONDecoder().decode(
+            TuyaSpecification.self,
+            from: Data(try fixtureJSON(named: "tuya-standard-specification").utf8)
+        )
+        let statuses = try decodedStatuses(from: fixtureJSON(named: "tuya-color-status"))
+        let capabilities = try TuyaCapabilityResolver.resolve(
+            specification: specification,
+            status: statuses
+        )
+        let commands = try capabilities.restoreCommands(
+            from: capabilities.baseline(from: statuses)
+        )
+        let transport = ScriptedTuyaTransport(steps: [
+            .json(200, tokenJSON("token", expiresIn: 7_200)),
+            .json(200, successJSON(result: "true"))
+        ])
+        let client = makeClient(transport: transport)
+
+        try await client.send(commands: commands)
+
+        let requests = await transport.recordedRequests()
+        let commandRequest = try XCTUnwrap(requests.first(where: isCommandRequest))
+        XCTAssertEqual(
+            commandRequest.httpBody,
+            Data(#"{"commands":[{"code":"work_mode","value":"scene"},{"code":"colour_data_v2","value":{"h":258,"s":626,"v":800}},{"code":"bright_value_v2","value":800},{"code":"temp_value","value":420},{"code":"switch_led","value":false}]}"#.utf8)
+        )
+    }
+
     func testCommandBodyUsesDeterministicJSON() async throws {
         let transport = ScriptedTuyaTransport(steps: [
             .json(200, tokenJSON("token", expiresIn: 7_200)),
@@ -660,6 +774,28 @@ private func statusJSON() -> String {
     #"{"success":true,"result":[{"code":"switch_led","value":true},{"code":"work_mode","value":"colour"}]}"#
 }
 
+private func fixtureJSON(named name: String) throws -> String {
+    let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json"))
+    return try String(contentsOf: url, encoding: .utf8)
+}
+
+private func decodedStatuses(from json: String) throws -> [TuyaStatus] {
+    let root = try JSONValue.decode(Data(json.utf8))
+    guard case let .array(items) = root else { throw ClientTestError.invalidFixture }
+    return try items.map { item in
+        guard case let .object(object) = item,
+              case let .string(code)? = object["code"],
+              let value = object["value"] else {
+            throw ClientTestError.invalidFixture
+        }
+        return TuyaStatus(code: code, value: value)
+    }
+}
+
+private enum ClientTestError: Error {
+    case invalidFixture
+}
+
 private func successJSON(result: String) -> String {
     #"{"success":true,"result":\#(result)}"#
 }
@@ -679,6 +815,10 @@ private func isCommandRequest(_ request: URLRequest) -> Bool {
 
 private func isStatusRequest(_ request: URLRequest) -> Bool {
     request.url?.path.hasSuffix("/status") == true
+}
+
+private func isSpecificationRequest(_ request: URLRequest) -> Bool {
+    request.url?.path.hasSuffix("/specifications") == true
 }
 
 private func isSignedRequest(_ request: URLRequest) -> Bool {

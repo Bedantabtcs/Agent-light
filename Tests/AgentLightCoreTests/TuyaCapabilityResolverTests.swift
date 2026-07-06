@@ -3,6 +3,32 @@ import XCTest
 @testable import AgentLightCore
 
 final class TuyaCapabilityResolverTests: XCTestCase {
+    func testAcceptsDocumentedFixedV2SchemaFromSanitizedFixture() throws {
+        let specification = try specificationFixture(named: "tuya-standard-specification")
+
+        let capabilities = try TuyaCapabilityResolver.resolve(specification: specification)
+        let payload = try colorPayload(from: LightColorMapper.commands(
+            for: DesiredLightState(color: RGBColor(hex: 0x00FF00)),
+            capabilities: capabilities
+        ))
+
+        XCTAssertEqual(capabilities.colorCode, "colour_data_v2")
+        XCTAssertEqual(payload, hsv(h: 120, s: 1000, v: 800))
+    }
+
+    func testAcceptsDocumentedNestedLegacySchemaFromSanitizedFixture() throws {
+        let specification = try specificationFixture(named: "tuya-nested-specification")
+
+        let capabilities = try TuyaCapabilityResolver.resolve(specification: specification)
+        let payload = try colorPayload(from: LightColorMapper.commands(
+            for: DesiredLightState(color: RGBColor(hex: 0x00FF00)),
+            capabilities: capabilities
+        ))
+
+        XCTAssertEqual(capabilities.colorCode, "colour_data")
+        XCTAssertEqual(payload, hsv(h: 120, s: 255, v: 204))
+    }
+
     func testV2CapabilitiesBuildApprovedThinkingCommandInDeterministicOrder() throws {
         let capabilities = try TuyaCapabilityResolver.resolve(
             specification: fixtureSpecification(
@@ -116,11 +142,44 @@ final class TuyaCapabilityResolverTests: XCTestCase {
         )
     }
 
+    func testRejectsMalformedPreferredNumericSchemasInsteadOfFallingBack() {
+        XCTAssertThrowsCapabilityError(
+            .invalidSchema("bright_value_v2"),
+            try TuyaCapabilityResolver.resolve(
+                specification: fixtureSpecification(functions: [
+                    power(), colorV2(), brightnessLegacy(),
+                    brightnessV2(values: #"{"min":10,"max":1000,"scale":0,"step":0}"#)
+                ])
+            )
+        )
+        XCTAssertThrowsCapabilityError(
+            .invalidSchema("temp_value_v2"),
+            try TuyaCapabilityResolver.resolve(
+                specification: fixtureSpecification(functions: [
+                    power(), colorV2(), temperature(),
+                    temperatureV2(values: "not-json")
+                ])
+            )
+        )
+    }
+
+    func testRejectsStepConstraintThatDoesNotAlignMaximumFromNonzeroMinimum() {
+        XCTAssertThrowsCapabilityError(
+            .invalidSchema("colour_data_v2"),
+            try TuyaCapabilityResolver.resolve(
+                specification: fixtureSpecification(functions: [
+                    power(),
+                    colorV2(values: colorSchema(s: (10, 100, 0, 16)))
+                ])
+            )
+        )
+    }
+
     func testAdvertisedRangesWithNonzeroMinimumScaleAndStepClampAndRoundDeterministically() throws {
         let schema = colorSchema(
             h: (100, 3_700, 2, 25),
-            s: (100, 900, 1, 30),
-            v: (200, 1_200, 1, 60)
+            s: (100, 900, 1, 25),
+            v: (200, 1_200, 1, 50)
         )
         let capabilities = try TuyaCapabilityResolver.resolve(
             specification: fixtureSpecification(
@@ -247,20 +306,18 @@ final class TuyaCapabilityResolverTests: XCTestCase {
         )
     }
 
-    func testBaselineRoundTripsExactTypedValuesAndNumericLexemesInCapabilityOrder() throws {
+    func testBaselineKeepsRawColorStringAndRestoreParsesObjectWithPowerLast() throws {
         let capabilities = try TuyaCapabilityResolver.resolve(
             specification: fixtureSpecification(
                 functions: [temperature(), colorV2(), brightnessV2(), mode(), power()]
             )
         )
-        let exactColor = try JSONValue.decode(
-            Data(#"{"h":258,"s":0435,"v":8.00e2}"#.replacingOccurrences(of: "0435", with: "435").utf8)
-        )
+        let exactColorString = #"{"h":258,"s":626,"v":8.00e2}"#
         let exactBrightness = JSONValue.number(try JSONNumber(lexeme: "8.00e2"))
         let statuses = [
-            TuyaStatus(code: "temp_value", value: .null),
+            TuyaStatus(code: "temp_value", value: .number(420)),
             TuyaStatus(code: "bright_value_v2", value: exactBrightness),
-            TuyaStatus(code: "colour_data_v2", value: exactColor),
+            TuyaStatus(code: "colour_data_v2", value: .string(exactColorString)),
             TuyaStatus(code: "work_mode", value: .string("scene")),
             TuyaStatus(code: "switch_led", value: .bool(false)),
             TuyaStatus(code: "unrelated", value: .array([.number(1)]))
@@ -270,16 +327,58 @@ final class TuyaCapabilityResolverTests: XCTestCase {
         let restored = try capabilities.restoreCommands(from: baseline)
 
         XCTAssertEqual(restored.map(\.code), [
-            "switch_led", "work_mode", "colour_data_v2", "bright_value_v2", "temp_value"
+            "work_mode", "colour_data_v2", "bright_value_v2", "temp_value", "switch_led"
         ])
-        XCTAssertEqual(restored.map(\.value), [
-            .bool(false), .string("scene"), exactColor, exactBrightness, .null
-        ])
-        guard case let .number(restoredNumber) = restored[3].value else {
+        XCTAssertEqual(baseline.values["colour_data_v2"], .string(exactColorString))
+        XCTAssertEqual(restored[0].value, .string("scene"))
+        XCTAssertEqual(restored[1].value, try JSONValue.decode(Data(exactColorString.utf8)))
+        XCTAssertEqual(restored[2].value, exactBrightness)
+        XCTAssertEqual(restored[3].value, .number(420))
+        XCTAssertEqual(restored[4].value, .bool(false))
+        guard case let .number(restoredNumber) = restored[2].value else {
             return XCTFail("Expected exact number")
         }
         XCTAssertEqual(restoredNumber.lexeme, "8.00e2")
         XCTAssertNil(baseline.values["unrelated"])
+    }
+
+    func testBaselineValidatesEveryResolvedStatusAgainstItsSchema() throws {
+        let steppedBrightness = brightnessV2(
+            values: #"{"min":10,"max":1000,"scale":0,"step":10}"#
+        )
+        let capabilities = try TuyaCapabilityResolver.resolve(
+            specification: fixtureSpecification(
+                functions: [power(), mode(), colorV2(), steppedBrightness, temperature()]
+            )
+        )
+        let valid = try statusFixture(named: "tuya-color-status")
+        _ = try capabilities.baseline(from: valid)
+
+        let invalidValues: [(String, JSONValue)] = [
+            ("switch_led", .number(1)),
+            ("work_mode", .string("unsupported")),
+            ("bright_value_v2", .number(15)),
+            ("bright_value_v2", .number(try JSONNumber(lexeme: "10.5"))),
+            ("bright_value_v2", .number(1_010)),
+            ("temp_value", .null),
+            ("colour_data_v2", .object(["h": .number(1), "s": .number(1), "v": .number(1)])),
+            ("colour_data_v2", .string("not-json")),
+            ("colour_data_v2", .string("[]")),
+            ("colour_data_v2", .string(#"{"h":258,"s":626}"#)),
+            ("colour_data_v2", .string(#"{"h":258,"s":626,"v":800,"extra":1}"#)),
+            ("colour_data_v2", .string(#"{"h":361,"s":626,"v":800}"#)),
+            ("colour_data_v2", .string(#"{"h":258,"s":626.5,"v":800}"#))
+        ]
+
+        for (code, value) in invalidValues {
+            let statuses = valid.map { status in
+                status.code == code ? TuyaStatus(code: code, value: value) : status
+            }
+            XCTAssertThrowsCapabilityError(
+                .invalidStatus(code),
+                try capabilities.baseline(from: statuses)
+            )
+        }
     }
 
     func testResolveWithStatusValidatesAndCapturesTheSameRestorableSet() throws {
@@ -338,6 +437,14 @@ private func colorLegacy() -> TuyaDataPointSpecification {
     TuyaDataPointSpecification(code: "colour_data", type: "Json", values: "{}")
 }
 
+private func brightnessLegacy() -> TuyaDataPointSpecification {
+    TuyaDataPointSpecification(
+        code: "bright_value",
+        type: "Integer",
+        values: #"{"min":10,"max":255,"scale":0,"step":1}"#
+    )
+}
+
 private func brightnessV2(
     values: String = #"{"min":10,"max":1000,"scale":0,"step":1}"#
 ) -> TuyaDataPointSpecification {
@@ -350,6 +457,29 @@ private func temperature() -> TuyaDataPointSpecification {
         type: "Integer",
         values: #"{"min":0,"max":1000,"scale":0,"step":1}"#
     )
+}
+
+private func temperatureV2(values: String) -> TuyaDataPointSpecification {
+    TuyaDataPointSpecification(code: "temp_value_v2", type: "Integer", values: values)
+}
+
+private func specificationFixture(named name: String) throws -> TuyaSpecification {
+    let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json"))
+    return try JSONDecoder().decode(TuyaSpecification.self, from: Data(contentsOf: url))
+}
+
+private func statusFixture(named name: String) throws -> [TuyaStatus] {
+    let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "json"))
+    let value = try JSONValue.decode(Data(contentsOf: url))
+    guard case let .array(items) = value else { throw TestError.invalidFixture }
+    return try items.map { item in
+        guard case let .object(object) = item,
+              case let .string(code)? = object["code"],
+              let statusValue = object["value"] else {
+            throw TestError.invalidFixture
+        }
+        return TuyaStatus(code: code, value: statusValue)
+    }
 }
 
 private func colorSchema(
@@ -381,6 +511,7 @@ private func colorPayload(from commands: [TuyaCommand]) throws -> JSONValue {
 
 private enum TestError: Error {
     case missingColorCommand
+    case invalidFixture
 }
 
 private func XCTAssertThrowsCapabilityError<T>(

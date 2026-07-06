@@ -18,6 +18,7 @@ public struct ResolvedLightCapabilities: Equatable, Sendable {
     public let color: ColorEncoding
 
     let colorConstraints: HSVConstraints
+    let modeValues: Set<String>?
     let brightnessConstraint: NumericConstraint?
     let temperatureConstraint: NumericConstraint?
 
@@ -30,18 +31,19 @@ public struct ResolvedLightCapabilities: Equatable, Sendable {
 
     init(
         powerCode: String,
-        modeCode: String?,
+        mode: ResolvedEnumCapability?,
         brightness: ResolvedNumericCapability?,
         temperature: ResolvedNumericCapability?,
         color: ColorEncoding,
         colorConstraints: HSVConstraints
     ) {
         self.powerCode = powerCode
-        self.modeCode = modeCode
+        modeCode = mode?.code
         brightnessCode = brightness?.code
         temperatureCode = temperature?.code
         self.color = color
         self.colorConstraints = colorConstraints
+        modeValues = mode?.values
         brightnessConstraint = brightness?.constraint
         temperatureConstraint = temperature?.constraint
     }
@@ -61,20 +63,88 @@ public struct ResolvedLightCapabilities: Equatable, Sendable {
         for code in restorable where valuesByCode[code] == nil {
             throw CapabilityError.missingStatus(code)
         }
+        for code in restorable {
+            guard let value = valuesByCode[code] else {
+                throw CapabilityError.missingStatus(code)
+            }
+            try validateStatus(value, code: code)
+        }
         return BulbBaseline(values: valuesByCode)
     }
 
     public func restoreCommands(from baseline: BulbBaseline) throws -> [TuyaCommand] {
-        try restorableCodes.map { code in
+        try restoreCodes.map { code in
             guard let value = baseline.values[code] else {
                 throw CapabilityError.missingStatus(code)
             }
-            return TuyaCommand(code: code, value: value)
+            try validateStatus(value, code: code)
+            let commandValue = code == colorCode ? try colorCommandValue(from: value) : value
+            return TuyaCommand(code: code, value: commandValue)
         }
     }
 
     private var restorableCodes: [String] {
         [powerCode, modeCode, colorCode, brightnessCode, temperatureCode].compactMap { $0 }
+    }
+
+    private var restoreCodes: [String] {
+        [modeCode, colorCode, brightnessCode, temperatureCode, powerCode].compactMap { $0 }
+    }
+
+    private func validateStatus(_ value: JSONValue, code: String) throws {
+        if code == powerCode {
+            guard case .bool = value else { throw CapabilityError.invalidStatus(code) }
+            return
+        }
+        if code == modeCode {
+            guard case let .string(mode) = value,
+                  modeValues?.contains(mode) == true else {
+                throw CapabilityError.invalidStatus(code)
+            }
+            return
+        }
+        if code == colorCode {
+            _ = try colorCommandValue(from: value)
+            return
+        }
+        if code == brightnessCode {
+            try validateIntegerStatus(value, constraint: brightnessConstraint, code: code)
+            return
+        }
+        if code == temperatureCode {
+            try validateIntegerStatus(value, constraint: temperatureConstraint, code: code)
+            return
+        }
+        throw CapabilityError.invalidStatus(code)
+    }
+
+    private func validateIntegerStatus(
+        _ value: JSONValue,
+        constraint: NumericConstraint?,
+        code: String
+    ) throws {
+        guard let constraint,
+              let integer = exactInteger(value),
+              constraint.contains(integer) else {
+            throw CapabilityError.invalidStatus(code)
+        }
+    }
+
+    private func colorCommandValue(from value: JSONValue) throws -> JSONValue {
+        guard case let .string(encodedColor) = value,
+              let data = encodedColor.data(using: .utf8),
+              let decoded = try? JSONValue.decode(data),
+              case let .object(object) = decoded,
+              Set(object.keys) == Set(["h", "s", "v"]),
+              let hue = exactInteger(object["h"]),
+              let saturation = exactInteger(object["s"]),
+              let brightness = exactInteger(object["v"]),
+              colorConstraints.hue.contains(hue),
+              colorConstraints.saturation.contains(saturation),
+              colorConstraints.value.contains(brightness) else {
+            throw CapabilityError.invalidStatus(colorCode)
+        }
+        return decoded
     }
 }
 
@@ -82,6 +152,7 @@ public enum CapabilityError: Error, Equatable, Sendable {
     case missingPower
     case missingColor
     case invalidSchema(String)
+    case invalidStatus(String)
     case missingStatus(String)
     case duplicateStatus(String)
 }
@@ -95,6 +166,8 @@ extension CapabilityError: LocalizedError {
             "The device does not advertise a supported color control."
         case let .invalidSchema(code):
             "The device advertises an invalid schema for \(code)."
+        case let .invalidStatus(code):
+            "The device returned an invalid status for \(code)."
         case let .missingStatus(code):
             "The device status is missing \(code)."
         case let .duplicateStatus(code):
@@ -142,7 +215,7 @@ public enum TuyaCapabilityResolver {
 
         let colorResolution: (ResolvedLightCapabilities.ColorEncoding, HSVConstraints)
         if let v2 = functions["colour_data_v2"] {
-            let constraints = try colorV2Constraints(v2)
+            let constraints = try colorConstraints(v2, fixed: .v2)
             colorResolution = (
                 .hsvV2(
                     code: v2.code,
@@ -153,18 +226,18 @@ public enum TuyaCapabilityResolver {
                 constraints
             )
         } else if let legacy = functions["colour_data"] {
-            try validateLegacyColor(legacy)
-            colorResolution = (.hsvLegacy(code: legacy.code), .legacy)
+            let constraints = try colorConstraints(legacy, fixed: .legacy)
+            colorResolution = (.hsvLegacy(code: legacy.code), constraints)
         } else {
             throw CapabilityError.missingColor
         }
 
-        let modeCode: String?
+        let modeCapability: ResolvedEnumCapability?
         if let mode = functions["work_mode"] {
-            try validateMode(mode)
-            modeCode = mode.code
+            let values = try modeValues(mode)
+            modeCapability = ResolvedEnumCapability(code: mode.code, values: values)
         } else {
-            modeCode = nil
+            modeCapability = nil
         }
 
         let brightness = try resolveNumeric(
@@ -177,7 +250,7 @@ public enum TuyaCapabilityResolver {
         )
         return ResolvedLightCapabilities(
             powerCode: power.code,
-            modeCode: modeCode,
+            mode: modeCapability,
             brightness: brightness,
             temperature: temperature,
             color: colorResolution.0,
@@ -205,7 +278,7 @@ public enum TuyaCapabilityResolver {
         _ = try objectValues(specification)
     }
 
-    private static func validateMode(_ specification: TuyaDataPointSpecification) throws {
+    private static func modeValues(_ specification: TuyaDataPointSpecification) throws -> Set<String> {
         guard specification.type == "Enum" else {
             throw CapabilityError.invalidSchema(specification.code)
         }
@@ -216,29 +289,26 @@ public enum TuyaCapabilityResolver {
               range.contains(.string("colour")) else {
             throw CapabilityError.invalidSchema(specification.code)
         }
+        return Set(range.compactMap(\.stringValue))
     }
 
-    private static func colorV2Constraints(
-        _ specification: TuyaDataPointSpecification
+    private static func colorConstraints(
+        _ specification: TuyaDataPointSpecification,
+        fixed: HSVConstraints
     ) throws -> HSVConstraints {
         guard specification.type == "Json" else {
             throw CapabilityError.invalidSchema(specification.code)
         }
         let object = try objectValues(specification)
+        if object.isEmpty { return fixed }
+        guard Set(object.keys) == Set(["h", "s", "v"]) else {
+            throw CapabilityError.invalidSchema(specification.code)
+        }
         return HSVConstraints(
             hue: try numericConstraint(object["h"], code: specification.code),
             saturation: try numericConstraint(object["s"], code: specification.code),
             value: try numericConstraint(object["v"], code: specification.code)
         )
-    }
-
-    private static func validateLegacyColor(
-        _ specification: TuyaDataPointSpecification
-    ) throws {
-        guard specification.type == "Json",
-              try objectValues(specification).isEmpty else {
-            throw CapabilityError.invalidSchema(specification.code)
-        }
     }
 
     private static func resolveNumeric(
@@ -289,7 +359,7 @@ public enum TuyaCapabilityResolver {
             throw CapabilityError.invalidSchema(code)
         }
         let (width, overflow) = maximum.subtractingReportingOverflow(minimum)
-        guard !overflow, step <= width else {
+        guard !overflow, step <= width, width % step == 0 else {
             throw CapabilityError.invalidSchema(code)
         }
         return NumericConstraint(
@@ -300,15 +370,34 @@ public enum TuyaCapabilityResolver {
     }
 
     private static func integer(_ value: JSONValue?) -> Int? {
-        guard case let .number(number)? = value else { return nil }
-        return Int(number.lexeme)
+        exactInteger(value)
     }
+}
+
+private func exactInteger(_ value: JSONValue?) -> Int? {
+    guard case let .number(number)? = value,
+          let decimal = Decimal(string: number.lexeme, locale: Locale(identifier: "en_US_POSIX")) else {
+        return nil
+    }
+    var source = decimal
+    var rounded = Decimal()
+    NSDecimalRound(&rounded, &source, 0, .plain)
+    guard rounded == decimal,
+          rounded >= Decimal(Int64.min),
+          rounded <= Decimal(Int64.max) else {
+        return nil
+    }
+    return Int(NSDecimalNumber(decimal: rounded).int64Value)
 }
 
 struct NumericConstraint: Equatable, Sendable {
     let range: ClosedRange<Int>
     let scale: Int
     let step: Int
+
+    func contains(_ value: Int) -> Bool {
+        range.contains(value) && (value - range.lowerBound) % step == 0
+    }
 }
 
 struct HSVConstraints: Equatable, Sendable {
@@ -321,6 +410,17 @@ struct HSVConstraints: Equatable, Sendable {
         saturation: NumericConstraint(range: 0 ... 255, scale: 0, step: 1),
         value: NumericConstraint(range: 0 ... 255, scale: 0, step: 1)
     )
+
+    static let v2 = HSVConstraints(
+        hue: NumericConstraint(range: 0 ... 360, scale: 0, step: 1),
+        saturation: NumericConstraint(range: 0 ... 1_000, scale: 0, step: 1),
+        value: NumericConstraint(range: 0 ... 1_000, scale: 0, step: 1)
+    )
+}
+
+struct ResolvedEnumCapability: Equatable, Sendable {
+    let code: String
+    let values: Set<String>
 }
 
 struct ResolvedNumericCapability: Equatable, Sendable {

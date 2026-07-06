@@ -1,0 +1,15 @@
+{
+  "category": "dj",
+  "functions": [
+    {"code": "switch_led", "type": "Boolean", "values": "{}"},
+    {"code": "work_mode", "type": "Enum", "values": "{\"range\":[\"white\",\"colour\",\"scene\",\"music\"]}"},
+    {"code": "colour_data_v2", "type": "Json", "values": "{}"},
+    {"code": "bright_value_v2", "type": "Integer", "values": "{\"min\":10,\"max\":1000,\"scale\":0,\"step\":1}"},
+    {"code": "temp_value", "type": "Integer", "values": "{\"min\":0,\"max\":1000,\"scale\":0,\"step\":1}"}
+  ],
+  "status": [
+    {"code": "switch_led", "type": "Boolean", "values": "{}"},
+    {"code": "work_mode", "type": "Enum", "values": "{\"range\":[\"white\",\"colour\",\"scene\",\"music\"]}"},
+    {"code": "colour_data_v2", "type": "Json", "values": "{}"}
+  ]
+}

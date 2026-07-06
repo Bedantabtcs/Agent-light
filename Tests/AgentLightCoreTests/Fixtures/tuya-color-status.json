@@ -1,0 +1,7 @@
+[
+  {"code": "switch_led", "value": false},
+  {"code": "work_mode", "value": "scene"},
+  {"code": "colour_data_v2", "value": "{\"h\":258,\"s\":626,\"v\":8.00e2}"},
+  {"code": "bright_value_v2", "value": 8.00e2},
+  {"code": "temp_value", "value": 420}
+]
