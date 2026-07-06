@@ -17,11 +17,13 @@ actor ManualClock: AgentLightClock {
     private var nowNanoseconds: Int64 = 0
     private var sleepers: [UUID: Sleeper] = [:]
     private(set) var requestedSleeps: [Duration] = []
+    private var sleepCountWaiters: [UUID: (Int, CheckedContinuation<Void, Never>)] = [:]
 
     func sleep(for duration: Duration) async throws {
         let id = UUID()
         let nanoseconds = duration.nanoseconds
         requestedSleeps.append(duration)
+        resumeSleepCountWaiters()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 sleepers[id] = Sleeper(
@@ -54,9 +56,26 @@ actor ManualClock: AgentLightClock {
         sleepers.count
     }
 
+    func waitForSleepCount(_ count: Int) async {
+        if requestedSleeps.count >= count { return }
+        let id = UUID()
+        await withCheckedContinuation { continuation in
+            sleepCountWaiters[id] = (count, continuation)
+        }
+    }
+
     private func cancel(id: UUID) {
         guard let sleeper = sleepers.removeValue(forKey: id) else { return }
         sleeper.continuation.resume(throwing: CancellationError())
+    }
+
+
+    private func resumeSleepCountWaiters() {
+        let ready = sleepCountWaiters.filter { requestedSleeps.count >= $0.value.0 }
+        for (id, waiter) in ready {
+            sleepCountWaiters[id] = nil
+            waiter.1.resume()
+        }
     }
 }
 
@@ -85,8 +104,14 @@ actor RecordingLightController: TuyaLightControlling {
     private var matchResults: [Result<Bool, TestLightError>]
     private var blockedApply: CheckedContinuation<Void, Never>?
     private var blockedRestore: CheckedContinuation<Void, Never>?
+    private var blockedCapture: CheckedContinuation<Void, Never>?
+    private var blockedMatch: CheckedContinuation<Void, Never>?
     private var shouldBlockApply = false
     private var shouldBlockRestore = false
+    private var shouldBlockCapture = false
+    private var shouldBlockMatch = false
+    private var captureErrors: [any Error] = []
+    private var matchErrors: [any Error] = []
     private(set) var operations: [Operation] = []
 
     init(
@@ -105,6 +130,14 @@ actor RecordingLightController: TuyaLightControlling {
 
     func captureBaseline() async throws -> BulbBaseline {
         operations.append(.capture)
+        if shouldBlockCapture {
+            await withCheckedContinuation { continuation in
+                blockedCapture = continuation
+            }
+        }
+        if !captureErrors.isEmpty {
+            throw captureErrors.removeFirst()
+        }
         if !captureResults.isEmpty {
             return try captureResults.removeFirst().get()
         }
@@ -125,6 +158,14 @@ actor RecordingLightController: TuyaLightControlling {
 
     func currentStateMatches(_ state: DesiredLightState) async throws -> Bool {
         operations.append(.match(state))
+        if shouldBlockMatch {
+            await withCheckedContinuation { continuation in
+                blockedMatch = continuation
+            }
+        }
+        if !matchErrors.isEmpty {
+            throw matchErrors.removeFirst()
+        }
         if !matchResults.isEmpty {
             return try matchResults.removeFirst().get()
         }
@@ -163,6 +204,34 @@ actor RecordingLightController: TuyaLightControlling {
         blockedRestore = nil
     }
 
+    func setCaptureBlocked(_ blocked: Bool) {
+        shouldBlockCapture = blocked
+    }
+
+    func releaseCapture() {
+        shouldBlockCapture = false
+        blockedCapture?.resume()
+        blockedCapture = nil
+    }
+
+    func setMatchBlocked(_ blocked: Bool) {
+        shouldBlockMatch = blocked
+    }
+
+    func releaseMatch() {
+        shouldBlockMatch = false
+        blockedMatch?.resume()
+        blockedMatch = nil
+    }
+
+    func enqueueCaptureErrors(_ errors: [any Error]) {
+        captureErrors.append(contentsOf: errors)
+    }
+
+    func enqueueMatchErrors(_ errors: [any Error]) {
+        matchErrors.append(contentsOf: errors)
+    }
+
     func appliedStates() -> [DesiredLightState] {
         operations.compactMap {
             guard case let .apply(state) = $0 else { return nil }
@@ -175,6 +244,59 @@ actor RecordingLightController: TuyaLightControlling {
             if case .restore = $0 { return true }
             return false
         }.count
+    }
+}
+
+actor CompletionFlag {
+    private var completed = false
+
+    func markCompleted() {
+        completed = true
+    }
+
+    func value() -> Bool {
+        completed
+    }
+}
+
+actor BlockingSessionCoordinator: SessionCoordinating {
+    private let underlying = SessionCoordinator()
+    private var shouldBlockNextAccept = false
+    private var blockedAccept: CheckedContinuation<Void, Never>?
+
+    func blockNextAccept() {
+        shouldBlockNextAccept = true
+    }
+
+    func releaseAccept() {
+        blockedAccept?.resume()
+        blockedAccept = nil
+    }
+
+    func accept(_ event: AgentEvent) async {
+        if shouldBlockNextAccept {
+            shouldBlockNextAccept = false
+            await withCheckedContinuation { continuation in
+                blockedAccept = continuation
+            }
+        }
+        await underlying.accept(event)
+    }
+
+    func expireTerminalState(sessionID: String, sequence: UInt64) async {
+        await underlying.expireTerminalState(sessionID: sessionID, sequence: sequence)
+    }
+
+    func currentWinner() async -> AgentEvent? {
+        await underlying.currentWinner()
+    }
+
+    func snapshots() async -> [AgentEvent] {
+        await underlying.snapshots()
+    }
+
+    func reset() async {
+        await underlying.reset()
     }
 }
 

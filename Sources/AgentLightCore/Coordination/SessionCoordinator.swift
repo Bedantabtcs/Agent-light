@@ -1,5 +1,13 @@
 import AgentLightProtocol
 
+public protocol SessionCoordinating: Sendable {
+    func accept(_ event: AgentEvent) async
+    func expireTerminalState(sessionID: String, sequence: UInt64) async
+    func currentWinner() async -> AgentEvent?
+    func snapshots() async -> [AgentEvent]
+    func reset() async
+}
+
 public actor SessionCoordinator {
     private var sessions: [String: AgentEvent] = [:]
 
@@ -52,3 +60,5 @@ public actor SessionCoordinator {
         return left.source.rawValue < right.source.rawValue
     }
 }
+
+extension SessionCoordinator: SessionCoordinating {}
