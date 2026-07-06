@@ -422,9 +422,68 @@ final class IntegrationInstallerTests: XCTestCase {
         }
 
         let artifacts = try temporaryArtifacts(in: root)
+        XCTAssertEqual(artifacts.count, 2)
         let rollbackArtifacts = artifacts.filter { $0.lastPathComponent.contains("rollback") }
         XCTAssertEqual(rollbackArtifacts.count, 1)
         XCTAssertEqual(try mode(at: try XCTUnwrap(rollbackArtifacts.first)), mode_t(0o600))
+    }
+
+    func testInternalSwapBackFailurePreservesDisplacedAndRollbackRecoveryMaterial() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let original = Data(#"{"original":true}"#.utf8)
+        let concurrent = Data(#"{"concurrent":true}"#.utf8)
+        try write(original, to: paths.codex)
+        let atomicRenamer = FailingSecondExchangeRenamer()
+        let base = POSIXIntegrationFileOperations(atomicRenamer: atomicRenamer)
+        let operations = FaultInjectingFileOperations(
+            base: base,
+            mutationBeforeRename: .replaceFileWithMode(url: paths.codex, data: concurrent, mode: 0o644)
+        )
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        do {
+            try await installer.install()
+            XCTFail("Expected internal exchange restoration failure")
+        } catch let error as IntegrationError {
+            guard case let .rollbackFailed(failures) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertTrue(failures.contains { $0.contains("atomic exchange restoration") })
+        }
+
+        XCTAssertTrue(String(decoding: try Data(contentsOf: paths.codex), as: UTF8.self).contains(AppIdentity.integrationIdentifier))
+        let artifacts = try temporaryArtifacts(in: root)
+        XCTAssertGreaterThanOrEqual(artifacts.count, 2)
+        let artifactData = try artifacts.map { try Data(contentsOf: $0) }
+        XCTAssertTrue(artifactData.contains(original))
+        XCTAssertTrue(artifactData.contains(concurrent))
+        XCTAssertTrue(try artifacts.allSatisfy { try mode(at: $0) == mode_t(0o600) })
+    }
+
+    func testMissingDestinationRollbackDoesNotDeleteConcurrentReplacementAfterVerification() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let concurrent = Data(#"{"concurrent-after-verification":true}"#.utf8)
+        let operations = FaultInjectingFileOperations(
+            mutationBeforeRemove: .replaceFile(url: paths.codex, data: concurrent),
+            failRenameCall: 2
+        )
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/AgentLightRelay",
+            paths: paths,
+            fileOperations: operations
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.install())
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), concurrent)
     }
 
     private func temporaryRoot() -> URL {
@@ -461,12 +520,14 @@ final class IntegrationInstallerTests: XCTestCase {
 private final class FaultInjectingFileOperations: IntegrationFileOperating, @unchecked Sendable {
     enum Mutation: Sendable {
         case replaceFile(url: URL, data: Data)
+        case replaceFileWithMode(url: URL, data: Data, mode: mode_t)
         case modifyFileInPlace(url: URL, data: Data)
         case replaceWithSymlink(url: URL, destination: URL)
 
         var target: URL {
             switch self {
             case let .replaceFile(url, _),
+                 let .replaceFileWithMode(url, _, _),
                  let .modifyFileInPlace(url, _),
                  let .replaceWithSymlink(url, _):
                 url
@@ -474,10 +535,11 @@ private final class FaultInjectingFileOperations: IntegrationFileOperating, @unc
         }
     }
 
-    private let base = POSIXIntegrationFileOperations()
+    private let base: any IntegrationFileOperating
     private let lock = NSLock()
     private let mutation: Mutation?
     private let mutationBeforeRename: Mutation?
+    private let mutationBeforeRemove: Mutation?
     private let failFirstStagedWriteAfterSuccess: Bool
     private let failRenameCall: Int?
     private let failVerificationAt: URL?
@@ -486,19 +548,24 @@ private final class FaultInjectingFileOperations: IntegrationFileOperating, @unc
     private var destinationSnapshots: [String: Int] = [:]
     private var stagedWriteFailed = false
     private var renameMutationApplied = false
+    private var removeMutationApplied = false
     private var renameCount = 0
 
     init(
+        base: any IntegrationFileOperating = POSIXIntegrationFileOperations(),
         mutation: Mutation? = nil,
         mutationBeforeRename: Mutation? = nil,
+        mutationBeforeRemove: Mutation? = nil,
         failFirstStagedWriteAfterSuccess: Bool = false,
         failRenameCall: Int? = nil,
         failVerificationAt: URL? = nil,
         failRollbackCleanup: Bool = false,
         failRollbackRename: Bool = false
     ) {
+        self.base = base
         self.mutation = mutation
         self.mutationBeforeRename = mutationBeforeRename
+        self.mutationBeforeRemove = mutationBeforeRemove
         self.failFirstStagedWriteAfterSuccess = failFirstStagedWriteAfterSuccess
         self.failRenameCall = failRenameCall
         self.failVerificationAt = failVerificationAt
@@ -575,6 +642,18 @@ private final class FaultInjectingFileOperations: IntegrationFileOperating, @unc
         try base.remove(at: url)
     }
 
+    func remove(at url: URL, expecting snapshot: IntegrationFileSnapshot) throws {
+        let removeMutation = withLock { () -> Mutation? in
+            guard !removeMutationApplied, mutationBeforeRemove?.target == url else { return nil }
+            removeMutationApplied = true
+            return mutationBeforeRemove
+        }
+        if let removeMutation {
+            try applyMutation(removeMutation)
+        }
+        try base.remove(at: url, expecting: snapshot)
+    }
+
     func setMode(_ mode: mode_t, at url: URL) throws {
         try base.setMode(mode, at: url)
     }
@@ -587,12 +666,42 @@ private final class FaultInjectingFileOperations: IntegrationFileOperating, @unc
         switch mutation {
         case let .replaceFile(url, data):
             try data.write(to: url, options: .atomic)
+        case let .replaceFileWithMode(url, data, mode):
+            try data.write(to: url, options: .atomic)
+            guard chmod(url.path, mode) == 0 else { throw POSIXError(.EIO) }
         case let .modifyFileInPlace(url, data):
             try data.write(to: url)
         case let .replaceWithSymlink(url, destination):
             try FileManager.default.removeItem(at: url)
             try FileManager.default.createSymbolicLink(at: url, withDestinationURL: destination)
         }
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+}
+
+private final class FailingSecondExchangeRenamer: IntegrationAtomicRenaming, @unchecked Sendable {
+    private let base = POSIXIntegrationAtomicRenamer()
+    private let lock = NSLock()
+    private var exchangeCount = 0
+
+    func createExclusively(from source: URL, to destination: URL) throws {
+        try base.createExclusively(from: source, to: destination)
+    }
+
+    func exchange(_ first: URL, with second: URL) throws {
+        let call = withLock {
+            exchangeCount += 1
+            return exchangeCount
+        }
+        if call == 2 {
+            throw IntegrationError.fileOperation("injected internal swap-back failure")
+        }
+        try base.exchange(first, with: second)
     }
 
     private func withLock<T>(_ body: () -> T) -> T {

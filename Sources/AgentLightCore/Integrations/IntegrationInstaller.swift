@@ -299,11 +299,45 @@ protocol IntegrationFileOperating: Sendable {
         expecting snapshot: IntegrationFileSnapshot
     ) throws
     func remove(at url: URL) throws
+    func remove(at url: URL, expecting snapshot: IntegrationFileSnapshot) throws
     func setMode(_ mode: mode_t, at url: URL) throws
     func syncDirectory(at url: URL) throws
 }
 
+protocol IntegrationAtomicRenaming: Sendable {
+    func createExclusively(from source: URL, to destination: URL) throws
+    func exchange(_ first: URL, with second: URL) throws
+}
+
+struct POSIXIntegrationAtomicRenamer: IntegrationAtomicRenaming {
+    func createExclusively(from source: URL, to destination: URL) throws {
+        guard renamex_np(source.path, destination.path, UInt32(RENAME_EXCL)) == 0 else {
+            if errno == EEXIST || errno == ENOTEMPTY || errno == ENOENT {
+                throw IntegrationError.destinationChanged(destination.path)
+            }
+            throw posixError("rename configuration exclusively")
+        }
+    }
+
+    func exchange(_ first: URL, with second: URL) throws {
+        guard renamex_np(first.path, second.path, UInt32(RENAME_SWAP)) == 0 else {
+            if errno == ENOENT { throw IntegrationError.destinationChanged(second.path) }
+            throw posixError("exchange configuration atomically")
+        }
+    }
+}
+
+private struct IntegrationAtomicRecoveryFailure: Error {
+    let failures: [String]
+}
+
 struct POSIXIntegrationFileOperations: IntegrationFileOperating {
+    private let atomicRenamer: any IntegrationAtomicRenaming
+
+    init(atomicRenamer: any IntegrationAtomicRenaming = POSIXIntegrationAtomicRenamer()) {
+        self.atomicRenamer = atomicRenamer
+    }
+
     func snapshot(at url: URL) throws -> IntegrationFileSnapshot {
         let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         if descriptor < 0 {
@@ -356,28 +390,34 @@ struct POSIXIntegrationFileOperations: IntegrationFileOperating {
     ) throws {
         switch snapshot {
         case .missing:
-            guard renamex_np(source.path, destination.path, UInt32(RENAME_EXCL)) == 0 else {
-                if errno == EEXIST || errno == ENOTEMPTY {
-                    throw IntegrationError.destinationChanged(destination.path)
-                }
-                throw posixError("create configuration atomically")
-            }
+            try atomicRenamer.createExclusively(from: source, to: destination)
         case .file:
-            guard renamex_np(source.path, destination.path, UInt32(RENAME_SWAP)) == 0 else {
-                if errno == ENOENT { throw IntegrationError.destinationChanged(destination.path) }
-                throw posixError("exchange configuration atomically")
-            }
+            try atomicRenamer.exchange(source, with: destination)
             do {
                 guard try self.snapshot(at: source).matchesDisplacedVersion(of: snapshot) else {
                     throw IntegrationError.destinationChanged(destination.path)
                 }
             } catch {
                 let comparisonError = error
-                guard renamex_np(source.path, destination.path, UInt32(RENAME_SWAP)) == 0 else {
-                    throw IntegrationError.rollbackFailed([
+                do {
+                    try atomicRenamer.exchange(source, with: destination)
+                } catch {
+                    var failures = [
                         "atomic exchange comparison: \(comparisonError)",
-                        "atomic exchange restoration: \(posixError("restore exchanged configuration"))"
-                    ])
+                        "atomic exchange restoration: \(error)",
+                        "preserved displaced file: \(source.path)"
+                    ]
+                    do {
+                        try setMode(0o600, at: source)
+                    } catch {
+                        failures.append("protect displaced file: \(error)")
+                    }
+                    do {
+                        try syncDirectory(at: destination.deletingLastPathComponent())
+                    } catch {
+                        failures.append("sync preserved exchange state: \(error)")
+                    }
+                    throw IntegrationAtomicRecoveryFailure(failures: failures)
                 }
                 throw comparisonError
             }
@@ -388,6 +428,40 @@ struct POSIXIntegrationFileOperations: IntegrationFileOperating {
         if unlink(url.path) != 0, errno != ENOENT {
             throw posixError("remove configuration artifact")
         }
+    }
+
+    func remove(at url: URL, expecting snapshot: IntegrationFileSnapshot) throws {
+        let directory = url.deletingLastPathComponent()
+        let quarantine = directory.appending(
+            path: ".\(url.lastPathComponent).agent-light-removal-\(UUID().uuidString)"
+        )
+        do {
+            try atomicRenamer.createExclusively(from: url, to: quarantine)
+        } catch {
+            throw IntegrationError.destinationChanged(url.path)
+        }
+
+        do {
+            guard try self.snapshot(at: quarantine).matchesDisplacedVersion(of: snapshot) else {
+                throw IntegrationError.destinationChanged(url.path)
+            }
+        } catch {
+            let comparisonError = error
+            do {
+                try atomicRenamer.createExclusively(from: quarantine, to: url)
+                try syncDirectory(at: directory)
+            } catch {
+                throw IntegrationAtomicRecoveryFailure(failures: [
+                    "atomic removal comparison: \(comparisonError)",
+                    "atomic removal restoration: \(error)",
+                    "preserved recovery artifact: \(quarantine.path)"
+                ])
+            }
+            throw comparisonError
+        }
+
+        try remove(at: quarantine)
+        try syncDirectory(at: directory)
     }
 
     func setMode(_ mode: mode_t, at url: URL) throws {
@@ -549,6 +623,9 @@ private struct AtomicConfigurationWriter {
                 try verify(item.change.after, mode: 0o600, at: item.change.destination)
             }
         } catch {
+            if let recoveryFailure = error as? IntegrationAtomicRecoveryFailure {
+                throw IntegrationError.rollbackFailed(recoveryFailure.failures)
+            }
             let failures = rollback(
                 prepared: prepared,
                 renamedCount: renamedCount,
@@ -625,6 +702,7 @@ private struct AtomicConfigurationWriter {
                 try restore(item)
             } catch {
                 failures.append("restore \(item.change.destination.path): \(error)")
+                failedRestorationArtifacts.insert(item.staged)
                 if let rollback = item.rollback {
                     failedRestorationArtifacts.insert(rollback)
                 }
@@ -633,7 +711,9 @@ private struct AtomicConfigurationWriter {
 
         var removable: [URL] = []
         for item in prepared {
-            removable.append(item.staged)
+            if !failedRestorationArtifacts.contains(item.staged) {
+                removable.append(item.staged)
+            }
             if let rollback = item.rollback, !failedRestorationArtifacts.contains(rollback) {
                 removable.append(rollback)
             }
@@ -655,7 +735,7 @@ private struct AtomicConfigurationWriter {
         )
         switch item.change.before {
         case .missing:
-            try fileOperations.remove(at: item.change.destination)
+            try fileOperations.remove(at: item.change.destination, expecting: installedSnapshot)
         case let .file(record):
             guard let rollback = item.rollback else {
                 throw IntegrationError.verificationFailed("missing rollback for \(item.change.destination.path)")
