@@ -100,6 +100,102 @@ public struct JSONNumber: Codable, Equatable, Sendable, ExpressibleByIntegerLite
         }
         return CanonicalJSONNumber(isNegative: isNegative, digits: digits, powerOfTen: power)
     }
+
+    var exactInteger: Int? {
+        var body = lexeme[...]
+        let isNegative = body.first == "-"
+        if isNegative { body = body.dropFirst() }
+
+        let exponentIndex = body.firstIndex { $0 == "e" || $0 == "E" }
+        let mantissa = exponentIndex.map { body[..<$0] } ?? body
+        let exponentText = exponentIndex.map { body[body.index(after: $0)...] }
+
+        var totalDigits = 0
+        var fractionDigits = 0
+        var trailingZeros = 0
+        var isFraction = false
+        var hasNonzeroDigit = false
+        for character in mantissa {
+            if character == "." {
+                isFraction = true
+                continue
+            }
+            totalDigits += 1
+            if isFraction { fractionDigits += 1 }
+            if character == "0" {
+                trailingZeros += 1
+            } else {
+                trailingZeros = 0
+                hasNonzeroDigit = true
+            }
+        }
+
+        if !hasNonzeroDigit { return 0 }
+        guard let exponent = Self.parseExponent(exponentText) else { return nil }
+        let (power, powerOverflow) = exponent.subtractingReportingOverflow(fractionDigits)
+        guard !powerOverflow else { return nil }
+
+        let digitsToConsume: Int
+        let zerosToAppend: Int
+        if power < 0 {
+            guard power != Int.min else { return nil }
+            let removedDigits = -power
+            guard removedDigits <= trailingZeros else { return nil }
+            digitsToConsume = totalDigits - removedDigits
+            zerosToAppend = 0
+        } else {
+            digitsToConsume = totalDigits
+            zerosToAppend = power
+        }
+
+        let negativeLimit = UInt(Int.max) + 1
+        let limit = isNegative ? negativeLimit : UInt(Int.max)
+        var magnitude: UInt = 0
+        var consumedDigits = 0
+        for character in mantissa where character != "." && consumedDigits < digitsToConsume {
+            guard let digitValue = character.wholeNumberValue else { return nil }
+            let digit = UInt(digitValue)
+            guard magnitude <= (limit - digit) / 10 else { return nil }
+            magnitude = (magnitude * 10) + digit
+            consumedDigits += 1
+        }
+
+        guard zerosToAppend <= 19 else { return nil }
+        for _ in 0..<zerosToAppend {
+            guard magnitude <= limit / 10 else { return nil }
+            magnitude *= 10
+        }
+
+        if isNegative {
+            if magnitude == negativeLimit { return Int.min }
+            guard let positive = Int(exactly: magnitude) else { return nil }
+            return -positive
+        }
+        return Int(exactly: magnitude)
+    }
+
+    private static func parseExponent(_ text: Substring?) -> Int? {
+        guard var text else { return 0 }
+        let isNegative = text.first == "-"
+        if text.first == "+" || isNegative { text = text.dropFirst() }
+
+        let negativeLimit = UInt(Int.max) + 1
+        let limit = isNegative ? negativeLimit : UInt(Int.max)
+        var magnitude: UInt = 0
+        for character in text {
+            guard let digitValue = character.wholeNumberValue else { return nil }
+            let digit = UInt(digitValue)
+            guard magnitude <= (limit - digit) / 10 else { return nil }
+            magnitude = (magnitude * 10) + digit
+        }
+
+        if isNegative {
+            if magnitude == negativeLimit { return Int.min }
+            guard let positive = Int(exactly: magnitude) else { return nil }
+            return -positive
+        }
+        return Int(exactly: magnitude)
+    }
 }
 
 private struct CanonicalJSONNumber: Equatable {

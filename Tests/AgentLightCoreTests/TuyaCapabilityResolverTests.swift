@@ -175,6 +175,84 @@ final class TuyaCapabilityResolverTests: XCTestCase {
         )
     }
 
+    func testSchemaIntegerFieldsRejectFractionsBeyondFoundationDecimalPrecision() {
+        let fraction = "1.0000000000000000000000000000000000000001"
+        let nearZero = "0.0000000000000000000000000000000000000001"
+        let schemas = [
+            colorSchemaLexemes(hMin: fraction),
+            colorSchemaLexemes(hMax: "360.0000000000000000000000000000000000000001"),
+            colorSchemaLexemes(hScale: nearZero),
+            colorSchemaLexemes(hStep: fraction)
+        ]
+
+        for schema in schemas {
+            XCTAssertThrowsCapabilityError(
+                .invalidSchema("colour_data_v2"),
+                try TuyaCapabilityResolver.resolve(
+                    specification: fixtureSpecification(functions: [power(), colorV2(values: schema)])
+                )
+            )
+        }
+    }
+
+    func testSchemaAndLiveStatusesAcceptExactIntegralExponentFormsAndNegativeZero() throws {
+        let capabilities = try TuyaCapabilityResolver.resolve(
+            specification: fixtureSpecification(functions: [
+                power(),
+                colorV2(values: colorSchemaLexemes(
+                    hMin: "-0", hMax: "36e1", hScale: "0.0", hStep: "10e-1"
+                )),
+                brightnessV2(values: #"{"min":10e-1,"max":1e3,"scale":-0,"step":1.0}"#),
+                temperature()
+            ])
+        )
+        let statuses = [
+            TuyaStatus(code: "switch_led", value: .bool(false)),
+            TuyaStatus(code: "colour_data_v2", value: .string(#"{"h":2.58e2,"s":6260e-1,"v":8e2}"#)),
+            TuyaStatus(code: "bright_value_v2", value: .number(try JSONNumber(lexeme: "8.00e2"))),
+            TuyaStatus(code: "temp_value", value: .number(try JSONNumber(lexeme: "42e1")))
+        ]
+
+        let baseline = try capabilities.baseline(from: statuses)
+        let restore = try capabilities.restoreCommands(from: baseline)
+
+        XCTAssertEqual(restore.map(\.code), [
+            "colour_data_v2", "bright_value_v2", "temp_value", "switch_led"
+        ])
+    }
+
+    func testLiveNumericStatusesRejectFractionsBeyondFoundationDecimalPrecision() throws {
+        let capabilities = try TuyaCapabilityResolver.resolve(
+            specification: fixtureSpecification(functions: [
+                power(), colorV2(), brightnessV2(), temperature()
+            ])
+        )
+        let fraction = "1.0000000000000000000000000000000000000001"
+        let valid = [
+            TuyaStatus(code: "switch_led", value: .bool(false)),
+            TuyaStatus(code: "colour_data_v2", value: .string(#"{"h":1,"s":1,"v":1}"#)),
+            TuyaStatus(code: "bright_value_v2", value: .number(10)),
+            TuyaStatus(code: "temp_value", value: .number(10))
+        ]
+        let invalid: [(String, JSONValue)] = [
+            ("bright_value_v2", .number(try JSONNumber(lexeme: fraction))),
+            ("temp_value", .number(try JSONNumber(lexeme: fraction))),
+            ("colour_data_v2", .string(#"{"h":#(fraction),"s":1,"v":1}"#)),
+            ("colour_data_v2", .string(#"{"h":1,"s":#(fraction),"v":1}"#)),
+            ("colour_data_v2", .string(#"{"h":1,"s":1,"v":#(fraction)}"#))
+        ]
+
+        for (code, value) in invalid {
+            let statuses = valid.map { status in
+                status.code == code ? TuyaStatus(code: code, value: value) : status
+            }
+            XCTAssertThrowsCapabilityError(
+                .invalidStatus(code),
+                try capabilities.baseline(from: statuses)
+            )
+        }
+    }
+
     func testAdvertisedRangesWithNonzeroMinimumScaleAndStepClampAndRoundDeterministically() throws {
         let schema = colorSchema(
             h: (100, 3_700, 2, 25),
@@ -491,6 +569,19 @@ private func colorSchema(
     {"h":{"min":\(h.0),"max":\(h.1),"scale":\(h.2),"step":\(h.3)},\
     "s":{"min":\(s.0),"max":\(s.1),"scale":\(s.2),"step":\(s.3)},\
     "v":{"min":\(v.0),"max":\(v.1),"scale":\(v.2),"step":\(v.3)}}
+    """
+}
+
+private func colorSchemaLexemes(
+    hMin: String = "0",
+    hMax: String = "360",
+    hScale: String = "0",
+    hStep: String = "1"
+) -> String {
+    """
+    {"h":{"min":\(hMin),"max":\(hMax),"scale":\(hScale),"step":\(hStep)},\
+    "s":{"min":0,"max":1000,"scale":0,"step":1},\
+    "v":{"min":0,"max":1000,"scale":0,"step":1}}
     """
 }
 

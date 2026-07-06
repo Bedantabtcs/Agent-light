@@ -68,7 +68,7 @@ public actor TuyaClient {
     public func specification() async throws -> TuyaSpecification {
         let result = try await performAuthorizedRequest(
             method: "GET",
-            pathComponents: ["v1.0", "devices", credentials.deviceID, "specifications"],
+            pathComponents: ["v1.0", "iot-03", "devices", credentials.deviceID, "specification"],
             body: Data()
         )
         do {

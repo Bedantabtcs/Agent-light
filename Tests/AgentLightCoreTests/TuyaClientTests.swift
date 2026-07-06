@@ -232,7 +232,7 @@ final class TuyaClientTests: XCTestCase {
         let components = try XCTUnwrap(request.url.flatMap {
             URLComponents(url: $0, resolvingAgainstBaseURL: false)
         })
-        XCTAssertEqual(components.percentEncodedPath, "/v1.0/devices/device-id/specifications")
+        XCTAssertEqual(components.percentEncodedPath, "/v1.0/iot-03/devices/device-id/specification")
         XCTAssertTrue(isSignedRequest(request))
     }
 
@@ -293,7 +293,7 @@ final class TuyaClientTests: XCTestCase {
         })
         XCTAssertEqual(
             components.percentEncodedPath,
-            "/v1.0/devices/device%2F..%2F%3Fagent-content/specifications"
+            "/v1.0/iot-03/devices/device%2F..%2F%3Fagent-content/specification"
         )
         XCTAssertNil(request.url?.query)
     }
@@ -818,7 +818,7 @@ private func isStatusRequest(_ request: URLRequest) -> Bool {
 }
 
 private func isSpecificationRequest(_ request: URLRequest) -> Bool {
-    request.url?.path.hasSuffix("/specifications") == true
+    request.url?.path.hasSuffix("/specification") == true
 }
 
 private func isSignedRequest(_ request: URLRequest) -> Bool {

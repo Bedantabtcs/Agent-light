@@ -375,19 +375,8 @@ public enum TuyaCapabilityResolver {
 }
 
 private func exactInteger(_ value: JSONValue?) -> Int? {
-    guard case let .number(number)? = value,
-          let decimal = Decimal(string: number.lexeme, locale: Locale(identifier: "en_US_POSIX")) else {
-        return nil
-    }
-    var source = decimal
-    var rounded = Decimal()
-    NSDecimalRound(&rounded, &source, 0, .plain)
-    guard rounded == decimal,
-          rounded >= Decimal(Int64.min),
-          rounded <= Decimal(Int64.max) else {
-        return nil
-    }
-    return Int(NSDecimalNumber(decimal: rounded).int64Value)
+    guard case let .number(number)? = value else { return nil }
+    return number.exactInteger
 }
 
 struct NumericConstraint: Equatable, Sendable {
