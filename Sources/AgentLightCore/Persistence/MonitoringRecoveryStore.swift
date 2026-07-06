@@ -125,7 +125,6 @@ protocol MonitoringRecoveryPOSIXOperations: Sendable {
     func synchronize(_ descriptor: Int32, kind: MonitoringRecoveryDescriptorKind) throws
     func swap(at directory: Int32, _ first: String, _ second: String) throws
     func renameExclusive(at directory: Int32, from: String, to: String) throws
-    func unlink(at directory: Int32, name: String) throws
     func close(_ descriptor: Int32)
 }
 
@@ -233,10 +232,6 @@ final class DarwinMonitoringRecoveryPOSIXOperations: MonitoringRecoveryPOSIXOper
         }
     }
 
-    func unlink(at directory: Int32, name: String) throws {
-        guard unlinkat(directory, name, 0) == 0 else { throw posixError() }
-    }
-
     func close(_ descriptor: Int32) {
         _ = Darwin.close(descriptor)
     }
@@ -298,7 +293,10 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         guard let opened = try openExistingFile(
             directory: directory.descriptor,
             name: location.fileName
-        ) else { return nil }
+        ) else {
+            try invalidateDestinationRevisions()
+            return nil
+        }
         defer { operations.close(opened.descriptor) }
         let data: Data
         do {
@@ -362,16 +360,8 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             try generationIDs(matching: $0.descriptor)
         } ?? []
         let temporary = try createTemporary(in: directory.descriptor, destination: location.fileName)
-        var cleanupTemporary = true
         var candidatePinnedDescriptor: Int32?
         defer {
-            if cleanupTemporary {
-                _ = try? removeNameIfSameOpenFile(
-                    directory: directory.descriptor,
-                    name: temporary.name,
-                    descriptor: temporary.descriptor
-                )
-            }
             if let candidatePinnedDescriptor {
                 operations.close(candidatePinnedDescriptor)
             }
@@ -412,7 +402,7 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             }
             guard let displaced,
                   try sameOpenFileOrIO(displaced.descriptor, original.descriptor) else {
-                cleanupTemporary = recoverFailedReplacement(
+                recoverFailedReplacement(
                     directory: directory.descriptor,
                     destination: location.fileName,
                     temporary: temporary.name,
@@ -424,7 +414,7 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             do {
                 try operations.synchronize(directory.descriptor, kind: .directory)
             } catch {
-                cleanupTemporary = recoverFailedReplacement(
+                recoverFailedReplacement(
                     directory: directory.descriptor,
                     destination: location.fileName,
                     temporary: temporary.name,
@@ -436,7 +426,7 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             do {
                 try verifyParent(location.parentPath, matches: directory.metadata)
             } catch {
-                cleanupTemporary = recoverFailedReplacement(
+                recoverFailedReplacement(
                     directory: directory.descriptor,
                     destination: location.fileName,
                     temporary: temporary.name,
@@ -445,17 +435,6 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
                 )
                 throw error
             }
-            cleanupTemporary = false
-            do {
-                if try removeNameIfSameOpenFile(
-                    directory: directory.descriptor,
-                    name: temporary.name,
-                    descriptor: original.descriptor
-                ) {
-                    try operations.synchronize(directory.descriptor, kind: .directory)
-                }
-            } catch {
-            }
         } else {
             do {
                 try operations.renameExclusive(
@@ -463,7 +442,6 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
                     from: temporary.name,
                     to: location.fileName
                 )
-                cleanupTemporary = false
             } catch MonitoringRecoveryPOSIXError.alreadyExists {
                 throw MonitoringRecoveryStoreError.concurrentModification
             } catch {
@@ -621,16 +599,6 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         }
         try verifyParent(location.parentPath, matches: directory.metadata)
         invalidateGeneration(ownership.generationID)
-        do {
-            if try removeNameIfSameOpenFile(
-                directory: directory.descriptor,
-                name: tombstone,
-                descriptor: opened.descriptor
-            ) {
-                try operations.synchronize(directory.descriptor, kind: .directory)
-            }
-        } catch {
-        }
     }
 
     private struct Location {
@@ -784,7 +752,7 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         temporary: String,
         originalDescriptor: Int32,
         priorGenerationIDs: Set<UUID>
-    ) -> Bool {
+    ) {
         _ = try? operations.swap(at: directory, temporary, destination)
 
         if name(destination, in: directory, matches: originalDescriptor) {
@@ -794,8 +762,6 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         } else {
             invalidateGenerations(priorGenerationIDs)
         }
-
-        return false
     }
 
     private func name(_ name: String, in directory: Int32, matches descriptor: Int32) -> Bool {
@@ -820,27 +786,6 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             )
             updateLocation(of: generationID, to: .destination)
         } catch {
-        }
-    }
-
-    @discardableResult
-    private func removeNameIfSameOpenFile(
-        directory: Int32,
-        name: String,
-        descriptor: Int32
-    ) throws -> Bool {
-        guard let opened = try openExistingFile(directory: directory, name: name) else {
-            return false
-        }
-        defer { operations.close(opened.descriptor) }
-        guard try sameOpenFileOrIO(opened.descriptor, descriptor) else {
-            return false
-        }
-        do {
-            try operations.unlink(at: directory, name: name)
-            return true
-        } catch {
-            throw MonitoringRecoveryStoreError.ioFailure
         }
     }
 

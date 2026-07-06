@@ -1110,6 +1110,127 @@ final class MonitoringOrchestratorTests: XCTestCase {
 }
 
 final class FileMonitoringRecoveryStoreTests: XCTestCase {
+    func testTemporaryCleanupRetainsAuthenticatedArtifactWithoutPathUnlink() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        operations.failNextRenameExclusive = true
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let unrelatedBytes = try encoded(
+            MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.error))
+        )
+        operations.beforeUnlink = { name in
+            try replaceInode(
+                at: directory.appendingPathComponent(name),
+                bytes: unrelatedBytes
+            )
+        }
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
+            _ = try await store.save(record)
+        }
+
+        XCTAssertEqual(operations.unlinkCallCount(), 0)
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        guard artifacts.count == 1 else {
+            XCTFail("Expected one retained temporary artifact, got \(artifacts.count)")
+            return
+        }
+        XCTAssertEqual(
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: artifacts[0])),
+            record
+        )
+    }
+
+    func testCommittedSaveCleanupRetainsDisplacedArtifactWithoutPathUnlink() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+        _ = try await store.save(original)
+        let unrelatedBytes = try encoded(
+            MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.error))
+        )
+        operations.beforeUnlink = { name in
+            try replaceInode(
+                at: directory.appendingPathComponent(name),
+                bytes: unrelatedBytes
+            )
+        }
+
+        _ = try await store.save(replacement)
+
+        XCTAssertEqual(operations.unlinkCallCount(), 0)
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let records = try artifacts.map {
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: $0))
+        }
+        guard records.count == 2 else {
+            XCTFail("Expected destination and retained displaced artifact, got \(records.count)")
+            return
+        }
+        XCTAssertTrue(records.contains(original))
+        XCTAssertTrue(records.contains(replacement))
+    }
+
+    func testCommittedClearCleanupRetainsTombstoneWithoutPathUnlink() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline)
+        let revision = try await store.save(record)
+        let unrelatedBytes = try encoded(
+            MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.error))
+        )
+        operations.beforeUnlink = { name in
+            try replaceInode(
+                at: directory.appendingPathComponent(name),
+                bytes: unrelatedBytes
+            )
+        }
+
+        try await store.clear(
+            expecting: StoredMonitoringRecovery(record: record, revision: revision)
+        )
+
+        XCTAssertEqual(operations.unlinkCallCount(), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        guard artifacts.count == 1 else {
+            XCTFail("Expected one retained tombstone, got \(artifacts.count)")
+            return
+        }
+        XCTAssertEqual(
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: artifacts[0])),
+            record
+        )
+    }
+
+    func testLoadMissingDestinationInvalidatesAndClosesSiblingRevisions() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline)
+        _ = try await store.save(record)
+        _ = try await store.load()
+        _ = try await store.load()
+        XCTAssertEqual(operations.openFileDescriptorCount(), 3)
+        try FileManager.default.removeItem(at: url)
+
+        await XCTAssertAsyncNil(try await store.load())
+
+        XCTAssertEqual(operations.openFileDescriptorCount(), 0)
+    }
+
     func testPinnedRevisionRejectsDifferentOpenGenerationWithReusedMetadataAndClosesHandle() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1272,7 +1393,13 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
             try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: url)),
             replacement
         )
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [url.lastPathComponent])
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let records = try artifacts.map {
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: $0))
+        }
+        XCTAssertEqual(records.count, 2)
+        XCTAssertTrue(records.contains(original))
+        XCTAssertTrue(records.contains(replacement))
         XCTAssertEqual(operations.openFileDescriptorCount(), 0)
     }
 
@@ -1425,18 +1552,25 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(info.st_mode & 0o777, 0o600)
     }
 
-    func testReplacementLeavesCompleteDecodableRecordAndNoTemporaryFiles() async throws {
+    func testReplacementRetainsCompleteDecodableDisplacedRecord() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("monitoring-recovery.json")
         let store = FileMonitoringRecoveryStore(url: url)
-        try await store.save(MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking)))
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        try await store.save(original)
         let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.error))
 
         try await store.save(replacement)
 
         await XCTAssertAsyncEqual((try await store.load())?.record, replacement)
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [url.lastPathComponent])
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let records = try artifacts.map {
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: $0))
+        }
+        XCTAssertEqual(records.count, 2)
+        XCTAssertTrue(records.contains(original))
+        XCTAssertTrue(records.contains(replacement))
     }
 
     func testSymlinkDestinationIsRejectedWithoutChangingTarget() async throws {
@@ -1541,25 +1675,32 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: url), concurrentBytes)
     }
 
-    func testFileSyncFailureLeavesExistingRecordAndCleansTemporaryArtifact() async throws {
+    func testFileSyncFailureLeavesExistingRecordAndRetainsTemporaryArtifact() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("monitoring-recovery.json")
         let operations = FaultInjectingRecoveryPOSIXOperations()
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
         let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let attempted = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
         try await store.save(original)
         operations.failNextFileSync = true
 
         await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
-            try await store.save(MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working)))
+            try await store.save(attempted)
         }
 
         await XCTAssertAsyncEqual((try await store.load())?.record, original)
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [url.lastPathComponent])
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let records = try artifacts.map {
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: $0))
+        }
+        XCTAssertEqual(records.count, 2)
+        XCTAssertTrue(records.contains(original))
+        XCTAssertTrue(records.contains(attempted))
     }
 
-    func testUnlinkFailureAfterCommittedSavePreservesNewRecordAndRecoveryArtifactWithoutFailure() async throws {
+    func testCommittedSaveRetainsDisplacedRecoveryArtifactWithoutFailure() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("monitoring-recovery.json")
@@ -1567,8 +1708,6 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
         try await store.save(MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking)))
         let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
-        operations.failNextUnlink = true
-
         let replacementRevision = try await store.save(replacement)
 
         await XCTAssertAsyncEqual((try await store.load())?.record, replacement)
@@ -1629,8 +1768,6 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
         let originalRevision = try await store.save(original)
         let expected = StoredMonitoringRecovery(record: original, revision: originalRevision)
-        operations.failNextUnlink = true
-
         try await store.clear(expecting: expected)
         try await store.save(replacement)
         await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
@@ -1659,7 +1796,12 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(artifacts.count, 1)
         XCTAssertEqual(try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: artifacts[0])), original)
         try await store.clear(expecting: expected)
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+        let retained = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        XCTAssertEqual(retained.count, 1)
+        XCTAssertEqual(
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: retained[0])),
+            original
+        )
     }
 
     func testSaveParentReplacementAfterCommitSyncPreservesDisplacedRecord() async throws {
@@ -1813,23 +1955,30 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         )
     }
 
-    func testRenameFailureLeavesDestinationAbsentAndCleansTemporaryArtifact() async throws {
+    func testRenameFailureLeavesDestinationAbsentAndRetainsTemporaryArtifact() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("monitoring-recovery.json")
         let operations = FaultInjectingRecoveryPOSIXOperations()
         operations.failNextRenameExclusive = true
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline)
 
         await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
-            try await store.save(MonitoringRecoveryRecord(baseline: .testBaseline))
+            try await store.save(record)
         }
 
-        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
-        XCTAssertEqual(operations.fileDescriptorEvents().first, .sameOpenFile)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        XCTAssertEqual(artifacts.count, 1)
+        XCTAssertEqual(
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: artifacts[0])),
+            record
+        )
+        XCTAssertEqual(operations.unlinkCallCount(), 0)
     }
 
-    func testClearUnlinkFailurePreservesTombstoneRecoveryArtifact() async throws {
+    func testCommittedClearRetainsTombstoneRecoveryArtifact() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("monitoring-recovery.json")
@@ -1837,8 +1986,6 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         let store = FileMonitoringRecoveryStore(url: url, operations: operations)
         let record = MonitoringRecoveryRecord(baseline: .testBaseline)
         let revision = try await store.save(record)
-        operations.failNextUnlink = true
-
         try await store.clear(
             expecting: StoredMonitoringRecovery(record: record, revision: revision)
         )
@@ -1906,20 +2053,15 @@ private extension Array where Element == RecordingLightController.Operation {
 }
 
 private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOSIXOperations, @unchecked Sendable {
-    enum FileDescriptorEvent: Equatable {
-        case sameOpenFile
-        case close
-    }
-
     private let base = DarwinMonitoringRecoveryPOSIXOperations()
     private let lock = NSLock()
     var beforeSwap: (() throws -> Void)?
     var beforeRenameExclusive: (() throws -> Void)?
     var beforeRead: (() throws -> Void)?
+    var beforeUnlink: ((String) throws -> Void)?
     var afterNextRenameExclusive: ((String, String) throws -> Void)?
     var failNextFileSync = false
     var failNextDirectorySync = false
-    var failNextUnlink = false
     var failNextRenameExclusive = false
     var overrideNextRegularOwner: uid_t?
     var overrideNextRegularMode: mode_t?
@@ -1929,8 +2071,8 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
     private var swapCallCount = 0
     private var openFileDescriptors: Set<Int32> = []
     private var openDirectoryDescriptors: Set<Int32> = []
-    private var descriptorEvents: [FileDescriptorEvent] = []
     private var duplicateCloseOnExecValues: [Bool] = []
+    private var unlinkCalls = 0
 
     func openDirectory(path: String) throws -> Int32 {
         let descriptor = try base.openDirectory(path: path)
@@ -1990,7 +2132,6 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
     }
 
     func sameOpenFile(_ first: Int32, _ second: Int32) throws -> Bool {
-        locked { descriptorEvents.append(.sameOpenFile) }
         return try base.sameOpenFile(first, second)
     }
 
@@ -2068,21 +2209,8 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
         try afterHook?(from, to)
     }
 
-    func unlink(at directory: Int32, name: String) throws {
-        let shouldFail = locked {
-            guard failNextUnlink else { return false }
-            failNextUnlink = false
-            return true
-        }
-        if shouldFail { throw MonitoringRecoveryPOSIXError.system(EIO) }
-        try base.unlink(at: directory, name: name)
-    }
-
     func close(_ descriptor: Int32) {
         locked {
-            if openFileDescriptors.contains(descriptor) {
-                descriptorEvents.append(.close)
-            }
             openFileDescriptors.remove(descriptor)
             openDirectoryDescriptors.remove(descriptor)
         }
@@ -2093,13 +2221,24 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
         locked { openFileDescriptors.count }
     }
 
-    func fileDescriptorEvents() -> [FileDescriptorEvent] {
-        locked { descriptorEvents }
-    }
-
     func duplicatedDescriptorsAreCloseOnExec() -> Bool {
         locked {
             !duplicateCloseOnExecValues.isEmpty && duplicateCloseOnExecValues.allSatisfy { $0 }
+        }
+    }
+
+    func unlinkCallCount() -> Int {
+        locked { unlinkCalls }
+    }
+
+    func unlink(at directory: Int32, name: String) throws {
+        let hook = locked { () -> ((String) throws -> Void)? in
+            unlinkCalls += 1
+            return beforeUnlink
+        }
+        try hook?(name)
+        guard Darwin.unlinkat(directory, name, 0) == 0 else {
+            throw MonitoringRecoveryPOSIXError.system(errno)
         }
     }
 
