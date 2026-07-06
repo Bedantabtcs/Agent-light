@@ -19,7 +19,11 @@ let package = Package(
             dependencies: ["AgentLightCore", "AgentLightProtocol"]
         ),
         .testTarget(name: "AgentLightProtocolTests", dependencies: ["AgentLightProtocol"]),
-        .testTarget(name: "AgentLightCoreTests", dependencies: ["AgentLightCore"])
+        .testTarget(
+            name: "AgentLightCoreTests",
+            dependencies: ["AgentLightCore"],
+            resources: [.process("Fixtures")]
+        )
     ],
     swiftLanguageModes: [.v6]
 )
