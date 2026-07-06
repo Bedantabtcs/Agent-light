@@ -9,6 +9,9 @@ public struct DesiredLightState: Codable, Equatable, Sendable {
 }
 
 public struct BulbBaseline: Codable, Equatable, Sendable {
-    public let values: [String: String]
-    public init(values: [String: String]) { self.values = values }
+    public let values: [String: JSONValue]
+
+    public init(values: [String: JSONValue]) {
+        self.values = values
+    }
 }

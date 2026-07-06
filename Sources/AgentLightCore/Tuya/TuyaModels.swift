@@ -46,6 +46,37 @@ public struct TuyaStatus: Codable, Equatable, Sendable {
     }
 }
 
+public struct TuyaDataPointSpecification: Codable, Equatable, Sendable {
+    public let code: String
+    public let type: String
+    public let values: String
+
+    public init(code: String, type: String, values: String) {
+        self.code = code
+        self.type = type
+        self.values = values
+    }
+}
+
+public struct TuyaSpecification: Codable, Equatable, Sendable {
+    public let category: String
+    public let functions: [TuyaDataPointSpecification]
+    public let status: [TuyaDataPointSpecification]
+
+    public init(
+        category: String,
+        functions: [TuyaDataPointSpecification],
+        status: [TuyaDataPointSpecification]
+    ) {
+        self.category = category
+        self.functions = functions
+        self.status = status
+    }
+}
+
+public typealias TuyaDeviceSpecification = TuyaSpecification
+public typealias TuyaFunctionSpecification = TuyaDataPointSpecification
+
 public enum TuyaClientError: Error, Equatable, Sendable {
     case invalidEndpoint
     case transport
