@@ -4,6 +4,12 @@ public actor TuyaClient {
     private struct CachedToken: Sendable {
         let value: String
         let expiresAt: Date
+        let generation: UInt64
+    }
+
+    private struct TokenAcquisition: Sendable {
+        let generation: UInt64
+        let task: Task<CachedToken, Error>
     }
 
     private struct Envelope: Sendable {
@@ -21,6 +27,8 @@ public actor TuyaClient {
     private let now: @Sendable () async -> Date
     private let nonce: @Sendable () async -> String
     private var cachedToken: CachedToken?
+    private var tokenAcquisition: TokenAcquisition?
+    private var nextTokenGeneration: UInt64 = 0
 
     public init(
         credentials: TuyaCredentials,
@@ -88,28 +96,55 @@ public actor TuyaClient {
                 pathComponents: pathComponents,
                 queryItems: [],
                 body: body,
-                token: token
+                token: token.value
             )
         } catch TuyaClientError.authenticationFailure {
-            cachedToken = nil
-            let refreshedToken = try await accessToken()
+            let refreshedToken = try await refreshedToken(afterRejecting: token)
             return try await performRequest(
                 method: method,
                 pathComponents: pathComponents,
                 queryItems: [],
                 body: body,
-                token: refreshedToken
+                token: refreshedToken.value
             )
         }
     }
 
-    private func accessToken() async throws -> String {
+    private func accessToken() async throws -> CachedToken {
         let currentDate = await now()
         if let cachedToken,
            currentDate < cachedToken.expiresAt.addingTimeInterval(-60) {
-            return cachedToken.value
+            return cachedToken
         }
 
+        if let tokenAcquisition {
+            return try await resolve(tokenAcquisition)
+        }
+
+        nextTokenGeneration += 1
+        let generation = nextTokenGeneration
+        let task = Task<CachedToken, Error> {
+            try await self.fetchToken(generation: generation)
+        }
+        let acquisition = TokenAcquisition(generation: generation, task: task)
+        tokenAcquisition = acquisition
+        return try await resolve(acquisition)
+    }
+
+    private func refreshedToken(afterRejecting rejectedToken: CachedToken) async throws -> CachedToken {
+        let currentDate = await now()
+        if let cachedToken,
+           cachedToken.generation != rejectedToken.generation,
+           currentDate < cachedToken.expiresAt.addingTimeInterval(-60) {
+            return cachedToken
+        }
+        if cachedToken?.generation == rejectedToken.generation {
+            cachedToken = nil
+        }
+        return try await accessToken()
+    }
+
+    private func fetchToken(generation: UInt64) async throws -> CachedToken {
         let result = try await performRequest(
             method: "GET",
             pathComponents: ["v1.0", "token"],
@@ -124,11 +159,32 @@ public actor TuyaClient {
             throw TuyaClientError.malformedResponse
         }
         let expirationBase = await now()
-        cachedToken = CachedToken(
+        return CachedToken(
             value: accessToken,
-            expiresAt: expirationBase.addingTimeInterval(TimeInterval(expiresIn))
+            expiresAt: expirationBase.addingTimeInterval(TimeInterval(expiresIn)),
+            generation: generation
         )
-        return accessToken
+    }
+
+    private func resolve(_ acquisition: TokenAcquisition) async throws -> CachedToken {
+        do {
+            let token = try await acquisition.task.value
+            if tokenAcquisition?.generation == acquisition.generation {
+                cachedToken = token
+                tokenAcquisition = nil
+            }
+            return token
+        } catch let error as TuyaClientError {
+            if tokenAcquisition?.generation == acquisition.generation {
+                tokenAcquisition = nil
+            }
+            throw error
+        } catch {
+            if tokenAcquisition?.generation == acquisition.generation {
+                tokenAcquisition = nil
+            }
+            throw TuyaClientError.transport
+        }
     }
 
     private func performRequest(
