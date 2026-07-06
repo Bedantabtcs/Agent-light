@@ -1110,6 +1110,200 @@ final class MonitoringOrchestratorTests: XCTestCase {
 }
 
 final class FileMonitoringRecoveryStoreTests: XCTestCase {
+    func testPinnedRevisionRejectsDifferentOpenGenerationWithReusedMetadataAndClosesHandle() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        operations.overrideRegularIdentity = MonitoringRecoveryFileIdentity(device: 7, inode: 11)
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline)
+        let revision = try await store.save(record)
+        let expected = StoredMonitoringRecovery(record: record, revision: revision)
+        let bytes = try Data(contentsOf: url)
+
+        XCTAssertEqual(operations.openFileDescriptorCount(), 1)
+        XCTAssertTrue(operations.duplicatedDescriptorsAreCloseOnExec())
+        try replaceInode(at: url, bytes: bytes)
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.clear(expecting: expected)
+        }
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        XCTAssertEqual(operations.openFileDescriptorCount(), 0)
+    }
+
+    func testReplacementSaveRejectsDifferentOpenGenerationWithReusedMetadata() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        operations.overrideRegularIdentity = MonitoringRecoveryFileIdentity(device: 7, inode: 11)
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        _ = try await store.save(original)
+        let concurrent = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.error))
+        let concurrentBytes = try encoded(concurrent)
+        operations.beforeSwap = {
+            try replaceInode(at: url, bytes: concurrentBytes)
+        }
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            _ = try await store.save(
+                MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+            )
+        }
+
+        XCTAssertEqual(try Data(contentsOf: url), concurrentBytes)
+    }
+
+    func testFileStoreRejectsPublicRevisionItDidNotIssue() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let store = FileMonitoringRecoveryStore(url: url)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline)
+        _ = try await store.save(record)
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.clear(
+                expecting: StoredMonitoringRecovery(
+                    record: record,
+                    revision: MonitoringRecoveryRevision()
+                )
+            )
+        }
+
+        await XCTAssertAsyncEqual((try await store.load())?.record, record)
+    }
+
+    func testClearingOneRevisionInvalidatesAndClosesSiblingHandles() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let record = MonitoringRecoveryRecord(baseline: .testBaseline)
+        let saveRevision = try await store.save(record)
+        let firstLoadedValue = try await store.load()
+        let firstLoaded = try XCTUnwrap(firstLoadedValue)
+        let secondLoadedValue = try await store.load()
+        let secondLoaded = try XCTUnwrap(secondLoadedValue)
+
+        XCTAssertEqual(operations.openFileDescriptorCount(), 3)
+        try await store.clear(expecting: firstLoaded)
+
+        XCTAssertEqual(operations.openFileDescriptorCount(), 0)
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.clear(
+                expecting: StoredMonitoringRecovery(record: record, revision: saveRevision)
+            )
+        }
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.clear(expecting: secondLoaded)
+        }
+    }
+
+    func testStoreDeinitClosesPinnedRevisionDescriptors() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        var store: FileMonitoringRecoveryStore? = FileMonitoringRecoveryStore(
+            url: url,
+            operations: operations
+        )
+        _ = try await store?.save(MonitoringRecoveryRecord(baseline: .testBaseline))
+        XCTAssertEqual(operations.openFileDescriptorCount(), 1)
+
+        store = nil
+
+        XCTAssertEqual(operations.openFileDescriptorCount(), 0)
+    }
+
+    func testPostSwapDirectorySyncFailureRollsBackAndPriorRevisionRemainsClearable() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let revision = try await store.save(original)
+        let expected = StoredMonitoringRecovery(record: original, revision: revision)
+        let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+        operations.failNextDirectorySync = true
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
+            _ = try await store.save(replacement)
+        }
+
+        XCTAssertEqual(
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: url)),
+            original
+        )
+        try await store.clear(expecting: expected)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(operations.openFileDescriptorCount(), 0)
+    }
+
+    func testFailedPostSwapRollbackRetargetsPriorRevisionWithoutClearingReplacement() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let revision = try await store.save(original)
+        let expected = StoredMonitoringRecovery(record: original, revision: revision)
+        let replacement = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.working))
+        operations.failNextDirectorySync = true
+        operations.failSwapCalls = [2]
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.ioFailure) {
+            _ = try await store.save(replacement)
+        }
+
+        XCTAssertEqual(
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: url)),
+            replacement
+        )
+        try await store.clear(expecting: expected)
+        XCTAssertEqual(
+            try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: Data(contentsOf: url)),
+            replacement
+        )
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [url.lastPathComponent])
+        XCTAssertEqual(operations.openFileDescriptorCount(), 0)
+    }
+
+    func testClearDoesNotDeleteUnrelatedFileThatReplacesQuarantinedGeneration() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("monitoring-recovery.json")
+        let operations = FaultInjectingRecoveryPOSIXOperations()
+        let store = FileMonitoringRecoveryStore(url: url, operations: operations)
+        let original = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.thinking))
+        let revision = try await store.save(original)
+        let expected = StoredMonitoringRecovery(record: original, revision: revision)
+        let unrelated = MonitoringRecoveryRecord(baseline: .testBaseline, lastCommand: desired(.error))
+        let unrelatedBytes = try encoded(unrelated)
+        operations.afterNextRenameExclusive = { _, destination in
+            try replaceInode(
+                at: directory.appendingPathComponent(destination),
+                bytes: unrelatedBytes
+            )
+        }
+
+        await XCTAssertThrowsSpecificError(MonitoringRecoveryStoreError.concurrentModification) {
+            try await store.clear(expecting: expected)
+        }
+
+        let artifacts = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        XCTAssertEqual(artifacts.count, 1)
+        XCTAssertEqual(try Data(contentsOf: artifacts[0]), unrelatedBytes)
+        XCTAssertEqual(operations.openFileDescriptorCount(), 0)
+    }
+
     func testClearRejectsByteIdenticalReplacementWithDifferentRevision() async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -1632,6 +1826,7 @@ final class FileMonitoringRecoveryStoreTests: XCTestCase {
         }
 
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
+        XCTAssertEqual(operations.fileDescriptorEvents().first, .sameOpenFile)
     }
 
     func testClearUnlinkFailurePreservesTombstoneRecoveryArtifact() async throws {
@@ -1711,50 +1906,92 @@ private extension Array where Element == RecordingLightController.Operation {
 }
 
 private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOSIXOperations, @unchecked Sendable {
+    enum FileDescriptorEvent: Equatable {
+        case sameOpenFile
+        case close
+    }
+
     private let base = DarwinMonitoringRecoveryPOSIXOperations()
     private let lock = NSLock()
     var beforeSwap: (() throws -> Void)?
     var beforeRenameExclusive: (() throws -> Void)?
     var beforeRead: (() throws -> Void)?
+    var afterNextRenameExclusive: ((String, String) throws -> Void)?
     var failNextFileSync = false
     var failNextDirectorySync = false
     var failNextUnlink = false
     var failNextRenameExclusive = false
     var overrideNextRegularOwner: uid_t?
     var overrideNextRegularMode: mode_t?
+    var overrideRegularIdentity: MonitoringRecoveryFileIdentity?
     var afterNextDirectorySync: (() throws -> Void)?
+    var failSwapCalls: Set<Int> = []
+    private var swapCallCount = 0
+    private var openFileDescriptors: Set<Int32> = []
+    private var openDirectoryDescriptors: Set<Int32> = []
+    private var descriptorEvents: [FileDescriptorEvent] = []
+    private var duplicateCloseOnExecValues: [Bool] = []
 
     func openDirectory(path: String) throws -> Int32 {
-        try base.openDirectory(path: path)
+        let descriptor = try base.openDirectory(path: path)
+        _ = locked { openDirectoryDescriptors.insert(descriptor) }
+        return descriptor
     }
 
     func openExisting(at directory: Int32, name: String) throws -> Int32? {
-        try base.openExisting(at: directory, name: name)
+        let descriptor = try base.openExisting(at: directory, name: name)
+        if let descriptor {
+            _ = locked { openFileDescriptors.insert(descriptor) }
+        }
+        return descriptor
     }
 
     func createExclusive(at directory: Int32, name: String, mode: mode_t) throws -> Int32 {
-        try base.createExclusive(at: directory, name: name, mode: mode)
+        let descriptor = try base.createExclusive(at: directory, name: name, mode: mode)
+        _ = locked { openFileDescriptors.insert(descriptor) }
+        return descriptor
+    }
+
+    func duplicate(_ descriptor: Int32) throws -> Int32 {
+        let duplicate = try base.duplicate(descriptor)
+        locked {
+            duplicateCloseOnExecValues.append(fcntl(duplicate, F_GETFD) & FD_CLOEXEC != 0)
+            if openFileDescriptors.contains(descriptor) {
+                openFileDescriptors.insert(duplicate)
+            } else if openDirectoryDescriptors.contains(descriptor) {
+                openDirectoryDescriptors.insert(duplicate)
+            }
+        }
+        return duplicate
     }
 
     func metadata(for descriptor: Int32) throws -> MonitoringRecoveryFileMetadata {
         let metadata = try base.metadata(for: descriptor)
         return locked {
             guard metadata.mode & S_IFMT == S_IFREG,
-                  overrideNextRegularOwner != nil || overrideNextRegularMode != nil else {
+                  overrideNextRegularOwner != nil
+                    || overrideNextRegularMode != nil
+                    || overrideRegularIdentity != nil else {
                 return metadata
             }
             let owner = overrideNextRegularOwner ?? metadata.owner
             let mode = overrideNextRegularMode ?? metadata.mode
+            let identity = overrideRegularIdentity ?? metadata.identity
             overrideNextRegularOwner = nil
             overrideNextRegularMode = nil
             return MonitoringRecoveryFileMetadata(
-                device: metadata.device,
-                inode: metadata.inode,
+                device: identity.device,
+                inode: identity.inode,
                 mode: mode,
                 owner: owner,
                 linkCount: metadata.linkCount
             )
         }
+    }
+
+    func sameOpenFile(_ first: Int32, _ second: Int32) throws -> Bool {
+        locked { descriptorEvents.append(.sameOpenFile) }
+        return try base.sameOpenFile(first, second)
     }
 
     func read(from descriptor: Int32, maximumBytes: Int) throws -> Data {
@@ -1803,6 +2040,11 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
             return beforeSwap
         }
         try hook?()
+        let shouldFail = locked { () -> Bool in
+            swapCallCount += 1
+            return failSwapCalls.remove(swapCallCount) != nil
+        }
+        if shouldFail { throw MonitoringRecoveryPOSIXError.system(EIO) }
         try base.swap(at: directory, first, second)
     }
 
@@ -1819,6 +2061,11 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
         }
         if shouldFail { throw MonitoringRecoveryPOSIXError.system(EIO) }
         try base.renameExclusive(at: directory, from: from, to: to)
+        let afterHook = locked { () -> ((String, String) throws -> Void)? in
+            defer { afterNextRenameExclusive = nil }
+            return afterNextRenameExclusive
+        }
+        try afterHook?(from, to)
     }
 
     func unlink(at directory: Int32, name: String) throws {
@@ -1832,7 +2079,28 @@ private final class FaultInjectingRecoveryPOSIXOperations: MonitoringRecoveryPOS
     }
 
     func close(_ descriptor: Int32) {
+        locked {
+            if openFileDescriptors.contains(descriptor) {
+                descriptorEvents.append(.close)
+            }
+            openFileDescriptors.remove(descriptor)
+            openDirectoryDescriptors.remove(descriptor)
+        }
         base.close(descriptor)
+    }
+
+    func openFileDescriptorCount() -> Int {
+        locked { openFileDescriptors.count }
+    }
+
+    func fileDescriptorEvents() -> [FileDescriptorEvent] {
+        locked { descriptorEvents }
+    }
+
+    func duplicatedDescriptorsAreCloseOnExec() -> Bool {
+        locked {
+            !duplicateCloseOnExecValues.isEmpty && duplicateCloseOnExecValues.allSatisfy { $0 }
+        }
     }
 
     private func locked<T>(_ body: () -> T) -> T {
