@@ -1,0 +1,273 @@
+import Foundation
+import AgentLightProtocol
+@testable import AgentLightCore
+
+enum TestLightError: Error, Sendable {
+    case transient
+    case permanent
+}
+
+actor ManualClock: AgentLightClock {
+    private struct Sleeper {
+        let id: UUID
+        let deadline: Int64
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private var nowNanoseconds: Int64 = 0
+    private var sleepers: [UUID: Sleeper] = [:]
+    private(set) var requestedSleeps: [Duration] = []
+
+    func sleep(for duration: Duration) async throws {
+        let id = UUID()
+        let nanoseconds = duration.nanoseconds
+        requestedSleeps.append(duration)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                sleepers[id] = Sleeper(
+                    id: id,
+                    deadline: nowNanoseconds + nanoseconds,
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task { await self.cancel(id: id) }
+        }
+    }
+
+    func advance(by duration: Duration) async {
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        nowNanoseconds += duration.nanoseconds
+        let ready = sleepers.values.filter { $0.deadline <= nowNanoseconds }
+        for sleeper in ready {
+            sleepers.removeValue(forKey: sleeper.id)
+            sleeper.continuation.resume()
+        }
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+    }
+
+    func sleeperCount() -> Int {
+        sleepers.count
+    }
+
+    private func cancel(id: UUID) {
+        guard let sleeper = sleepers.removeValue(forKey: id) else { return }
+        sleeper.continuation.resume(throwing: CancellationError())
+    }
+}
+
+private extension Duration {
+    var nanoseconds: Int64 {
+        let components = self.components
+        let seconds = components.seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        precondition(!seconds.overflow)
+        let attoseconds = components.attoseconds / 1_000_000_000
+        return seconds.partialValue + attoseconds
+    }
+}
+
+actor RecordingLightController: TuyaLightControlling {
+    enum Operation: Equatable, Sendable {
+        case capture
+        case match(DesiredLightState)
+        case apply(DesiredLightState)
+        case restore(BulbBaseline)
+    }
+
+    private let baseline: BulbBaseline
+    private var captureResults: [Result<BulbBaseline, TestLightError>]
+    private var applyResults: [Result<Void, TestLightError>]
+    private var restoreResults: [Result<Void, TestLightError>]
+    private var matchResults: [Result<Bool, TestLightError>]
+    private var blockedApply: CheckedContinuation<Void, Never>?
+    private var blockedRestore: CheckedContinuation<Void, Never>?
+    private var shouldBlockApply = false
+    private var shouldBlockRestore = false
+    private(set) var operations: [Operation] = []
+
+    init(
+        baseline: BulbBaseline = .testBaseline,
+        captureResults: [Result<BulbBaseline, TestLightError>] = [],
+        applyResults: [Result<Void, TestLightError>] = [],
+        restoreResults: [Result<Void, TestLightError>] = [],
+        matchResults: [Result<Bool, TestLightError>] = []
+    ) {
+        self.baseline = baseline
+        self.captureResults = captureResults
+        self.applyResults = applyResults
+        self.restoreResults = restoreResults
+        self.matchResults = matchResults
+    }
+
+    func captureBaseline() async throws -> BulbBaseline {
+        operations.append(.capture)
+        if !captureResults.isEmpty {
+            return try captureResults.removeFirst().get()
+        }
+        return baseline
+    }
+
+    func apply(_ state: DesiredLightState) async throws {
+        operations.append(.apply(state))
+        if shouldBlockApply {
+            await withCheckedContinuation { continuation in
+                blockedApply = continuation
+            }
+        }
+        if !applyResults.isEmpty {
+            try applyResults.removeFirst().get()
+        }
+    }
+
+    func currentStateMatches(_ state: DesiredLightState) async throws -> Bool {
+        operations.append(.match(state))
+        if !matchResults.isEmpty {
+            return try matchResults.removeFirst().get()
+        }
+        return true
+    }
+
+    func restore(_ baseline: BulbBaseline) async throws {
+        operations.append(.restore(baseline))
+        if shouldBlockRestore {
+            await withCheckedContinuation { continuation in
+                blockedRestore = continuation
+            }
+        }
+        if !restoreResults.isEmpty {
+            try restoreResults.removeFirst().get()
+        }
+    }
+
+    func setApplyBlocked(_ blocked: Bool) {
+        shouldBlockApply = blocked
+    }
+
+    func releaseApply() {
+        shouldBlockApply = false
+        blockedApply?.resume()
+        blockedApply = nil
+    }
+
+    func setRestoreBlocked(_ blocked: Bool) {
+        shouldBlockRestore = blocked
+    }
+
+    func releaseRestore() {
+        shouldBlockRestore = false
+        blockedRestore?.resume()
+        blockedRestore = nil
+    }
+
+    func appliedStates() -> [DesiredLightState] {
+        operations.compactMap {
+            guard case let .apply(state) = $0 else { return nil }
+            return state
+        }
+    }
+
+    func restoreCount() -> Int {
+        operations.filter {
+            if case .restore = $0 { return true }
+            return false
+        }.count
+    }
+}
+
+actor MemoryRecoveryStore: MonitoringRecoveryStoring {
+    enum Operation: Equatable, Sendable {
+        case load
+        case save(MonitoringRecoveryRecord)
+        case clear
+    }
+
+    private var record: MonitoringRecoveryRecord?
+    private var saveFailures: [TestLightError]
+    private var saveFailureCalls: Set<Int>
+    private var saveCallCount = 0
+    private var clearFailures: [TestLightError]
+    private(set) var operations: [Operation] = []
+
+    init(
+        record: MonitoringRecoveryRecord? = nil,
+        saveFailures: [TestLightError] = [],
+        saveFailureCalls: Set<Int> = [],
+        clearFailures: [TestLightError] = []
+    ) {
+        self.record = record
+        self.saveFailures = saveFailures
+        self.saveFailureCalls = saveFailureCalls
+        self.clearFailures = clearFailures
+    }
+
+    func load() async throws -> MonitoringRecoveryRecord? {
+        operations.append(.load)
+        return record
+    }
+
+    func save(_ record: MonitoringRecoveryRecord) async throws {
+        operations.append(.save(record))
+        saveCallCount += 1
+        if saveFailureCalls.remove(saveCallCount) != nil {
+            throw TestLightError.permanent
+        }
+        if !saveFailures.isEmpty {
+            throw saveFailures.removeFirst()
+        }
+        self.record = record
+    }
+
+    func clear() async throws {
+        operations.append(.clear)
+        if !clearFailures.isEmpty {
+            throw clearFailures.removeFirst()
+        }
+        record = nil
+    }
+
+    func storedRecord() -> MonitoringRecoveryRecord? {
+        record
+    }
+}
+
+extension BulbBaseline {
+    static let testBaseline = BulbBaseline(values: [
+        "switch_led": .bool(true),
+        "work_mode": .string("white")
+    ])
+}
+
+func makeEvent(
+    source: AgentSource = .codex,
+    session: String = "session",
+    workspace: String? = nil,
+    state: AgentState,
+    externalSequence: UInt64 = 0
+) -> AgentEvent {
+    AgentEvent(
+        source: source,
+        sessionID: session,
+        workspace: workspace,
+        state: state,
+        sequence: externalSequence
+    )
+}
+
+func desired(_ state: AgentState) -> DesiredLightState {
+    DesiredLightState(color: state.color!)
+}
+
+func eventually(
+    attempts: Int = 200,
+    _ condition: @escaping @Sendable () async -> Bool
+) async -> Bool {
+    for _ in 0..<attempts {
+        if await condition() { return true }
+        await Task.yield()
+    }
+    return false
+}
