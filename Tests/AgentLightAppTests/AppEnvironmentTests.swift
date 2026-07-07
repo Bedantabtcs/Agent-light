@@ -96,7 +96,7 @@ final class AppEnvironmentTests: XCTestCase {
 
         XCTAssertEqual(
             recorder.values,
-            [.prepare, .recover, .loadCredentials, .synchronize, .relayStart, .relayAccept]
+            [.prepare, .recover, .synchronize, .loadCredentials, .relayStart, .relayAccept]
         )
     }
 
@@ -122,7 +122,7 @@ final class AppEnvironmentTests: XCTestCase {
 
         XCTAssertEqual(
             recorder.values,
-            [.prepare, .recover, .loadCredentials, .synchronize, .connect, .approve, .relayStart]
+            [.prepare, .recover, .synchronize, .loadCredentials, .connect, .approve, .relayStart]
         )
         XCTAssertEqual(viewModel.lastDraft?.accessSecret, "CANARY_ACCESS_SECRET")
     }

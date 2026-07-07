@@ -1,4 +1,5 @@
 import AgentLightProtocol
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -28,7 +29,7 @@ public struct IntegrationPreview: Equatable, Sendable {
     }
 }
 
-public enum IntegrationSourceOwnership: Equatable, Sendable {
+public enum IntegrationSourceOwnership: String, Codable, Equatable, Sendable {
     case fresh
     case fullyPreexisting
     case partial
@@ -40,17 +41,26 @@ public enum IntegrationOverallOwnership: Equatable, Sendable {
     case mixed
 }
 
-public struct IntegrationSourceReceipt: Equatable, Sendable {
+public struct IntegrationSourceReceipt: Codable, Equatable, Sendable {
     public let source: AgentSource
     public let ownership: IntegrationSourceOwnership
+    public let marker: String?
+    public let installedContentFingerprint: String?
 
-    public init(source: AgentSource, ownership: IntegrationSourceOwnership) {
+    public init(
+        source: AgentSource,
+        ownership: IntegrationSourceOwnership,
+        marker: String? = nil,
+        installedContentFingerprint: String? = nil
+    ) {
         self.source = source
         self.ownership = ownership
+        self.marker = marker
+        self.installedContentFingerprint = installedContentFingerprint
     }
 }
 
-public struct IntegrationInstallReceipt: Equatable, Sendable {
+public struct IntegrationInstallReceipt: Codable, Equatable, Sendable {
     public let sources: [IntegrationSourceReceipt]
 
     public init(sources: [IntegrationSourceReceipt]) {
@@ -79,6 +89,18 @@ public struct IntegrationInstallReceipt: Equatable, Sendable {
         }
         return .mixed
     }
+
+    public var hasVerifiableFingerprints: Bool {
+        isValid && sources.allSatisfy { source in
+            guard source.marker == AppIdentity.integrationIdentifier,
+                  let fingerprint = source.installedContentFingerprint,
+                  fingerprint.count == 64 else { return false }
+            return fingerprint.utf8.allSatisfy {
+                ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))
+                    || ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "f"))
+            }
+        }
+    }
 }
 
 public enum IntegrationReceiptValidationError: Error, Equatable, Sendable {
@@ -91,6 +113,7 @@ public protocol IntegrationInstalling: Sendable {
     func installWithReceipt() async throws -> IntegrationInstallReceipt
     func repair() async throws
     func uninstall() async throws
+    func uninstall(using receipt: IntegrationInstallReceipt) async throws
     func verifyArtifactCleanup() async throws -> Bool
 }
 
@@ -105,6 +128,10 @@ public extension IntegrationInstalling {
     }
 
     func verifyArtifactCleanup() async throws -> Bool { false }
+
+    func uninstall(using receipt: IntegrationInstallReceipt) async throws {
+        throw IntegrationError.ownershipVerificationFailed
+    }
 }
 
 public enum IntegrationError: Error, Equatable {
@@ -120,6 +147,7 @@ public enum IntegrationError: Error, Equatable {
     case committedWithReceiptCleanupFailure(receipt: IntegrationInstallReceipt, failures: [String])
     case artifactCleanupFailure([String])
     case rollbackFailed([String])
+    case ownershipVerificationFailed
 }
 
 public struct IntegrationConfigEditor: Sendable {
@@ -178,6 +206,38 @@ public struct IntegrationConfigEditor: Sendable {
     func hasOwnedEntries(in data: Data) throws -> Bool {
         var root = try rootObject(from: data)
         return removeOwnedCommands(from: &root)
+    }
+
+    func installedContentFingerprint(in data: Data) throws -> String {
+        let root = try rootObject(from: data)
+        guard case let .object(hooks)? = root["hooks"] else {
+            throw IntegrationError.ownershipVerificationFailed
+        }
+        var ownedHooks: [String: JSONValue] = [:]
+        for (event, value) in hooks {
+            guard case let .array(entries) = value else { continue }
+            let ownedEntries: [JSONValue]
+            if source == .cursor {
+                ownedEntries = entries.filter(isOwnedHandler)
+            } else {
+                ownedEntries = entries.compactMap { entry in
+                    guard case var .object(group) = entry,
+                          case let .array(handlers)? = group["hooks"] else { return nil }
+                    let ownedHandlers = handlers.filter(isOwnedHandler)
+                    guard !ownedHandlers.isEmpty else { return nil }
+                    group["hooks"] = .array(ownedHandlers)
+                    return .object(group)
+                }
+            }
+            if !ownedEntries.isEmpty { ownedHooks[event] = .array(ownedEntries) }
+        }
+        guard !ownedHooks.isEmpty else { throw IntegrationError.ownershipVerificationFailed }
+        var material = Data(AppIdentity.integrationIdentifier.utf8)
+        material.append(0)
+        material.append(contentsOf: source.rawValue.utf8)
+        material.append(0)
+        material.append(try JSONValue.object(ownedHooks).encodedData())
+        return SHA256.hash(data: material).map { String(format: "%02x", $0) }.joined()
     }
 
     func ownership(before data: Data, after installed: Data) throws -> IntegrationSourceOwnership {
@@ -692,7 +752,9 @@ public struct IntegrationInstaller: IntegrationInstalling {
                 ),
                 IntegrationSourceReceipt(
                     source: configuration.source,
-                    ownership: try editor.ownership(before: before.data, after: after)
+                    ownership: try editor.ownership(before: before.data, after: after),
+                    marker: AppIdentity.integrationIdentifier,
+                    installedContentFingerprint: try editor.installedContentFingerprint(in: after)
                 )
             )
         }
@@ -714,6 +776,34 @@ public struct IntegrationInstaller: IntegrationInstalling {
 
     public func uninstall() async throws {
         try apply(includeMissing: false) { editor, data in try editor.uninstall(from: data) }
+    }
+
+    public func uninstall(using receipt: IntegrationInstallReceipt) async throws {
+        guard receipt.hasVerifiableFingerprints, receipt.overallOwnership == .fresh else {
+            throw IntegrationError.ownershipVerificationFailed
+        }
+        let receipts = Dictionary(uniqueKeysWithValues: receipt.sources.map { ($0.source, $0) })
+        let changes = try paths.all.map { configuration -> AtomicConfigurationChange in
+            guard let sourceReceipt = receipts[configuration.source],
+                  let expected = sourceReceipt.installedContentFingerprint else {
+                throw IntegrationError.ownershipVerificationFailed
+            }
+            let before = try fileOperations.snapshot(at: configuration.url)
+            guard case .file = before else { throw IntegrationError.ownershipVerificationFailed }
+            let editor = IntegrationConfigEditor(source: configuration.source, relayPath: relayPath)
+            guard try editor.installedContentFingerprint(in: before.data) == expected else {
+                throw IntegrationError.ownershipVerificationFailed
+            }
+            return AtomicConfigurationChange(
+                destination: configuration.url,
+                before: before,
+                after: try editor.uninstall(from: before.data)
+            )
+        }
+        let cleanupFailures = try AtomicConfigurationWriter(fileOperations: fileOperations).apply(changes)
+        if !cleanupFailures.isEmpty {
+            throw IntegrationError.artifactCleanupFailure(cleanupFailures)
+        }
     }
 
     public func verifyArtifactCleanup() async throws -> Bool {

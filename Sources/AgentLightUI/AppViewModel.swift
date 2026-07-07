@@ -104,14 +104,16 @@ public enum PresentationError: Error, Equatable, Sendable {
     case operationFailed
 }
 
-public enum OutstandingObligation: Hashable, Sendable {
+public enum OutstandingObligation: String, Codable, Hashable, Sendable {
     case integrationUninstallRetry
     case integrationRollbackRepair
     case integrationMixedAdoption
     case integrationArtifactCleanup
     case credentialRestore
     case credentialDelete
+    case credentialBackupCleanup
     case loginRegistrationCleanup
+    case ownershipReceiptRepair
 }
 
 @MainActor
@@ -152,8 +154,8 @@ public final class AppViewModel: AppViewModeling {
     @ObservationIgnored private var resumeTask: SharedOperation?
     @ObservationIgnored private var repairTask: SharedOperation?
     @ObservationIgnored private var disconnectTask: SharedOperation?
-    @ObservationIgnored private var integrationOwnership: IntegrationOwnership = .none
-    @ObservationIgnored private var credentialOwnership: CredentialOwnership = .none
+    @ObservationIgnored private var integrationOwnership: PersistentIntegrationOwnership = .none
+    @ObservationIgnored private var credentialOwnership: PersistentCredentialOwnership = .none
     @ObservationIgnored private var loginRegistrationOwned = false
     @ObservationIgnored private var ownsMonitoring = false
 #if DEBUG
@@ -490,7 +492,11 @@ public final class AppViewModel: AppViewModeling {
                 await ledger.releaseLease(lease)
                 return
             }
-            let result = await Self.performRepair(plan, using: integrations)
+            let result = await Self.performRepair(
+                plan,
+                integration: current.integration,
+                using: integrations
+            )
             let snapshot = await Self.recordRepair(
                 result,
                 plan: plan,
@@ -540,6 +546,7 @@ public final class AppViewModel: AppViewModeling {
             await pendingPause?.wait()
             await pendingResume?.wait()
             await pendingRepair?.wait()
+            try? await ledger.hydrate()
             let lease = await ledger.acquireLease()
             await ledger.registerPresentationHandle(presentationHandle)
             let snapshot = await Self.cleanupOwnedState(
@@ -572,8 +579,20 @@ public final class AppViewModel: AppViewModeling {
             let transition = try loginItem.setEnabled(true)
             loginItemStatus = transition.current
             if transition.didRegister {
-                loginRegistrationOwned = true
-                await ownershipLedger.setLoginOwned(true)
+                do {
+                    try await ownershipLedger.update(.login(
+                        transition.current == .requiresApproval ? .pendingApproval : .owned
+                    ))
+                    loginRegistrationOwned = true
+                } catch {
+                    _ = try? loginItem.setEnabled(false)
+                    loginItemStatus = loginItem.status()
+                    syncOwnership(await ownershipLedger.snapshot())
+                    phase = .repairRequired
+                    presentedError = .operationFailed
+                    await ownershipLedger.releaseLease(lease)
+                    return
+                }
             }
             presentedError = transition.current == .requiresApproval ? .loginApprovalRequired : nil
         } catch {
@@ -613,9 +632,9 @@ public final class AppViewModel: AppViewModeling {
               let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
         let snapshot = await ownershipLedger.snapshot()
         switch snapshot.integration {
-        case .uninstallable:
+        case let .uninstallable(receipt):
             do {
-                try await integrations.uninstall()
+                try await integrations.uninstall(using: receipt)
                 await ownershipLedger.setIntegration(.none)
                 await ownershipLedger.remove(.integrationUninstallRetry)
                 presentedError = nil
@@ -626,13 +645,19 @@ public final class AppViewModel: AppViewModeling {
                 await ownershipLedger.insert(.integrationArtifactCleanup)
                 phase = .repairRequired
                 presentedError = .operationFailed
+            } catch IntegrationError.ownershipVerificationFailed,
+                    IntegrationError.destinationChanged {
+                await ownershipLedger.setIntegration(.uncertain(receipt))
+                await ownershipLedger.insert(.integrationRollbackRepair)
+                phase = .repairRequired
+                presentedError = .integrationConflict
             } catch {
                 await ownershipLedger.insert(.integrationUninstallRetry)
                 phase = .repairRequired
                 presentedError = Self.presentationError(for: error)
             }
-        case .preexisting, .mixed:
-            await ownershipLedger.setIntegration(.mixed)
+        case let .preexisting(receipt), let .mixed(receipt):
+            await ownershipLedger.setIntegration(.mixed(receipt))
             await ownershipLedger.insert(.integrationMixedAdoption)
             phase = .repairRequired
             presentedError = .integrationConflict
@@ -748,6 +773,11 @@ public final class AppViewModel: AppViewModeling {
         let pendingConnect = connectTask
         pendingConnect?.cancel()
         await pendingConnect?.wait()
+        do {
+            try await ownershipLedger.hydrate()
+        } catch {
+            // The ledger has already replaced corrupt/unsupported state with a sanitized repair obligation.
+        }
         guard let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
         await ownershipLedger.registerPresentationHandle(presentationHandle)
         let snapshot = await ownershipLedger.snapshot()
@@ -770,6 +800,11 @@ public final class AppViewModel: AppViewModeling {
     }
 
     private func hydrateOwnership() async -> Bool {
+        do {
+            try await ownershipLedger.hydrate()
+        } catch {
+            // The sanitized fail-closed snapshot remains available for repair presentation.
+        }
         guard let lease = await ownershipLedger.acquireLeaseForCaller() else { return false }
         await ownershipLedger.registerPresentationHandle(presentationHandle)
         let snapshot = await ownershipLedger.snapshot()
@@ -886,19 +921,24 @@ public final class AppViewModel: AppViewModeling {
             try Task.checkCancellation()
             do {
                 let receipt = try await integrations.installWithReceipt()
-                guard receipt.isValid else {
-                    await ledger.setIntegration(.mixed)
+                guard receipt.isValid, receipt.hasVerifiableFingerprints else {
+                    await ledger.setIntegration(.uncertain(nil))
                     await ledger.insert(.integrationMixedAdoption)
                     return .failure(.integrationConflict, await ledger.snapshot())
                 }
-                await ledger.setIntegration(Self.integrationOwnership(for: receipt))
+                do {
+                    try await ledger.update(.integration(Self.integrationOwnership(for: receipt)))
+                } catch {
+                    try? await integrations.uninstall(using: receipt)
+                    return .failure(.operationFailed, await ledger.snapshot())
+                }
             } catch let error as IntegrationError {
                 switch error {
                 case let .committedWithReceiptCleanupFailure(receipt, _):
-                    if receipt.isValid {
+                    if receipt.isValid, receipt.hasVerifiableFingerprints {
                         await ledger.setIntegration(Self.integrationOwnership(for: receipt))
                     } else {
-                        await ledger.setIntegration(.mixed)
+                        await ledger.setIntegration(.uncertain(nil))
                         await ledger.insert(.integrationMixedAdoption)
                     }
                     await ledger.insert(.integrationArtifactCleanup)
@@ -911,12 +951,12 @@ public final class AppViewModel: AppViewModeling {
                         ledger: ledger
                     )
                 case .committedWithCleanupFailure:
-                    await ledger.setIntegration(.mixed)
+                    await ledger.setIntegration(.uncertain(nil))
                     await ledger.insert(.integrationMixedAdoption)
                     await ledger.insert(.integrationArtifactCleanup)
                     return .failure(.integrationConflict, await ledger.snapshot())
                 case .rollbackFailed:
-                    await ledger.setIntegration(.uncertain)
+                    await ledger.setIntegration(.uncertain(nil))
                     await ledger.insert(.integrationRollbackRepair)
                     return .failure(.integrationConflict, await ledger.snapshot())
                 default:
@@ -926,12 +966,31 @@ public final class AppViewModel: AppViewModeling {
 
             try Task.checkCancellation()
             let previous = try credentials.load()
+            let previousStore = credentials as? any PreviousCredentialStoring
+            if let previous {
+                guard let previousStore else { throw InternalError.previousCredentialStoreUnavailable }
+                try previousStore.savePrevious(previous)
+            }
+            do {
+                try await ledger.update(.credentials(previous == nil ? .created : .replacedWithBackup))
+            } catch {
+                if previous != nil { try? previousStore?.deletePrevious() }
+                throw error
+            }
             try credentials.save(pendingCredentials)
-            await ledger.setCredentials(previous.map(CredentialOwnership.replaced) ?? .created)
 
             try Task.checkCancellation()
             let transition = try loginItem.setEnabled(true)
-            if transition.didRegister { await ledger.setLoginOwned(true) }
+            if transition.didRegister {
+                do {
+                    try await ledger.update(.login(
+                        transition.current == .requiresApproval ? .pendingApproval : .owned
+                    ))
+                } catch {
+                    _ = try? loginItem.setEnabled(false)
+                    throw error
+                }
+            }
             guard transition.current == .enabled else { throw InternalError.loginApprovalRequired }
 
             try Task.checkCancellation()
@@ -1013,14 +1072,38 @@ public final class AppViewModel: AppViewModeling {
                 case .none: break
                 case .created:
                     try credentials.delete()
-                    await ledger.remove(.credentialDelete)
-                case let .replaced(previous):
+                    try await ledger.update(.removeObligation(.credentialDelete))
+                    try await ledger.update(.credentials(.none))
+                case .replacedWithBackup:
+                    guard let previousStore = credentials as? any PreviousCredentialStoring,
+                          let previous = try previousStore.loadPrevious() else {
+                        await ledger.insert(.credentialRestore)
+                        snapshot = await ledger.snapshot()
+                        break
+                    }
                     try credentials.save(previous)
-                    await ledger.remove(.credentialRestore)
+                    try await ledger.update(.removeObligation(.credentialRestore))
+                    try await ledger.update(.insertObligation(.credentialBackupCleanup))
+                    try await ledger.update(.credentials(.none))
+                    do {
+                        try previousStore.deletePrevious()
+                        await ledger.remove(.credentialBackupCleanup)
+                    } catch {
+                        await ledger.insert(.credentialBackupCleanup)
+                    }
                 }
-                await ledger.setCredentials(.none)
             } catch {
                 await ledger.insert(snapshot.credentials == .created ? .credentialDelete : .credentialRestore)
+            }
+        }
+        if snapshot.credentials == .none,
+           snapshot.obligations.contains(.credentialBackupCleanup),
+           let previousStore = credentials as? any PreviousCredentialStoring {
+            do {
+                try previousStore.deletePrevious()
+                await ledger.remove(.credentialBackupCleanup)
+            } catch {
+                await ledger.insert(.credentialBackupCleanup)
             }
         }
         snapshot = await ledger.snapshot()
@@ -1029,15 +1112,20 @@ public final class AppViewModel: AppViewModeling {
             break
         case .preexisting:
             await ledger.setIntegration(.none)
-        case .uninstallable:
+        case let .uninstallable(receipt):
             do {
-                try await integrations.uninstall()
+                try await integrations.uninstall(using: receipt)
                 await ledger.setIntegration(.none)
                 await ledger.remove(.integrationUninstallRetry)
             } catch let error as IntegrationError where Self.isCommittedCleanup(error) {
                 await ledger.setIntegration(.none)
                 await ledger.remove(.integrationUninstallRetry)
                 await ledger.insert(.integrationArtifactCleanup)
+            } catch IntegrationError.ownershipVerificationFailed,
+                    IntegrationError.destinationChanged {
+                await ledger.setIntegration(.uncertain(receipt))
+                await ledger.remove(.integrationUninstallRetry)
+                await ledger.insert(.integrationRollbackRepair)
             } catch {
                 await ledger.insert(.integrationUninstallRetry)
             }
@@ -1173,13 +1261,17 @@ public final class AppViewModel: AppViewModeling {
 
     private static func performRepair(
         _ plan: RepairPlan,
+        integration: PersistentIntegrationOwnership,
         using integrations: any IntegrationInstalling
     ) async -> RepairResult {
         do {
             try Task.checkCancellation()
             switch plan {
             case .uninstall:
-                try await integrations.uninstall()
+                guard case let .uninstallable(receipt) = integration else {
+                    return .invalidAdoptionReceipt
+                }
+                try await integrations.uninstall(using: receipt)
             case .rollback, .health:
                 try await integrations.repair()
             case .adoptMixed:
@@ -1207,7 +1299,7 @@ public final class AppViewModel: AppViewModeling {
     private static func recordRepair(
         _ result: RepairResult,
         plan: RepairPlan,
-        priorIntegration: IntegrationOwnership,
+        priorIntegration: PersistentIntegrationOwnership,
         ledger: AppOwnershipLedger
     ) async -> OwnershipSnapshot {
         switch result {
@@ -1261,42 +1353,15 @@ public final class AppViewModel: AppViewModeling {
         syncOwnership(snapshot)
         switch result {
         case .success:
-            switch plan {
-            case .uninstall:
-                outstandingObligations.remove(.integrationUninstallRetry)
-                integrationOwnership = .none
-            case .rollback:
-                outstandingObligations.remove(.integrationRollbackRepair)
-                integrationOwnership = .none
-            case .adoptMixed:
-                outstandingObligations.remove(.integrationMixedAdoption)
-                integrationOwnership = .none
-            case .health, .artifactOnly:
-                break
-            }
             if originalPhase == .repairRequired, outstandingObligations.isEmpty {
                 presentedError = nil
                 phase = pendingCredentials == nil ? .onboarding : .integrationReview
             }
         case .artifactCleanupRequired:
-            switch plan {
-            case .uninstall: outstandingObligations.remove(.integrationUninstallRetry)
-            case .rollback: outstandingObligations.remove(.integrationRollbackRepair)
-            case .adoptMixed: outstandingObligations.remove(.integrationMixedAdoption)
-            case .health, .artifactOnly: break
-            }
-            outstandingObligations.insert(.integrationArtifactCleanup)
-            switch plan {
-            case .uninstall, .rollback, .adoptMixed:
-                integrationOwnership = .none
-            case .health, .artifactOnly:
-                break
-            }
+            phase = .repairRequired
         case .legacyArtifactCleanupRequired:
-            outstandingObligations.insert(.integrationArtifactCleanup)
             phase = .repairRequired
         case .artifactVerifiedClean:
-            outstandingObligations.remove(.integrationArtifactCleanup)
             if originalPhase == .repairRequired, outstandingObligations.isEmpty {
                 presentedError = nil
                 phase = pendingCredentials == nil ? .onboarding : .integrationReview
@@ -1307,9 +1372,6 @@ public final class AppViewModel: AppViewModeling {
             phase = .repairRequired
             presentedError = .integrationConflict
         case let .failure(error):
-            if plan == .health {
-                outstandingObligations.insert(.integrationRollbackRepair)
-            }
             phase = .repairRequired
             presentedError = error
         case .cancelled:
@@ -1439,11 +1501,11 @@ public final class AppViewModel: AppViewModeling {
 
     private static func integrationOwnership(
         for receipt: IntegrationInstallReceipt
-    ) -> IntegrationOwnership {
+    ) -> PersistentIntegrationOwnership {
         switch receipt.overallOwnership {
-        case .fresh: .uninstallable
-        case .fullyPreexisting: .preexisting
-        case .mixed: .mixed
+        case .fresh: .uninstallable(receipt)
+        case .fullyPreexisting: .preexisting(receipt)
+        case .mixed: .mixed(receipt)
         }
     }
 
@@ -1516,36 +1578,47 @@ private enum ValidationError: Error {
 
 private enum InternalError: Error {
     case loginApprovalRequired
+    case previousCredentialStoreUnavailable
 }
 
-fileprivate enum CredentialOwnership: Equatable, Sendable {
-    case none
-    case created
-    case replaced(TuyaCredentials)
-}
+public struct OwnershipSnapshot: Equatable, Sendable {
+    public var integration: PersistentIntegrationOwnership
+    public var credentials: PersistentCredentialOwnership
+    public var login: PersistentLoginOwnership
+    public var monitoringOwned: Bool
+    public var obligations: Set<OutstandingObligation>
 
-fileprivate enum IntegrationOwnership: Equatable, Sendable {
-    case none
-    case uninstallable
-    case preexisting
-    case mixed
-    case uncertain
-}
+    public init(
+        integration: PersistentIntegrationOwnership = .none,
+        credentials: PersistentCredentialOwnership = .none,
+        login: PersistentLoginOwnership = .none,
+        monitoringOwned: Bool = false,
+        obligations: Set<OutstandingObligation> = []
+    ) {
+        self.integration = integration
+        self.credentials = credentials
+        self.login = login
+        self.monitoringOwned = monitoringOwned
+        self.obligations = obligations
+    }
 
-fileprivate struct OwnershipSnapshot: Sendable {
-    var integration: IntegrationOwnership = .none
-    var credentials: CredentialOwnership = .none
-    var loginRegistrationOwned = false
-    var monitoringOwned = false
-    var obligations: Set<OutstandingObligation> = []
+    var loginRegistrationOwned: Bool { login != .none }
 
     var hasOwnedState: Bool {
         integration != .none
             || credentials != .none
-            || loginRegistrationOwned
+            || login != .none
             || monitoringOwned
             || !obligations.isEmpty
     }
+}
+
+public enum OwnershipMutation: Sendable {
+    case integration(PersistentIntegrationOwnership)
+    case credentials(PersistentCredentialOwnership)
+    case login(PersistentLoginOwnership)
+    case insertObligation(OutstandingObligation)
+    case removeObligation(OutstandingObligation)
 }
 
 public actor AppOwnershipLedger {
@@ -1554,7 +1627,12 @@ public actor AppOwnershipLedger {
         let continuation: CheckedContinuation<UUID?, Never>
     }
 
+    private let store: any SetupOwnershipStoring
     private var value = OwnershipSnapshot()
+    private var hydrated = false
+    private var hydrationFailure: SetupOwnershipStoreError?
+    private var persistenceBusy = false
+    private var persistenceWaiters: [CheckedContinuation<Void, Never>] = []
     private var presentationHandlesByID: [UUID: AppPresentationHandle] = [:]
     private var activeLease: UUID?
     private var leaseWaiters: [LeaseWaiter] = []
@@ -1570,7 +1648,100 @@ public actor AppOwnershipLedger {
     private var blockedCancellableLeaseAcquisitionWaiters: [CheckedContinuation<Void, Never>] = []
 #endif
 
-    public init() {}
+    public init(store: any SetupOwnershipStoring = MemorySetupOwnershipStore()) {
+        self.store = store
+    }
+
+    public func hydrate() async throws {
+        await acquirePersistenceAccess()
+        defer { releasePersistenceAccess() }
+        try await hydrateWithoutPersistenceGate()
+    }
+
+    private func hydrateWithoutPersistenceGate() async throws {
+        guard !hydrated else {
+            if let hydrationFailure { throw hydrationFailure }
+            return
+        }
+        do {
+            if let receipt = try await store.load() {
+                guard receipt.isValid else { throw SetupOwnershipStoreError.malformedReceipt }
+                value = OwnershipSnapshot(
+                    integration: receipt.integration,
+                    credentials: receipt.credential,
+                    login: receipt.login,
+                    obligations: receipt.obligations
+                )
+            } else {
+                value = OwnershipSnapshot()
+            }
+            hydrated = true
+            hydrationFailure = nil
+        } catch let error as SetupOwnershipStoreError {
+            value = OwnershipSnapshot(obligations: [.ownershipReceiptRepair])
+            hydrated = true
+            hydrationFailure = error
+            throw error
+        } catch {
+            value = OwnershipSnapshot(obligations: [.ownershipReceiptRepair])
+            hydrated = true
+            hydrationFailure = .readFailed
+            throw SetupOwnershipStoreError.readFailed
+        }
+    }
+
+    public func snapshot() -> OwnershipSnapshot { value }
+
+    public func update(_ mutation: OwnershipMutation) async throws {
+        await acquirePersistenceAccess()
+        defer { releasePersistenceAccess() }
+        if !hydrated { try await hydrateWithoutPersistenceGate() }
+        var proposed = value
+        switch mutation {
+        case let .integration(ownership): proposed.integration = ownership
+        case let .credentials(ownership): proposed.credentials = ownership
+        case let .login(ownership): proposed.login = ownership
+        case let .insertObligation(obligation): proposed.obligations.insert(obligation)
+        case let .removeObligation(obligation): proposed.obligations.remove(obligation)
+        }
+        let receipt = SetupOwnershipReceipt(
+            integration: proposed.integration,
+            credential: proposed.credentials,
+            login: proposed.login,
+            obligations: proposed.obligations
+        )
+        do {
+            if receipt.isEmpty {
+                try await store.delete()
+            } else {
+                try await store.save(receipt)
+            }
+            value = proposed
+            hydrationFailure = nil
+        } catch let error as SetupOwnershipStoreError {
+            value.obligations.insert(.ownershipReceiptRepair)
+            throw error
+        } catch {
+            value.obligations.insert(.ownershipReceiptRepair)
+            throw SetupOwnershipStoreError.writeFailed
+        }
+    }
+
+    private func acquirePersistenceAccess() async {
+        if !persistenceBusy {
+            persistenceBusy = true
+            return
+        }
+        await withCheckedContinuation { persistenceWaiters.append($0) }
+    }
+
+    private func releasePersistenceAccess() {
+        guard !persistenceWaiters.isEmpty else {
+            persistenceBusy = false
+            return
+        }
+        persistenceWaiters.removeFirst().resume()
+    }
 
     fileprivate func registerPresentationHandle(_ handle: AppPresentationHandle) async {
         await pruneDeadPresentationHandles()
@@ -1737,13 +1908,22 @@ public actor AppOwnershipLedger {
     private func blockCancellableLeaseAcquisitionReturnIfNeeded() async {}
 #endif
 
-    fileprivate func snapshot() -> OwnershipSnapshot { value }
-    fileprivate func setIntegration(_ ownership: IntegrationOwnership) { value.integration = ownership }
-    fileprivate func setCredentials(_ ownership: CredentialOwnership) { value.credentials = ownership }
-    func setLoginOwned(_ owned: Bool) { value.loginRegistrationOwned = owned }
+    fileprivate func setIntegration(_ ownership: PersistentIntegrationOwnership) async {
+        try? await update(.integration(ownership))
+    }
+    fileprivate func setCredentials(_ ownership: PersistentCredentialOwnership) async {
+        try? await update(.credentials(ownership))
+    }
+    func setLoginOwned(_ owned: Bool) async {
+        try? await update(.login(owned ? .owned : .none))
+    }
     func setMonitoringOwned(_ owned: Bool) { value.monitoringOwned = owned }
-    func insert(_ obligation: OutstandingObligation) { value.obligations.insert(obligation) }
-    func remove(_ obligation: OutstandingObligation) { value.obligations.remove(obligation) }
+    func insert(_ obligation: OutstandingObligation) async {
+        try? await update(.insertObligation(obligation))
+    }
+    func remove(_ obligation: OutstandingObligation) async {
+        try? await update(.removeObligation(obligation))
+    }
 }
 
 private enum ConnectResult {

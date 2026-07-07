@@ -9,6 +9,53 @@ final class CredentialStoreTests: XCTestCase {
     private let service = "com.bbatchas.agentlight.tuya.tests"
     private let account = "credential-store-test"
 
+    func testPreviousCredentialsUseIndependentKeychainItemWithoutChangingActiveItem() throws {
+        let operations = MultiAccountSecurityOperations()
+        let store = KeychainCredentialStore(
+            service: service,
+            account: account,
+            previousAccount: account + ".previous",
+            operations: operations
+        )
+        let active = makeCredentials()
+        let previous = TuyaCredentials(
+            endpoint: URL(string: "https://openapi.tuyain.com")!,
+            accessID: "previous-access-id-private",
+            accessSecret: "previous-access-secret-private",
+            deviceID: "previous-device-id-private"
+        )
+
+        try store.save(active)
+        try store.savePrevious(previous)
+
+        XCTAssertEqual(try store.load(), active)
+        XCTAssertEqual(try store.loadPrevious(), previous)
+        XCTAssertEqual(Set(operations.accounts), [account, account + ".previous"])
+
+        try store.deletePrevious()
+
+        XCTAssertNil(try store.loadPrevious())
+        XCTAssertEqual(try store.load(), active)
+    }
+
+    func testPreviousCredentialValidationMatchesActiveCredentialValidation() throws {
+        let operations = MultiAccountSecurityOperations()
+        let store = KeychainCredentialStore(
+            service: service,
+            account: account,
+            previousAccount: account + ".previous",
+            operations: operations
+        )
+
+        XCTAssertThrowsError(
+            try store.savePrevious(makeCredentials(endpoint: "https://evil.example"))
+        ) { error in
+            XCTAssertEqual(error as? CredentialStoreError, .malformedData)
+            self.assertRedacted(error)
+        }
+        XCTAssertTrue(operations.accounts.isEmpty)
+    }
+
     func testSaveAddsOneGenericPasswordItemWithExactIdentityAccessibilityAndJSON() throws {
         let operations = FakeSecurityOperations()
         let store = makeStore(operations: operations)
@@ -363,6 +410,58 @@ private final class StatefulSecurityOperations: SecurityOperations, @unchecked S
     func delete(_ query: CFDictionary) -> OSStatus {
         storedData = nil
         return errSecSuccess
+    }
+}
+
+private final class MultiAccountSecurityOperations: SecurityOperations, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String: Data] = [:]
+    private(set) var accounts: [String] = []
+
+    func add(_ attributes: CFDictionary) -> OSStatus {
+        lock.withLock {
+            let values = attributes as NSDictionary
+            guard let account = values[kSecAttrAccount] as? String,
+                  let data = values[kSecValueData] as? Data else { return errSecParam }
+            accounts.append(account)
+            guard storage[account] == nil else { return errSecDuplicateItem }
+            storage[account] = data
+            return errSecSuccess
+        }
+    }
+
+    func update(_ query: CFDictionary, attributes: CFDictionary) -> OSStatus {
+        lock.withLock {
+            let identity = query as NSDictionary
+            let values = attributes as NSDictionary
+            guard let account = identity[kSecAttrAccount] as? String,
+                  let data = values[kSecValueData] as? Data else { return errSecParam }
+            accounts.append(account)
+            guard storage[account] != nil else { return errSecItemNotFound }
+            storage[account] = data
+            return errSecSuccess
+        }
+    }
+
+    func copyMatching(_ query: CFDictionary, result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus {
+        lock.withLock {
+            let identity = query as NSDictionary
+            guard let account = identity[kSecAttrAccount] as? String else { return errSecParam }
+            accounts.append(account)
+            guard let data = storage[account] else { return errSecItemNotFound }
+            result.pointee = data as CFData
+            return errSecSuccess
+        }
+    }
+
+    func delete(_ query: CFDictionary) -> OSStatus {
+        lock.withLock {
+            let identity = query as NSDictionary
+            guard let account = identity[kSecAttrAccount] as? String else { return errSecParam }
+            accounts.append(account)
+            guard storage.removeValue(forKey: account) != nil else { return errSecItemNotFound }
+            return errSecSuccess
+        }
     }
 }
 

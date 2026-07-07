@@ -166,6 +166,8 @@ final class AppEnvironment {
             try Task.checkCancellation()
             try await monitor.recoverIfNeeded()
             try Task.checkCancellation()
+            await viewModel.synchronizeOwnership()
+            try Task.checkCancellation()
             let storedCredentials: TuyaCredentials?
             do {
                 storedCredentials = try credentials.load()
@@ -177,8 +179,6 @@ final class AppEnvironment {
                     return .credentialResetFailed
                 }
             }
-            await viewModel.synchronizeOwnership()
-            try Task.checkCancellation()
             if let storedCredentials, await viewModel.phase == .onboarding {
                 await viewModel.connect(using: ConnectionDraft(
                     endpoint: storedCredentials.endpoint.absoluteString,
@@ -330,7 +330,10 @@ struct ProductionAppComposition {
         let integrations = IntegrationInstaller(relayPath: relayPath)
         let loginItem = LoginItemController()
         let verifier = ProductionTuyaConnectionVerifier()
-        let ownershipLedger = AppOwnershipLedger()
+        let ownershipURL = AppIdentity.applicationSupportDirectory
+            .appending(path: "setup-ownership-v1.json")
+        let ownershipStore = FileSetupOwnershipStore(url: ownershipURL)
+        let ownershipLedger = AppOwnershipLedger(store: ownershipStore)
         let viewModel = AppViewModel(
             credentials: credentials,
             integrations: integrations,

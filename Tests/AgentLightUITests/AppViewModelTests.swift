@@ -259,7 +259,10 @@ final class AppViewModelTests: XCTestCase {
         }
         let scenarios = [
             Scenario(point: .install, expectedTail: [.install]),
-            Scenario(point: .saveCredentials, expectedTail: [.install, .loadCredentials, .saveCredentials, .uninstall]),
+            Scenario(
+                point: .saveCredentials,
+                expectedTail: [.install, .loadCredentials, .saveCredentials, .deleteCredentials, .uninstall]
+            ),
             Scenario(
                 point: .enableLogin,
                 expectedTail: [.install, .loadCredentials, .saveCredentials, .enableLogin, .deleteCredentials, .uninstall]
@@ -561,6 +564,88 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.credentials.deleteCount, 0)
         XCTAssertEqual(harness.viewModel.phase, .onboarding)
         XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+    }
+
+    func testDurableOwnershipHydratesIntoNewLedgerAndUsesVerifiedReceiptForCleanup() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        let relaunched = makeRelaunchedViewModel(using: harness, store: store)
+
+        await relaunched.synchronizeOwnership()
+        await relaunched.disconnect()
+
+        let verification = await harness.integrations.uninstallVerification()
+        XCTAssertEqual(verification.blind, 0)
+        XCTAssertTrue(try XCTUnwrap(verification.receipt).hasVerifiableFingerprints)
+        XCTAssertNil(harness.credentials.storedCredentials())
+        XCTAssertEqual(harness.loginItem.currentStatus, .notRegistered)
+        XCTAssertEqual(relaunched.outstandingObligations, [])
+    }
+
+    func testReplacedCredentialRestoresFromSeparateBackupAfterRelaunch() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        harness.credentials.seed(harness.previousCredentials)
+        await harness.connectAndApprove()
+        XCTAssertEqual(harness.credentials.storedPreviousCredentials(), harness.previousCredentials)
+        let relaunched = makeRelaunchedViewModel(using: harness, store: store)
+
+        await relaunched.synchronizeOwnership()
+        await relaunched.disconnect()
+
+        XCTAssertEqual(harness.credentials.storedCredentials(), harness.previousCredentials)
+        XCTAssertNil(harness.credentials.storedPreviousCredentials())
+        XCTAssertEqual(relaunched.outstandingObligations, [])
+    }
+
+    func testMissingPreviousCredentialBackupFailsClosedWithTypedObligation() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        harness.credentials.seed(harness.previousCredentials)
+        await harness.connectAndApprove()
+        try harness.credentials.deletePrevious()
+        let active = try XCTUnwrap(harness.credentials.storedCredentials())
+        let relaunched = makeRelaunchedViewModel(using: harness, store: store)
+
+        await relaunched.synchronizeOwnership()
+        await relaunched.disconnect()
+
+        XCTAssertEqual(harness.credentials.storedCredentials(), active)
+        XCTAssertTrue(relaunched.outstandingObligations.contains(.credentialRestore))
+        XCTAssertEqual(relaunched.phase, .repairRequired)
+    }
+
+    func testExternallyChangedHookContentsCannotBeBlindlyUninstalledAfterRelaunch() async {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        await harness.integrations.setCurrentHooksMatchReceipt(false)
+        let relaunched = makeRelaunchedViewModel(using: harness, store: store)
+
+        await relaunched.synchronizeOwnership()
+        await relaunched.disconnect()
+
+        let verification = await harness.integrations.uninstallVerification()
+        XCTAssertEqual(verification.blind, 0)
+        XCTAssertNil(verification.receipt)
+        XCTAssertTrue(relaunched.outstandingObligations.contains(.integrationRollbackRepair))
+        XCTAssertEqual(relaunched.phase, .repairRequired)
+    }
+
+    func testPreexistingHookReceiptRemainsNonOwnedAfterRelaunch() async {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.integrations.setPreviewOwnership([true, true, true])
+        await harness.connectAndApprove()
+        let relaunched = makeRelaunchedViewModel(using: harness, store: store)
+
+        await relaunched.synchronizeOwnership()
+        await relaunched.disconnect()
+
+        let counts = await harness.integrations.counts()
+        XCTAssertEqual(counts.uninstall, 0)
+        XCTAssertEqual(relaunched.outstandingObligations, [])
     }
 
     func testCredentialRestoreFailureCreatesTypedObligationAndRetryClearsIt() async {
@@ -2278,6 +2363,20 @@ final class AppViewModelTests: XCTestCase {
             loginItem: harness.loginItem,
             verifier: harness.verifier,
             ownershipLedger: harness.ownershipLedger
+        )
+    }
+
+    private func makeRelaunchedViewModel(
+        using harness: ViewModelHarness,
+        store: any SetupOwnershipStoring
+    ) -> AppViewModel {
+        AppViewModel(
+            credentials: harness.credentials,
+            integrations: harness.integrations,
+            monitor: harness.monitor,
+            loginItem: harness.loginItem,
+            verifier: harness.verifier,
+            ownershipLedger: AppOwnershipLedger(store: store)
         )
     }
 

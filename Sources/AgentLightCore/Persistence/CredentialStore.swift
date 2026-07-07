@@ -9,6 +9,12 @@ public protocol CredentialStoring: Sendable {
     func delete() throws
 }
 
+public protocol PreviousCredentialStoring: Sendable {
+    func loadPrevious() throws -> TuyaCredentials?
+    func savePrevious(_ credentials: TuyaCredentials) throws
+    func deletePrevious() throws
+}
+
 public enum CredentialStoreOperation: String, Equatable, Sendable {
     case add
     case update
@@ -73,25 +79,68 @@ enum TuyaCredentialValidator {
     }
 }
 
-public final class KeychainCredentialStore: CredentialStoring {
+public final class KeychainCredentialStore: CredentialStoring, PreviousCredentialStoring {
     private let service: String
     private let account: String
+    private let previousAccount: String
     private let operations: any SecurityOperations
 
     public convenience init(
         service: String = AppIdentity.keychainService,
         account: String = AppIdentity.bundleIdentifier
     ) {
-        self.init(service: service, account: account, operations: DarwinSecurityOperations())
+        self.init(
+            service: service,
+            account: account,
+            previousAccount: account + ".previous-v1",
+            operations: DarwinSecurityOperations()
+        )
     }
 
     init(service: String, account: String, operations: any SecurityOperations) {
         self.service = service
         self.account = account
+        previousAccount = account + ".previous-v1"
+        self.operations = operations
+    }
+
+    init(
+        service: String,
+        account: String,
+        previousAccount: String,
+        operations: any SecurityOperations
+    ) {
+        self.service = service
+        self.account = account
+        self.previousAccount = previousAccount
         self.operations = operations
     }
 
     public func save(_ credentials: TuyaCredentials) throws {
+        try save(credentials, account: account)
+    }
+
+    public func load() throws -> TuyaCredentials? {
+        try load(account: account)
+    }
+
+    public func delete() throws {
+        try delete(account: account)
+    }
+
+    public func savePrevious(_ credentials: TuyaCredentials) throws {
+        try save(credentials, account: previousAccount)
+    }
+
+    public func loadPrevious() throws -> TuyaCredentials? {
+        try load(account: previousAccount)
+    }
+
+    public func deletePrevious() throws {
+        try delete(account: previousAccount)
+    }
+
+    private func save(_ credentials: TuyaCredentials, account: String) throws {
         guard TuyaCredentialValidator.isValid(credentials) else {
             throw CredentialStoreError.malformedData
         }
@@ -103,7 +152,7 @@ public final class KeychainCredentialStore: CredentialStoring {
             throw CredentialStoreError.malformedData
         }
 
-        var attributes = identityQuery()
+        var attributes = identityQuery(account: account)
         attributes[kSecValueData as String] = data
         attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
 
@@ -118,7 +167,7 @@ public final class KeychainCredentialStore: CredentialStoring {
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
         let updateStatus = operations.update(
-            identityQuery() as CFDictionary,
+            identityQuery(account: account) as CFDictionary,
             attributes: updateAttributes as CFDictionary
         )
         guard updateStatus == errSecSuccess else {
@@ -126,8 +175,8 @@ public final class KeychainCredentialStore: CredentialStoring {
         }
     }
 
-    public func load() throws -> TuyaCredentials? {
-        var query = identityQuery()
+    private func load(account: String) throws -> TuyaCredentials? {
+        var query = identityQuery(account: account)
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         query[kSecReturnData as String] = true
 
@@ -153,14 +202,14 @@ public final class KeychainCredentialStore: CredentialStoring {
         return credentials
     }
 
-    public func delete() throws {
-        let status = operations.delete(identityQuery() as CFDictionary)
+    private func delete(account: String) throws {
+        let status = operations.delete(identityQuery(account: account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw CredentialStoreError.security(operation: .delete, status: status)
         }
     }
 
-    private func identityQuery() -> [String: Any] {
+    private func identityQuery(account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

@@ -30,16 +30,20 @@ final class HarnessCallRecorder: @unchecked Sendable {
     func removeAll() { lock.withLock { storage.removeAll() } }
 }
 
-final class FakeCredentialStore: CredentialStoring, @unchecked Sendable {
+final class FakeCredentialStore: CredentialStoring, PreviousCredentialStoring, @unchecked Sendable {
     private let lock = NSLock()
     private let calls: HarnessCallRecorder
     private var stored: TuyaCredentials?
+    private var previous: TuyaCredentials?
     private var saveError: (any Error & Sendable)?
     private var loadError: (any Error & Sendable)?
     private var deleteError: (any Error & Sendable)?
     private var saveErrors: [Int: any Error & Sendable] = [:]
     private var saves = 0
     private var deletes = 0
+    private var previousSaveError: (any Error & Sendable)?
+    private var previousLoadError: (any Error & Sendable)?
+    private var previousDeleteError: (any Error & Sendable)?
 
     init(calls: HarnessCallRecorder) { self.calls = calls }
     var saveCount: Int { lock.withLock { saves } }
@@ -72,14 +76,40 @@ final class FakeCredentialStore: CredentialStoring, @unchecked Sendable {
         }
     }
 
+    func savePrevious(_ credentials: TuyaCredentials) throws {
+        try lock.withLock {
+            if let previousSaveError { throw previousSaveError }
+            previous = credentials
+        }
+    }
+
+    func loadPrevious() throws -> TuyaCredentials? {
+        try lock.withLock {
+            if let previousLoadError { throw previousLoadError }
+            return previous
+        }
+    }
+
+    func deletePrevious() throws {
+        try lock.withLock {
+            if let previousDeleteError { throw previousDeleteError }
+            previous = nil
+        }
+    }
+
     func setSaveError(_ error: (any Error & Sendable)?) { lock.withLock { saveError = error } }
     func setSaveError(_ error: (any Error & Sendable)?, forCall call: Int) {
         lock.withLock { saveErrors[call] = error }
     }
     func setLoadError(_ error: (any Error & Sendable)?) { lock.withLock { loadError = error } }
     func setDeleteError(_ error: (any Error & Sendable)?) { lock.withLock { deleteError = error } }
+    func setPreviousSaveError(_ error: (any Error & Sendable)?) { lock.withLock { previousSaveError = error } }
+    func setPreviousLoadError(_ error: (any Error & Sendable)?) { lock.withLock { previousLoadError = error } }
+    func setPreviousDeleteError(_ error: (any Error & Sendable)?) { lock.withLock { previousDeleteError = error } }
     func seed(_ credentials: TuyaCredentials) { lock.withLock { stored = credentials } }
+    func seedPrevious(_ credentials: TuyaCredentials?) { lock.withLock { previous = credentials } }
     func storedCredentials() -> TuyaCredentials? { lock.withLock { stored } }
+    func storedPreviousCredentials() -> TuyaCredentials? { lock.withLock { previous } }
 }
 
 actor FakeVerifier: TuyaConnectionVerifying {
@@ -158,6 +188,7 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     private var uninstallError: (any Error & Sendable)?
     private var artifactVerificationError: (any Error & Sendable)?
     private var artifactCleanupVerified = false
+    private var currentHooksMatchReceipt = true
     private var installBlocked = false
     private var blockedPreviewCalls: Set<Int> = []
     private var repairBlocked = false
@@ -176,6 +207,8 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     private(set) var installCount = 0
     private(set) var repairCount = 0
     private(set) var uninstallCount = 0
+    private(set) var blindUninstallCount = 0
+    private(set) var lastVerifiedReceipt: IntegrationInstallReceipt?
     private(set) var artifactVerificationCount = 0
 
     init(calls: HarnessCallRecorder) { self.calls = calls }
@@ -222,7 +255,12 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
         if let installError { throw installError }
         return IntegrationInstallReceipt(
             sources: zip(AgentSource.allCases, installOwnership).map { source, ownership in
-                IntegrationSourceReceipt(source: source, ownership: ownership)
+                IntegrationSourceReceipt(
+                    source: source,
+                    ownership: ownership,
+                    marker: AppIdentity.integrationIdentifier,
+                    installedContentFingerprint: String(repeating: "a", count: 64)
+                )
             }
         )
     }
@@ -238,6 +276,19 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     }
 
     func uninstall() async throws {
+        blindUninstallCount += 1
+        try await performUninstall()
+    }
+
+    func uninstall(using receipt: IntegrationInstallReceipt) async throws {
+        guard receipt.hasVerifiableFingerprints, currentHooksMatchReceipt else {
+            throw IntegrationError.destinationChanged("sanitized integration receipt mismatch")
+        }
+        lastVerifiedReceipt = receipt
+        try await performUninstall()
+    }
+
+    private func performUninstall() async throws {
         calls.append(.uninstall)
         uninstallCount += 1
         let ready = uninstallWaiters.filter { uninstallCount >= $0.0 }
@@ -258,6 +309,7 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     func setPreviewError(_ error: (any Error & Sendable)?) { previewError = error }
     func setRepairError(_ error: (any Error & Sendable)?) { repairError = error }
     func setUninstallError(_ error: (any Error & Sendable)?) { uninstallError = error }
+    func setCurrentHooksMatchReceipt(_ matches: Bool) { currentHooksMatchReceipt = matches }
     func setArtifactVerification(clean: Bool, error: (any Error & Sendable)? = nil) {
         artifactCleanupVerified = clean
         artifactVerificationError = error
@@ -302,6 +354,10 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     }
     func counts() -> (preview: Int, install: Int, repair: Int, uninstall: Int) {
         (previewCount, installCount, repairCount, uninstallCount)
+    }
+
+    func uninstallVerification() -> (blind: Int, receipt: IntegrationInstallReceipt?) {
+        (blindUninstallCount, lastVerifiedReceipt)
     }
 }
 
@@ -575,20 +631,28 @@ final class ViewModelHarness {
     var freshInstallReceipt: IntegrationInstallReceipt {
         IntegrationInstallReceipt(
             sources: AgentSource.allCases.map {
-                IntegrationSourceReceipt(source: $0, ownership: .fresh)
+                IntegrationSourceReceipt(
+                    source: $0,
+                    ownership: .fresh,
+                    marker: AppIdentity.integrationIdentifier,
+                    installedContentFingerprint: String(repeating: "b", count: 64)
+                )
             }
         )
     }
     let viewModel: AppViewModel
 
-    init(initialSnapshot: MonitoringSnapshot = MonitoringSnapshot(state: .idle, sessions: [], connection: .connected)) {
+    init(
+        initialSnapshot: MonitoringSnapshot = MonitoringSnapshot(state: .idle, sessions: [], connection: .connected),
+        ownershipStore: any SetupOwnershipStoring = MemorySetupOwnershipStore()
+    ) {
         let calls = HarnessCallRecorder()
         let credentials = FakeCredentialStore(calls: calls)
         let integrations = FakeIntegrationInstaller(calls: calls)
         let monitor = FakeMonitor(calls: calls, initialSnapshot: initialSnapshot)
         let loginItem = FakeLoginItem(calls: calls)
         let verifier = FakeVerifier(calls: calls)
-        let ownershipLedger = AppOwnershipLedger()
+        let ownershipLedger = AppOwnershipLedger(store: ownershipStore)
         self.calls = calls
         self.credentials = credentials
         self.integrations = integrations

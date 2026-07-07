@@ -32,6 +32,61 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertEqual(receipt.overallOwnership, .mixed)
     }
 
+    func testInstallReceiptCarriesCodableExactFingerprintsAndChangedHookFailsClosed() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+
+        let receipt = try await installer.installWithReceipt()
+        XCTAssertTrue(receipt.hasVerifiableFingerprints)
+        XCTAssertEqual(try JSONDecoder().decode(
+            IntegrationInstallReceipt.self,
+            from: JSONEncoder().encode(receipt)
+        ), receipt)
+
+        var changed = String(decoding: try Data(contentsOf: paths.codex), as: UTF8.self)
+        changed = changed.replacingOccurrences(
+            of: "--event Stop",
+            with: "--event Stop --externally-changed"
+        )
+        try Data(changed.utf8).write(to: paths.codex)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.codex.path)
+        let beforeAttempt = try Data(contentsOf: paths.codex)
+
+        do {
+            try await installer.uninstall(using: receipt)
+            XCTFail("Expected ownership verification failure")
+        } catch IntegrationError.ownershipVerificationFailed {
+            // Expected fail-closed result.
+        }
+
+        XCTAssertEqual(try Data(contentsOf: paths.codex), beforeAttempt)
+        XCTAssertTrue(String(decoding: beforeAttempt, as: UTF8.self).contains("--externally-changed"))
+    }
+
+    func testVerifiedUninstallAllowsUnrelatedConfigChangesAndRemovesExactOwnedHooks() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+        let receipt = try await installer.installWithReceipt()
+        var codex = String(decoding: try Data(contentsOf: paths.codex), as: UTF8.self)
+        codex.removeLast()
+        codex += ",\"unrelated\":\"preserved\"}"
+        try Data(codex.utf8).write(to: paths.codex)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.codex.path)
+
+        try await installer.uninstall(using: receipt)
+
+        let final = String(decoding: try Data(contentsOf: paths.codex), as: UTF8.self)
+        XCTAssertFalse(final.contains(AppIdentity.integrationIdentifier))
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(final.utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(object["unrelated"] as? String, "preserved")
+    }
+
     func testLegacyCommittedCleanupErrorRemainsConstructible() {
         let error = IntegrationError.committedWithCleanupFailure(["CANARY_ARTIFACT"])
 
