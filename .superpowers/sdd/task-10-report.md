@@ -145,6 +145,36 @@ Starting commit: `117f46adc6488c7c5e67c6221a457b0f5f7dc8ed`
 - Concurrency/stale-stream subset: 20 consecutive runs passed under a 60-second process alarm.
 - `swift test`: 305 passed, 0 failures.
 - `swift build -c release`: exit 0.
+
+---
+
+## Final Findings Follow-up
+
+Date: 2026-07-07
+Starting commit: `384aad7fba0d740f1f1e0e2e20c854be8e3b0981`
+
+- All committed cleanup error forms now normalize to the persistent artifact obligation in uninstall/compensation/disconnect paths. Mixed adoption treats a malformed authoritative receipt as invalid and retains mixed repair state.
+- `AppOwnershipLedger` is now an explicit process-environment dependency injected into every view model. Replacement view models call `synchronizeOwnership()` to hydrate repair state and can retry credential, login, integration, and artifact cleanup without persisting secrets outside process memory.
+- If approval cancellation has no original presentation error but cleanup leaves obligations, the view model presents `integrationConflict` or `operationFailed` instead of repair-required state with no recovery error.
+- DEBUG action-entry barriers now prove the second connect enters while preview is blocked and resume enters while pause is blocked. Shared waiter tests establish initiating caller, waiter count one, then noninitiating caller and waiter count two before cancellation/release.
+- Process limitation: the ledger intentionally does not survive process termination. Prior credentials remain only in process-owned Sendable memory. Task 12/manual acceptance must verify behavior for app termination during cleanup and document any remaining manual recovery steps; no secret is written to UserDefaults or a plaintext file.
+
+### RED/GREEN evidence
+
+- RED: legacy and receipt-bearing committed uninstall errors became uninstall retry; GREEN: both retain artifact cleanup.
+- RED: malformed mixed-adoption receipt cleared repair state; GREEN: mixed obligation remains.
+- RED: replacement view model had no synchronization API; GREEN: shared-ledger hydration and retries pass.
+- RED: canceled approval cleanup failure entered repair-required with nil error; GREEN: sanitized integration conflict is presented.
+- RED: connect/resume ordering tests had no method-entry proof; GREEN: action-entry barriers are awaited before dependency release.
+
+### Verification
+
+- `swift test --filter AppViewModelTests`: 76 passed, 0 failures.
+- `swift test --filter IntegrationInstallerTests`: 32 passed, 0 failures.
+- `swift test --filter LoginItemControllerTests`: 8 passed, 0 failures.
+- Shared-ledger and ordering subset: 20 consecutive runs; 8 tests per run, 0 failures.
+- `swift test`: 345 passed, 0 failures.
+- `swift build -c release`: exit 0.
 - `git diff --cached --check`: exit 0 with no output.
 - Security/orphan scan: no polling/yields, removed boolean repair/login APIs, force casts/tries, debug output, dynamic evaluation, TODO/FIXME markers, production credential literals, or orphaned old API references.
 - Test credential scan: explicit `CANARY_*` values and intentional blank validation fields only.

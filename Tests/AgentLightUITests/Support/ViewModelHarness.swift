@@ -544,6 +544,7 @@ final class ViewModelHarness {
     let monitor: FakeMonitor
     let loginItem: FakeLoginItem
     let verifier: FakeVerifier
+    let ownershipLedger: AppOwnershipLedger
     let validDraft = ConnectionDraft(
         endpoint: "https://openapi.tuyaus.com",
         accessID: "CANARY_ACCESS_ID",
@@ -572,18 +573,21 @@ final class ViewModelHarness {
         let monitor = FakeMonitor(calls: calls, initialSnapshot: initialSnapshot)
         let loginItem = FakeLoginItem(calls: calls)
         let verifier = FakeVerifier(calls: calls)
+        let ownershipLedger = AppOwnershipLedger()
         self.calls = calls
         self.credentials = credentials
         self.integrations = integrations
         self.monitor = monitor
         self.loginItem = loginItem
         self.verifier = verifier
+        self.ownershipLedger = ownershipLedger
         viewModel = AppViewModel(
             credentials: credentials,
             integrations: integrations,
             monitor: monitor,
             loginItem: loginItem,
-            verifier: verifier
+            verifier: verifier,
+            ownershipLedger: ownershipLedger
         )
     }
 

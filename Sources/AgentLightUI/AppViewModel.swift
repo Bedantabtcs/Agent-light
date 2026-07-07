@@ -85,7 +85,7 @@ public final class AppViewModel: AppViewModeling {
     @ObservationIgnored private let monitor: any MonitoringOrchestrating
     @ObservationIgnored private let loginItem: any LoginItemControlling
     @ObservationIgnored private let verifier: any TuyaConnectionVerifying
-    @ObservationIgnored private let ownershipLedger = OwnershipLedger()
+    @ObservationIgnored private let ownershipLedger: AppOwnershipLedger
 
     @ObservationIgnored private var pendingCredentials: TuyaCredentials?
     @ObservationIgnored private var connectGeneration: UInt64 = 0
@@ -104,19 +104,25 @@ public final class AppViewModel: AppViewModeling {
     @ObservationIgnored private var loginRegistrationOwned = false
     @ObservationIgnored private var ownsMonitoring = false
     @ObservationIgnored private var disconnectedCleanupComplete = false
+#if DEBUG
+    @ObservationIgnored private var actionEntryCounts: [OperationKind: Int] = [:]
+    @ObservationIgnored private var actionEntryBarriers: [(OperationKind, Int, CheckedContinuation<Void, Never>)] = []
+#endif
 
     public init(
         credentials: any CredentialStoring,
         integrations: any IntegrationInstalling,
         monitor: any MonitoringOrchestrating,
         loginItem: any LoginItemControlling,
-        verifier: any TuyaConnectionVerifying
+        verifier: any TuyaConnectionVerifying,
+        ownershipLedger: AppOwnershipLedger
     ) {
         self.credentials = credentials
         self.integrations = integrations
         self.monitor = monitor
         self.loginItem = loginItem
         self.verifier = verifier
+        self.ownershipLedger = ownershipLedger
     }
 
     deinit {
@@ -130,6 +136,9 @@ public final class AppViewModel: AppViewModeling {
     }
 
     public func connect(using draft: ConnectionDraft) async {
+#if DEBUG
+        recordActionEntry(.connect)
+#endif
         guard (phase == .onboarding || phase == .integrationReview),
               outstandingObligations.isEmpty,
               approvalTask == nil else { return }
@@ -165,6 +174,9 @@ public final class AppViewModel: AppViewModeling {
     }
 
     public func approveIntegrations() async {
+#if DEBUG
+        recordActionEntry(.approval)
+#endif
         if let approvalTask {
             await approvalTask.wait()
             return
@@ -205,6 +217,9 @@ public final class AppViewModel: AppViewModeling {
     }
 
     public func pause() async {
+#if DEBUG
+        recordActionEntry(.pause)
+#endif
         if let disconnectTask {
             await disconnectTask.wait()
             return
@@ -257,6 +272,9 @@ public final class AppViewModel: AppViewModeling {
     }
 
     public func resume() async {
+#if DEBUG
+        recordActionEntry(.resume)
+#endif
         if let disconnectTask {
             await disconnectTask.wait()
             return
@@ -308,6 +326,9 @@ public final class AppViewModel: AppViewModeling {
     }
 
     public func repairIntegrations() async {
+#if DEBUG
+        recordActionEntry(.repair)
+#endif
         if let disconnectTask {
             await disconnectTask.wait()
             return
@@ -340,6 +361,9 @@ public final class AppViewModel: AppViewModeling {
     }
 
     public func disconnect() async {
+#if DEBUG
+        recordActionEntry(.disconnect)
+#endif
         if let disconnectTask {
             await disconnectTask.wait()
             return
@@ -393,7 +417,32 @@ public final class AppViewModel: AppViewModeling {
         await beginObservation()
     }
 
+    public func synchronizeOwnership() async {
+        let snapshot = await ownershipLedger.snapshot()
+        syncOwnership(snapshot)
+        ownsMonitoring = snapshot.monitoringOwned
+        guard !snapshot.obligations.isEmpty else { return }
+        phase = .repairRequired
+        presentedError = hasIntegrationObligation ? .integrationConflict : .operationFailed
+    }
+
 #if DEBUG
+    func waitForActionEntry(_ kind: OperationKind, count: Int) async {
+        if actionEntryCounts[kind, default: 0] >= count { return }
+        await withCheckedContinuation { actionEntryBarriers.append((kind, count, $0)) }
+    }
+
+    private func recordActionEntry(_ kind: OperationKind) {
+        actionEntryCounts[kind, default: 0] += 1
+        let ready = actionEntryBarriers.filter {
+            $0.0 == kind && actionEntryCounts[kind, default: 0] >= $0.1
+        }
+        actionEntryBarriers.removeAll {
+            $0.0 == kind && actionEntryCounts[kind, default: 0] >= $0.1
+        }
+        for barrier in ready { barrier.2.resume() }
+    }
+
     func waitForOperationWaiterCount(_ kind: OperationKind, count: Int) async {
         let operation: SharedOperation?
         switch kind {
@@ -457,7 +506,7 @@ public final class AppViewModel: AppViewModeling {
         credentials: any CredentialStoring,
         loginItem: any LoginItemControlling,
         monitor: any MonitoringOrchestrating,
-        ledger: OwnershipLedger
+        ledger: AppOwnershipLedger
     ) async -> ApprovalResult {
         do {
             do {
@@ -544,7 +593,7 @@ public final class AppViewModel: AppViewModeling {
         credentials: any CredentialStoring,
         loginItem: any LoginItemControlling,
         monitor: any MonitoringOrchestrating,
-        ledger: OwnershipLedger
+        ledger: AppOwnershipLedger
     ) async -> ApprovalResult {
         let cleanup = Task {
             await cleanupOwnedState(
@@ -563,7 +612,7 @@ public final class AppViewModel: AppViewModeling {
         credentials: any CredentialStoring,
         loginItem: any LoginItemControlling,
         monitor: any MonitoringOrchestrating,
-        ledger: OwnershipLedger
+        ledger: AppOwnershipLedger
     ) async -> OwnershipSnapshot {
         var snapshot = await ledger.snapshot()
         if snapshot.monitoringOwned {
@@ -610,7 +659,7 @@ public final class AppViewModel: AppViewModeling {
                 try await integrations.uninstall()
                 await ledger.setIntegration(.none)
                 await ledger.remove(.integrationUninstallRetry)
-            } catch IntegrationError.artifactCleanupFailure {
+            } catch let error as IntegrationError where Self.isCommittedCleanup(error) {
                 await ledger.setIntegration(.none)
                 await ledger.remove(.integrationUninstallRetry)
                 await ledger.insert(.integrationArtifactCleanup)
@@ -639,7 +688,11 @@ public final class AppViewModel: AppViewModeling {
             ownsMonitoring = snapshot.monitoringOwned
             cancelObservation(resetState: true)
             phase = snapshot.obligations.isEmpty ? .integrationReview : .repairRequired
-            if let error { presentedError = error }
+            if let error {
+                presentedError = error
+            } else if !snapshot.obligations.isEmpty {
+                presentedError = hasIntegrationObligation ? .integrationConflict : .operationFailed
+            }
         }
     }
 
@@ -689,7 +742,8 @@ public final class AppViewModel: AppViewModeling {
             case .rollback, .health:
                 try await integrations.repair()
             case .adoptMixed:
-                _ = try await integrations.installWithReceipt()
+                let receipt = try await integrations.installWithReceipt()
+                guard receipt.isValid else { return .invalidAdoptionReceipt }
             case .artifactOnly:
                 return try await integrations.verifyArtifactCleanup()
                     ? .artifactVerifiedClean
@@ -701,7 +755,7 @@ public final class AppViewModel: AppViewModeling {
         } catch IntegrationError.committedWithReceiptCleanupFailure {
             return .artifactCleanupRequired
         } catch IntegrationError.committedWithCleanupFailure {
-            return .legacyArtifactCleanupRequired
+            return plan == .adoptMixed ? .legacyArtifactCleanupRequired : .artifactCleanupRequired
         } catch is CancellationError {
             return .cancelled
         } catch {
@@ -712,7 +766,7 @@ public final class AppViewModel: AppViewModeling {
     private static func recordRepair(
         _ result: RepairResult,
         plan: RepairPlan,
-        ledger: OwnershipLedger
+        ledger: AppOwnershipLedger
     ) async -> OwnershipSnapshot {
         switch result {
         case .success:
@@ -741,7 +795,7 @@ public final class AppViewModel: AppViewModeling {
             await ledger.insert(.integrationArtifactCleanup)
         case .artifactVerifiedClean:
             await ledger.remove(.integrationArtifactCleanup)
-        case .artifactRetained, .cancelled:
+        case .artifactRetained, .invalidAdoptionReceipt, .cancelled:
             break
         case .failure:
             if plan == .health { await ledger.insert(.integrationRollbackRepair) }
@@ -795,6 +849,9 @@ public final class AppViewModel: AppViewModeling {
             }
         case .artifactRetained:
             phase = .repairRequired
+        case .invalidAdoptionReceipt:
+            phase = .repairRequired
+            presentedError = .integrationConflict
         case let .failure(error):
             if plan == .health {
                 outstandingObligations.insert(.integrationRollbackRepair)
@@ -920,6 +977,16 @@ public final class AppViewModel: AppViewModeling {
         }
     }
 
+    private static func isCommittedCleanup(_ error: IntegrationError) -> Bool {
+        switch error {
+        case .artifactCleanupFailure, .committedWithCleanupFailure,
+             .committedWithReceiptCleanupFailure:
+            true
+        default:
+            false
+        }
+    }
+
     private static func presentationError(for error: any Error) -> PresentationError {
         if let validation = error as? ValidationError {
             switch validation {
@@ -965,13 +1032,13 @@ private enum InternalError: Error {
     case loginApprovalRequired
 }
 
-private enum CredentialOwnership: Equatable, Sendable {
+fileprivate enum CredentialOwnership: Equatable, Sendable {
     case none
     case created
     case replaced(TuyaCredentials)
 }
 
-private enum IntegrationOwnership: Equatable, Sendable {
+fileprivate enum IntegrationOwnership: Equatable, Sendable {
     case none
     case uninstallable
     case preexisting
@@ -979,7 +1046,7 @@ private enum IntegrationOwnership: Equatable, Sendable {
     case uncertain
 }
 
-private struct OwnershipSnapshot: Sendable {
+fileprivate struct OwnershipSnapshot: Sendable {
     var integration: IntegrationOwnership = .none
     var credentials: CredentialOwnership = .none
     var loginRegistrationOwned = false
@@ -987,12 +1054,14 @@ private struct OwnershipSnapshot: Sendable {
     var obligations: Set<OutstandingObligation> = []
 }
 
-private actor OwnershipLedger {
+public actor AppOwnershipLedger {
     private var value = OwnershipSnapshot()
 
-    func snapshot() -> OwnershipSnapshot { value }
-    func setIntegration(_ ownership: IntegrationOwnership) { value.integration = ownership }
-    func setCredentials(_ ownership: CredentialOwnership) { value.credentials = ownership }
+    public init() {}
+
+    fileprivate func snapshot() -> OwnershipSnapshot { value }
+    fileprivate func setIntegration(_ ownership: IntegrationOwnership) { value.integration = ownership }
+    fileprivate func setCredentials(_ ownership: CredentialOwnership) { value.credentials = ownership }
     func setLoginOwned(_ owned: Bool) { value.loginRegistrationOwned = owned }
     func setMonitoringOwned(_ owned: Bool) { value.monitoringOwned = owned }
     func insert(_ obligation: OutstandingObligation) { value.obligations.insert(obligation) }
@@ -1006,7 +1075,7 @@ private enum ConnectResult {
 }
 
 #if DEBUG
-enum OperationKind {
+enum OperationKind: Hashable {
     case connect, approval, pause, resume, repair, disconnect
 }
 #endif
@@ -1035,6 +1104,7 @@ private enum RepairResult {
     case legacyArtifactCleanupRequired
     case artifactVerifiedClean
     case artifactRetained
+    case invalidAdoptionReceipt
     case failure(PresentationError)
     case cancelled
 }

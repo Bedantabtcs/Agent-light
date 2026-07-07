@@ -157,6 +157,27 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
     }
 
+    func testCompensationMapsEveryCommittedCleanupErrorToArtifactObligation() async {
+        let harness = ViewModelHarness()
+        let errors: [IntegrationError] = [
+            .committedWithCleanupFailure(["CANARY_LEGACY"]),
+            .committedWithReceiptCleanupFailure(
+                receipt: harness.freshInstallReceipt,
+                failures: ["CANARY_RECEIPT"]
+            )
+        ]
+        for error in errors {
+            let scenario = ViewModelHarness()
+            await scenario.monitor.setStartError(TuyaClientError.transport)
+            await scenario.integrations.setUninstallError(error)
+            await scenario.viewModel.connect(using: scenario.validDraft)
+
+            await scenario.viewModel.approveIntegrations()
+
+            XCTAssertEqual(scenario.viewModel.outstandingObligations, [.integrationArtifactCleanup])
+        }
+    }
+
     func testDisconnectArtifactCleanupFailureIsNotDowngradedToUninstallRetry() async {
         let harness = ViewModelHarness()
         await harness.connectAndApprove()
@@ -216,6 +237,7 @@ final class AppViewModelTests: XCTestCase {
         var secondDraft = harness.validDraft
         secondDraft.deviceID = "CANARY_SECOND_DEVICE"
         let second = Task { await harness.viewModel.connect(using: secondDraft) }
+        await harness.viewModel.waitForActionEntry(.connect, count: 2)
         await harness.integrations.releasePreview()
         await first.value
         await second.value
@@ -247,8 +269,9 @@ final class AppViewModelTests: XCTestCase {
         await harness.viewModel.connect(using: harness.validDraft)
         await harness.integrations.blockInstall()
         let first = Task { await harness.viewModel.approveIntegrations() }
-        let second = Task { await harness.viewModel.approveIntegrations() }
         await harness.integrations.waitForInstallCount(1)
+        await harness.viewModel.waitForOperationWaiterCount(.approval, count: 1)
+        let second = Task { await harness.viewModel.approveIntegrations() }
         await harness.viewModel.waitForOperationWaiterCount(.approval, count: 2)
         await cancelAndAwait(first, operation: "first shared approval waiter")
         await harness.integrations.releaseInstall()
@@ -267,8 +290,9 @@ final class AppViewModelTests: XCTestCase {
         await harness.viewModel.connect(using: harness.validDraft)
         await harness.integrations.blockInstall()
         let initiating = Task { await harness.viewModel.approveIntegrations() }
-        let noninitiating = Task { await harness.viewModel.approveIntegrations() }
         await harness.integrations.waitForInstallCount(1)
+        await harness.viewModel.waitForOperationWaiterCount(.approval, count: 1)
+        let noninitiating = Task { await harness.viewModel.approveIntegrations() }
         await harness.viewModel.waitForOperationWaiterCount(.approval, count: 2)
 
         await cancelAndAwait(noninitiating, operation: "noninitiating approval waiter")
@@ -621,6 +645,19 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
     }
 
+    func testMixedAdoptionInvalidReceiptRetainsMixedObligation() async {
+        let harness = ViewModelHarness()
+        await harness.integrations.setPreviewOwnership([true, false, false])
+        await harness.connectAndApprove()
+        await harness.viewModel.disconnect()
+        await harness.integrations.setInstallOwnership([.fresh])
+
+        await harness.viewModel.repairIntegrations()
+
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationMixedAdoption])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
     func testCommittedInstallFailureUninstallsCommittedOwnedHooks() async {
         let harness = ViewModelHarness()
         await harness.viewModel.connect(using: harness.validDraft)
@@ -857,6 +894,7 @@ final class AppViewModelTests: XCTestCase {
         await harness.monitor.waitForPauseCount(1)
 
         let resume = Task { await harness.viewModel.resume() }
+        await harness.viewModel.waitForActionEntry(.resume, count: 1)
         await harness.monitor.releasePause()
         await pause.value
         await resume.value
@@ -918,7 +956,8 @@ final class AppViewModelTests: XCTestCase {
                 integrations: harness.integrations,
                 monitor: harness.monitor,
                 loginItem: harness.loginItem,
-                verifier: harness.verifier
+                verifier: harness.verifier,
+                ownershipLedger: harness.ownershipLedger
             )
             weakBox.value = model
             await model.connect(using: harness.validDraft)
@@ -939,7 +978,8 @@ final class AppViewModelTests: XCTestCase {
             integrations: harness.integrations,
             monitor: harness.monitor,
             loginItem: harness.loginItem,
-            verifier: harness.verifier
+            verifier: harness.verifier,
+            ownershipLedger: harness.ownershipLedger
         )
         weak var weakModel = model
         let call = Task { [weak model] in
@@ -1033,6 +1073,24 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.loginItem.disableCount, 1)
     }
 
+    func testCanceledApprovalCleanupFailurePresentsSanitizedRecoveryError() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.monitor.blockSnapshot()
+        await harness.integrations.setUninstallError(HarnessSensitiveError("CANARY_UNINSTALL"))
+        let approval = Task { await harness.viewModel.approveIntegrations() }
+        await harness.monitor.waitForSnapshotCount(1)
+
+        approval.cancel()
+        await approval.value
+        await harness.monitor.releaseSnapshot()
+        await harness.viewModel.approveIntegrations()
+
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.presentedError, .integrationConflict)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationUninstallRetry])
+    }
+
     func testCanceledDisconnectAwaitingApprovalStillCleansLedgerAfterDeinit() async {
         let harness = ViewModelHarness()
         var model: AppViewModel? = makeViewModel(using: harness)
@@ -1051,6 +1109,59 @@ final class AppViewModelTests: XCTestCase {
         await approval.value
 
         XCTAssertNil(weakModel)
+    }
+
+    func testReplacementViewModelRehydratesSharedLedgerAndRetriesCleanup() async {
+        let harness = ViewModelHarness()
+        var first: AppViewModel? = makeViewModel(using: harness)
+        await first?.connect(using: harness.validDraft)
+        await first?.approveIntegrations()
+        harness.credentials.setDeleteError(HarnessSensitiveError("CANARY_DELETE"))
+        harness.loginItem.disableError = HarnessSensitiveError("CANARY_LOGIN")
+        await harness.integrations.setUninstallError(
+            IntegrationError.committedWithCleanupFailure(["CANARY_ARTIFACT"])
+        )
+        await first?.disconnect()
+        first = nil
+
+        let replacement = makeViewModel(using: harness)
+        await replacement.synchronizeOwnership()
+
+        XCTAssertEqual(replacement.phase, .repairRequired)
+        XCTAssertEqual(
+            replacement.outstandingObligations,
+            [.credentialDelete, .loginRegistrationCleanup, .integrationArtifactCleanup]
+        )
+
+        harness.credentials.setDeleteError(nil)
+        harness.loginItem.disableError = nil
+        await harness.integrations.setUninstallError(nil)
+        await harness.integrations.setArtifactVerification(clean: true)
+        await replacement.disconnect()
+        await replacement.repairIntegrations()
+
+        XCTAssertEqual(replacement.outstandingObligations, [])
+        XCTAssertEqual(replacement.phase, .onboarding)
+    }
+
+    func testReplacementViewModelRetriesOrdinaryIntegrationCleanupFromSharedLedger() async {
+        let harness = ViewModelHarness()
+        var first: AppViewModel? = makeViewModel(using: harness)
+        await first?.connect(using: harness.validDraft)
+        await first?.approveIntegrations()
+        await harness.integrations.setUninstallError(HarnessSensitiveError("CANARY_UNINSTALL"))
+        await first?.disconnect()
+        first = nil
+
+        let replacement = makeViewModel(using: harness)
+        await replacement.synchronizeOwnership()
+        XCTAssertEqual(replacement.outstandingObligations, [.integrationUninstallRetry])
+        await harness.integrations.setUninstallError(nil)
+
+        await replacement.disconnect()
+
+        XCTAssertEqual(replacement.outstandingObligations, [])
+        XCTAssertEqual(replacement.phase, .onboarding)
     }
 
     func testCanceledPauseCallerReturnsAndBlockedMonitorDoesNotRetainViewModel() async {
@@ -1293,7 +1404,8 @@ final class AppViewModelTests: XCTestCase {
             integrations: harness.integrations,
             monitor: harness.monitor,
             loginItem: harness.loginItem,
-            verifier: harness.verifier
+            verifier: harness.verifier,
+            ownershipLedger: harness.ownershipLedger
         )
     }
 
