@@ -84,3 +84,47 @@ Ready-to-paste prompt for a fresh agent:
 ```text
 Implement Task 10 from docs/superpowers/plans/2026-07-06-agent-light-macos-implementation.md using strict TDD. Read the approved design, Task 9 report, and the new CredentialStoring/LoginItemControlling boundaries first. Build onboarding and monitoring view-model behavior with fake dependencies, run focused and full verification, append the Task 10 report, and commit locally without pushing.
 ```
+
+---
+
+## Review Fix: Symmetric Credential Validation and Unknown Login Status
+
+### Corrections
+
+- Extracted one `TuyaCredentialValidator` used by both `save()` and `load()` so the accepted credential boundary cannot drift.
+- Moved save validation ahead of JSON encoding and every Security operation. Invalid credentials now return the sanitized `.malformedData` error without add or update calls.
+- The shared boundary rejects empty Access ID, Access Secret, and Device ID values. It rejects non-HTTPS or missing schemes, empty hosts, user info, query strings, fragments, and non-root paths.
+- Added a stateful Security fake proving an invalid save cannot overwrite an existing valid credential record and that the original remains loadable.
+- Added `.unknown` to the `isEnabled`, enable-transition, and disable-transition matrices. Both transitions fail closed without adapter calls.
+
+### Review RED
+
+Command:
+
+```sh
+swift test --filter CredentialStoreTests
+```
+
+Result: exit 1; invalid endpoint saves did not throw, each reached Security, and the stateful fake recorded one add plus one update that replaced the valid credential. Log: `/tmp/task9-review-credential-red.log`.
+
+Command:
+
+```sh
+swift test --filter CredentialStoreTests/testSaveAndLoadRejectEmptyCredentialFieldsUsingTheSameBoundary
+```
+
+Result: exit 1; save and load accepted empty Access ID, Access Secret, and Device ID values. Log: `/tmp/task9-review-empty-fields-red.log`.
+
+### Review GREEN and Final Verification
+
+- `swift test --filter CredentialStoreTests`: exit 0; 17 tests passed, 0 failures. Log: `/tmp/task9-review-credential-green.log`.
+- `swift test --filter LoginItemControllerTests`: exit 0; 7 tests passed, 0 failures. Log: `/tmp/task9-review-login-green.log`.
+- `swift test`: exit 0; 258 tests passed, 0 failures. Log: `/tmp/task9-review-full-test-final.log`.
+- `swift build -c release`: exit 0. Log: `/tmp/task9-review-release-build-final.log`.
+- `git diff --cached --check`: exit 0 with no output.
+- Source scan found no debug output, TODO/FIXME markers, dynamic evaluation, force casts, forced tries, commented-out code, or production credential literals. Credential strings found by the scan were explicit test canaries only.
+
+### Review Concerns
+
+- The validator intentionally rejects empty credential fields but does not normalize or trim them; Task 10 owns form normalization and pre-verification UX.
+- The real login service remains intentionally untouched. Unknown future `SMAppService` statuses map to `.unknown` and cause no registration change.

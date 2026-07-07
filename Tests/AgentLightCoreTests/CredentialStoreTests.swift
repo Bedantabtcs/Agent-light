@@ -78,6 +78,80 @@ final class CredentialStoreTests: XCTestCase {
         }
     }
 
+    func testSaveRejectsEveryEndpointOutsideTuyaHTTPSBoundaryBeforeSecurityCall() throws {
+        for endpoint in invalidEndpointStrings {
+            let operations = FakeSecurityOperations()
+            let store = makeStore(operations: operations)
+
+            XCTAssertThrowsError(try store.save(makeCredentials(endpoint: endpoint))) { error in
+                XCTAssertEqual(error as? CredentialStoreError, .malformedData)
+                self.assertRedacted(error)
+            }
+            XCTAssertTrue(operations.addQueries.isEmpty, endpoint)
+            XCTAssertTrue(operations.updateCalls.isEmpty, endpoint)
+        }
+    }
+
+    func testInvalidSaveDoesNotOverwriteExistingValidCredentials() throws {
+        let validCredentials = makeCredentials()
+        let operations = StatefulSecurityOperations(
+            storedData: try JSONEncoder().encode(validCredentials)
+        )
+        let store = makeStore(operations: operations)
+
+        XCTAssertThrowsError(
+            try store.save(makeCredentials(endpoint: "https://openapi.tuyaus.com/private"))
+        ) { error in
+            XCTAssertEqual(error as? CredentialStoreError, .malformedData)
+            self.assertRedacted(error)
+        }
+
+        XCTAssertEqual(try store.load(), validCredentials)
+        XCTAssertEqual(operations.addCallCount, 0)
+        XCTAssertEqual(operations.updateCallCount, 0)
+    }
+
+    func testSaveAndLoadRejectEmptyCredentialFieldsUsingTheSameBoundary() throws {
+        let invalidCredentials = [
+            TuyaCredentials(
+                endpoint: makeCredentials().endpoint,
+                accessID: "",
+                accessSecret: "access-secret-private",
+                deviceID: "device-id-private"
+            ),
+            TuyaCredentials(
+                endpoint: makeCredentials().endpoint,
+                accessID: "access-id-private",
+                accessSecret: "",
+                deviceID: "device-id-private"
+            ),
+            TuyaCredentials(
+                endpoint: makeCredentials().endpoint,
+                accessID: "access-id-private",
+                accessSecret: "access-secret-private",
+                deviceID: ""
+            )
+        ]
+
+        for credentials in invalidCredentials {
+            let saveOperations = FakeSecurityOperations()
+            XCTAssertThrowsError(try makeStore(operations: saveOperations).save(credentials)) { error in
+                XCTAssertEqual(error as? CredentialStoreError, .malformedData)
+                self.assertRedacted(error)
+            }
+            XCTAssertTrue(saveOperations.addQueries.isEmpty)
+            XCTAssertTrue(saveOperations.updateCalls.isEmpty)
+
+            let loadOperations = FakeSecurityOperations(
+                copyResults: [(errSecSuccess, try JSONEncoder().encode(credentials) as CFData)]
+            )
+            XCTAssertThrowsError(try makeStore(operations: loadOperations).load()) { error in
+                XCTAssertEqual(error as? CredentialStoreError, .malformedData)
+                self.assertRedacted(error)
+            }
+        }
+    }
+
     func testLoadRequestsOneDataResultAndDecodesCredentials() throws {
         let credentials = makeCredentials()
         let operations = FakeSecurityOperations(
@@ -120,21 +194,8 @@ final class CredentialStoreTests: XCTestCase {
     }
 
     func testLoadRejectsDecodedEndpointOutsideTuyaHTTPSBoundary() throws {
-        let invalidEndpoints = [
-            "http://openapi.tuyaus.com",
-            "https://user:password@openapi.tuyaus.com",
-            "https://openapi.tuyaus.com/path",
-            "https://openapi.tuyaus.com?private=query",
-            "https://openapi.tuyaus.com#fragment"
-        ]
-
-        for endpoint in invalidEndpoints {
-            let credentials = TuyaCredentials(
-                endpoint: try XCTUnwrap(URL(string: endpoint)),
-                accessID: "access-id-private",
-                accessSecret: "access-secret-private",
-                deviceID: "device-id-private"
-            )
+        for endpoint in invalidEndpointStrings {
+            let credentials = makeCredentials(endpoint: endpoint)
             let operations = FakeSecurityOperations(
                 copyResults: [(errSecSuccess, try JSONEncoder().encode(credentials) as CFData)]
             )
@@ -203,13 +264,26 @@ final class CredentialStoreTests: XCTestCase {
         }
     }
 
-    private func makeStore(operations: FakeSecurityOperations) -> KeychainCredentialStore {
+    private var invalidEndpointStrings: [String] {
+        [
+            "http://openapi.tuyaus.com",
+            "ftp://openapi.tuyaus.com",
+            "//openapi.tuyaus.com",
+            "https:///",
+            "https://user:password@openapi.tuyaus.com",
+            "https://openapi.tuyaus.com/path",
+            "https://openapi.tuyaus.com?private=query",
+            "https://openapi.tuyaus.com#fragment"
+        ]
+    }
+
+    private func makeStore(operations: any SecurityOperations) -> KeychainCredentialStore {
         KeychainCredentialStore(service: service, account: account, operations: operations)
     }
 
-    private func makeCredentials() -> TuyaCredentials {
+    private func makeCredentials(endpoint: String = "https://openapi.tuyaus.com") -> TuyaCredentials {
         TuyaCredentials(
-            endpoint: URL(string: "https://openapi.tuyaus.com")!,
+            endpoint: URL(string: endpoint)!,
             accessID: "access-id-private",
             accessSecret: "access-secret-private",
             deviceID: "device-id-private"
@@ -245,6 +319,47 @@ final class CredentialStoreTests: XCTestCase {
         for value in sensitiveValues {
             XCTAssertFalse(description.contains(value), "Leaked \(value)", file: file, line: line)
         }
+    }
+}
+
+private final class StatefulSecurityOperations: SecurityOperations, @unchecked Sendable {
+    private(set) var addCallCount = 0
+    private(set) var updateCallCount = 0
+    private var storedData: Data?
+
+    init(storedData: Data?) {
+        self.storedData = storedData
+    }
+
+    func add(_ attributes: CFDictionary) -> OSStatus {
+        addCallCount += 1
+        guard storedData == nil else { return errSecDuplicateItem }
+        guard let data = (attributes as NSDictionary)[kSecValueData] as? Data else {
+            return errSecParam
+        }
+        storedData = data
+        return errSecSuccess
+    }
+
+    func update(_ query: CFDictionary, attributes: CFDictionary) -> OSStatus {
+        updateCallCount += 1
+        guard storedData != nil else { return errSecItemNotFound }
+        guard let data = (attributes as NSDictionary)[kSecValueData] as? Data else {
+            return errSecParam
+        }
+        storedData = data
+        return errSecSuccess
+    }
+
+    func copyMatching(_ query: CFDictionary, result: UnsafeMutablePointer<CFTypeRef?>) -> OSStatus {
+        guard let storedData else { return errSecItemNotFound }
+        result.pointee = storedData as CFData
+        return errSecSuccess
+    }
+
+    func delete(_ query: CFDictionary) -> OSStatus {
+        storedData = nil
+        return errSecSuccess
     }
 }
 

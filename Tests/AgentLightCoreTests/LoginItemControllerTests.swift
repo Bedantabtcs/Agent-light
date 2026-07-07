@@ -8,6 +8,7 @@ final class LoginItemControllerTests: XCTestCase {
         XCTAssertFalse(LoginItemController(service: FakeLoginItemService(status: .notRegistered)).isEnabled())
         XCTAssertFalse(LoginItemController(service: FakeLoginItemService(status: .requiresApproval)).isEnabled())
         XCTAssertFalse(LoginItemController(service: FakeLoginItemService(status: .notFound)).isEnabled())
+        XCTAssertFalse(LoginItemController(service: FakeLoginItemService(status: .unknown)).isEnabled())
     }
 
     func testEnableRegistersOnlyFromNotRegisteredOrNotFound() throws {
@@ -24,8 +25,8 @@ final class LoginItemControllerTests: XCTestCase {
         }
     }
 
-    func testEnableDoesNotRegisterEnabledOrApprovalPendingService() throws {
-        for status in [LoginItemServiceStatus.enabled, .requiresApproval] {
+    func testEnableDoesNotRegisterEnabledApprovalPendingOrUnknownService() throws {
+        for status in [LoginItemServiceStatus.enabled, .requiresApproval, .unknown] {
             let service = FakeLoginItemService(status: status)
             let controller = LoginItemController(service: service)
 
@@ -50,8 +51,8 @@ final class LoginItemControllerTests: XCTestCase {
         }
     }
 
-    func testDisableDoesNotUnregisterNotRegisteredOrNotFoundService() throws {
-        for status in [LoginItemServiceStatus.notRegistered, .notFound] {
+    func testDisableDoesNotUnregisterNotRegisteredNotFoundOrUnknownService() throws {
+        for status in [LoginItemServiceStatus.notRegistered, .notFound, .unknown] {
             let service = FakeLoginItemService(status: status)
             let controller = LoginItemController(service: service)
 

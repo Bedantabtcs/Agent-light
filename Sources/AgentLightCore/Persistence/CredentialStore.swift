@@ -61,6 +61,28 @@ struct DarwinSecurityOperations: SecurityOperations {
     }
 }
 
+enum TuyaCredentialValidator {
+    static func isValid(_ credentials: TuyaCredentials) -> Bool {
+        guard !credentials.accessID.isEmpty,
+              !credentials.accessSecret.isEmpty,
+              !credentials.deviceID.isEmpty,
+              let components = URLComponents(
+                  url: credentials.endpoint,
+                  resolvingAgainstBaseURL: false
+              ),
+              components.scheme?.lowercased() == "https",
+              let host = components.host,
+              !host.isEmpty,
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil else {
+            return false
+        }
+        return components.path.isEmpty || components.path == "/"
+    }
+}
+
 public final class KeychainCredentialStore: CredentialStoring {
     private let service: String
     private let account: String
@@ -80,6 +102,10 @@ public final class KeychainCredentialStore: CredentialStoring {
     }
 
     public func save(_ credentials: TuyaCredentials) throws {
+        guard TuyaCredentialValidator.isValid(credentials) else {
+            throw CredentialStoreError.malformedData
+        }
+
         let data: Data
         do {
             data = try JSONEncoder().encode(credentials)
@@ -131,7 +157,7 @@ public final class KeychainCredentialStore: CredentialStoring {
         } catch {
             throw CredentialStoreError.malformedData
         }
-        guard Self.hasAllowedEndpoint(credentials.endpoint) else {
+        guard TuyaCredentialValidator.isValid(credentials) else {
             throw CredentialStoreError.malformedData
         }
         return credentials
@@ -150,19 +176,5 @@ public final class KeychainCredentialStore: CredentialStoring {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-    }
-
-    private static func hasAllowedEndpoint(_ endpoint: URL) -> Bool {
-        guard let components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "https",
-              let host = components.host,
-              !host.isEmpty,
-              components.user == nil,
-              components.password == nil,
-              components.query == nil,
-              components.fragment == nil else {
-            return false
-        }
-        return components.path.isEmpty || components.path == "/"
     }
 }
