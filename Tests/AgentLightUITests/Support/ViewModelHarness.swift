@@ -146,13 +146,17 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     private var installBlocked = false
     private var blockedPreviewCalls: Set<Int> = []
     private var repairBlocked = false
+    private var uninstallBlocked = false
     private var installRelease: CheckedContinuation<Void, Never>?
     private var previewReleases: [Int: CheckedContinuation<Void, Never>] = [:]
     private var repairRelease: CheckedContinuation<Void, Never>?
+    private var uninstallRelease: CheckedContinuation<Void, Never>?
     private var installWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var previewWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var repairWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var uninstallWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var previewOwnership: [Bool] = [false, false, false]
+    private var installOwnership: [IntegrationSourceOwnership] = [.fresh, .fresh, .fresh]
     private(set) var previewCount = 0
     private(set) var installCount = 0
     private(set) var repairCount = 0
@@ -185,6 +189,14 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     }
 
     func install() async throws {
+        _ = try await performInstall()
+    }
+
+    func installWithReceipt() async throws -> IntegrationInstallReceipt {
+        try await performInstall()
+    }
+
+    private func performInstall() async throws -> IntegrationInstallReceipt {
         calls.append(.install)
         installCount += 1
         let ready = installWaiters.filter { installCount >= $0.0 }
@@ -192,6 +204,11 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
         for waiter in ready { waiter.1.resume() }
         if installBlocked { await withCheckedContinuation { installRelease = $0 } }
         if let installError { throw installError }
+        return IntegrationInstallReceipt(
+            sources: zip(AgentSource.allCases, installOwnership).map { source, ownership in
+                IntegrationSourceReceipt(source: source, ownership: ownership)
+            }
+        )
     }
 
     func repair() async throws {
@@ -207,6 +224,10 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     func uninstall() async throws {
         calls.append(.uninstall)
         uninstallCount += 1
+        let ready = uninstallWaiters.filter { uninstallCount >= $0.0 }
+        uninstallWaiters.removeAll { uninstallCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+        if uninstallBlocked { await withCheckedContinuation { uninstallRelease = $0 } }
         if let uninstallError { throw uninstallError }
     }
 
@@ -214,7 +235,13 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     func setPreviewError(_ error: (any Error & Sendable)?) { previewError = error }
     func setRepairError(_ error: (any Error & Sendable)?) { repairError = error }
     func setUninstallError(_ error: (any Error & Sendable)?) { uninstallError = error }
-    func setPreviewOwnership(_ ownership: [Bool]) { previewOwnership = ownership }
+    func setPreviewOwnership(_ ownership: [Bool]) {
+        previewOwnership = ownership
+        installOwnership = ownership.map { $0 ? .fullyPreexisting : .fresh }
+    }
+    func setInstallOwnership(_ ownership: [IntegrationSourceOwnership]) {
+        installOwnership = ownership
+    }
     func blockInstall() { installBlocked = true }
     func releaseInstall() { installBlocked = false; installRelease?.resume(); installRelease = nil }
     func waitForInstallCount(_ expected: Int) async {
@@ -235,6 +262,16 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     func waitForRepairCount(_ expected: Int) async {
         if repairCount >= expected { return }
         await withCheckedContinuation { repairWaiters.append((expected, $0)) }
+    }
+    func blockUninstall() { uninstallBlocked = true }
+    func releaseUninstall() {
+        uninstallBlocked = false
+        uninstallRelease?.resume()
+        uninstallRelease = nil
+    }
+    func waitForUninstallCount(_ expected: Int) async {
+        if uninstallCount >= expected { return }
+        await withCheckedContinuation { uninstallWaiters.append((expected, $0)) }
     }
     func counts() -> (preview: Int, install: Int, repair: Int, uninstall: Int) {
         (previewCount, installCount, repairCount, uninstallCount)
@@ -388,23 +425,6 @@ actor FakeMonitor: MonitoringOrchestrating {
     }
 }
 
-actor AsyncInvocationBarrier {
-    private var arrived = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func arrive() {
-        arrived = true
-        let current = waiters
-        waiters.removeAll()
-        for waiter in current { waiter.resume() }
-    }
-
-    func wait() async {
-        if arrived { return }
-        await withCheckedContinuation { waiters.append($0) }
-    }
-}
-
 @MainActor
 final class WeakViewModelBox {
     weak var value: AppViewModel?
@@ -415,6 +435,7 @@ final class FakeLoginItem: LoginItemControlling {
     private let calls: HarnessCallRecorder
     var currentStatus: LoginItemStatus = .notRegistered
     var registerResult: LoginItemStatus = .enabled
+    var disableResult: LoginItemStatus = .notRegistered
     var enableError: (any Error)?
     var disableError: (any Error)?
     private(set) var enableCount = 0
@@ -447,7 +468,7 @@ final class FakeLoginItem: LoginItemControlling {
         }
         if let disableError { throw disableError }
         let didUnregister = previous == .enabled || previous == .requiresApproval
-        if didUnregister { currentStatus = .notRegistered }
+        if didUnregister { currentStatus = disableResult }
         return LoginItemTransition(
             previous: previous,
             current: status(),
@@ -477,6 +498,13 @@ final class ViewModelHarness {
         accessSecret: "CANARY_PREVIOUS_ACCESS_SECRET",
         deviceID: "CANARY_PREVIOUS_DEVICE_ID"
     )
+    var freshInstallReceipt: IntegrationInstallReceipt {
+        IntegrationInstallReceipt(
+            sources: AgentSource.allCases.map {
+                IntegrationSourceReceipt(source: $0, ownership: .fresh)
+            }
+        )
+    }
     let viewModel: AppViewModel
 
     init(initialSnapshot: MonitoringSnapshot = MonitoringSnapshot(state: .idle, sessions: [], connection: .connected)) {

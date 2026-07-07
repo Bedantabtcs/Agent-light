@@ -24,11 +24,61 @@ public struct IntegrationPreview: Equatable, Sendable {
     }
 }
 
+public enum IntegrationSourceOwnership: Equatable, Sendable {
+    case fresh
+    case fullyPreexisting
+    case partial
+}
+
+public enum IntegrationOverallOwnership: Equatable, Sendable {
+    case fresh
+    case fullyPreexisting
+    case mixed
+}
+
+public struct IntegrationSourceReceipt: Equatable, Sendable {
+    public let source: AgentSource
+    public let ownership: IntegrationSourceOwnership
+
+    public init(source: AgentSource, ownership: IntegrationSourceOwnership) {
+        self.source = source
+        self.ownership = ownership
+    }
+}
+
+public struct IntegrationInstallReceipt: Equatable, Sendable {
+    public let sources: [IntegrationSourceReceipt]
+
+    public init(sources: [IntegrationSourceReceipt]) {
+        self.sources = sources
+    }
+
+    public var overallOwnership: IntegrationOverallOwnership {
+        if !sources.isEmpty, sources.allSatisfy({ $0.ownership == .fresh }) { return .fresh }
+        if !sources.isEmpty, sources.allSatisfy({ $0.ownership == .fullyPreexisting }) {
+            return .fullyPreexisting
+        }
+        return .mixed
+    }
+}
+
 public protocol IntegrationInstalling: Sendable {
     func preview() async throws -> [IntegrationPreview]
     func install() async throws
+    func installWithReceipt() async throws -> IntegrationInstallReceipt
     func repair() async throws
     func uninstall() async throws
+}
+
+public extension IntegrationInstalling {
+    func installWithReceipt() async throws -> IntegrationInstallReceipt {
+        try await install()
+        return IntegrationInstallReceipt(
+            sources: AgentSource.allCases.map {
+                IntegrationSourceReceipt(source: $0, ownership: .partial)
+            }
+        )
+    }
 }
 
 public enum IntegrationError: Error, Equatable {
@@ -40,7 +90,8 @@ public enum IntegrationError: Error, Equatable {
     case destinationChanged(String)
     case fileOperation(String)
     case verificationFailed(String)
-    case committedWithCleanupFailure([String])
+    case committedWithCleanupFailure(receipt: IntegrationInstallReceipt, failures: [String])
+    case artifactCleanupFailure([String])
     case rollbackFailed([String])
 }
 
@@ -100,6 +151,13 @@ public struct IntegrationConfigEditor: Sendable {
     func hasOwnedEntries(in data: Data) throws -> Bool {
         var root = try rootObject(from: data)
         return removeOwnedCommands(from: &root)
+    }
+
+    func ownership(before data: Data, after installed: Data) throws -> IntegrationSourceOwnership {
+        guard try hasOwnedEntries(in: data) else { return .fresh }
+        return try JSONValue.decode(data) == JSONValue.decode(installed)
+            ? .fullyPreexisting
+            : .partial
     }
 
     private var events: [String] {
@@ -571,7 +629,36 @@ public struct IntegrationInstaller: IntegrationInstalling {
     }
 
     public func install() async throws {
-        try apply(includeMissing: true) { editor, data in try editor.install(into: data) }
+        _ = try await installWithReceipt()
+    }
+
+    public func installWithReceipt() async throws -> IntegrationInstallReceipt {
+        let prepared = try paths.all.map { configuration -> (AtomicConfigurationChange, IntegrationSourceReceipt) in
+            let before = try fileOperations.snapshot(at: configuration.url)
+            let editor = IntegrationConfigEditor(source: configuration.source, relayPath: relayPath)
+            let after = try editor.install(into: before.data)
+            return (
+                AtomicConfigurationChange(
+                    destination: configuration.url,
+                    before: before,
+                    after: after
+                ),
+                IntegrationSourceReceipt(
+                    source: configuration.source,
+                    ownership: try editor.ownership(before: before.data, after: after)
+                )
+            )
+        }
+        let receipt = IntegrationInstallReceipt(sources: prepared.map(\.1))
+        let cleanupFailures = try AtomicConfigurationWriter(fileOperations: fileOperations)
+            .apply(prepared.map(\.0))
+        if !cleanupFailures.isEmpty {
+            throw IntegrationError.committedWithCleanupFailure(
+                receipt: receipt,
+                failures: cleanupFailures
+            )
+        }
+        return receipt
     }
 
     public func repair() async throws {
@@ -596,7 +683,10 @@ public struct IntegrationInstaller: IntegrationInstalling {
                 after: try transform(editor, before.data)
             )
         }
-        try AtomicConfigurationWriter(fileOperations: fileOperations).apply(changes)
+        let cleanupFailures = try AtomicConfigurationWriter(fileOperations: fileOperations).apply(changes)
+        if !cleanupFailures.isEmpty {
+            throw IntegrationError.artifactCleanupFailure(cleanupFailures)
+        }
     }
 }
 
@@ -615,7 +705,7 @@ private struct PreparedConfigurationChange {
 private struct AtomicConfigurationWriter {
     let fileOperations: any IntegrationFileOperating
 
-    func apply(_ changes: [AtomicConfigurationChange]) throws {
+    func apply(_ changes: [AtomicConfigurationChange]) throws -> [String] {
         var prepared: [PreparedConfigurationChange] = []
         var renamedCount = 0
 
@@ -650,10 +740,7 @@ private struct AtomicConfigurationWriter {
             throw IntegrationError.rollbackFailed(failures)
         }
 
-        let cleanupFailures = cleanupCommittedArtifacts(prepared)
-        if !cleanupFailures.isEmpty {
-            throw IntegrationError.committedWithCleanupFailure(cleanupFailures)
-        }
+        return cleanupCommittedArtifacts(prepared)
     }
 
     private func prepare(_ change: AtomicConfigurationChange) throws -> PreparedConfigurationChange {

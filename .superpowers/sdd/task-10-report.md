@@ -152,3 +152,52 @@ Starting commit: `117f46adc6488c7c5e67c6221a457b0f5f7dc8ed`
 ### Remaining concern
 
 - Mixed preexisting integration ownership cannot be destructively separated with the current installer API. Agent Light preserves all entries and requires explicit repair/adoption instead of removing entries that may predate this approval attempt.
+
+---
+
+## Re-review Correction Batch
+
+Date: 2026-07-07
+Starting commit: `0a1e1bb8bfe99e786146c5a1ff0496fbbe52276a`
+
+### Integration commit authority and cleanup
+
+- Added `IntegrationInstallReceipt` with per-source `fresh`, `fullyPreexisting`, or `partial` ownership derived from the exact snapshots passed to the atomic writer. Preview data is display-only and no longer controls compensation.
+- Preserved source compatibility for existing `IntegrationInstalling` conformers with a conservative default receipt. The concrete installer overrides it with authoritative ownership.
+- A committed installation that cannot remove staging or rollback material now carries its receipt and creates a distinct `integrationArtifactCleanup` obligation.
+- Split integration obligations into uninstall retry, rollback repair, mixed adoption, and artifact cleanup. Repair dispatches only the action appropriate to the obligation; artifact-only state remains visible because no safe automatic artifact-removal API exists.
+- Partial-event drift is classified as mixed ownership and is adopted by an authoritative install rather than destructively uninstalled.
+
+### Lifecycle ownership and cancellation
+
+- Replaced raw task handles with a shared-operation owner. Duplicate callers await one driver; canceling one waiter returns promptly without canceling a driver still used by another waiter, while the final canceled waiter cancels the driver.
+- External dependency waits capture dependencies and immutable inputs, then weakly commit to the view model. Blocked verify, install, pause, resume, repair, and disconnect-cleanup calls no longer retain the view model.
+- Driver completion, rather than a caller returning, clears the in-flight handle. This prevents a canceled waiter from opening a duplicate-operation window.
+- Test synchronization now uses barriers inside fake dependency methods. The standalone invocation barrier was removed.
+
+### Login and presentation behavior
+
+- Login cleanup clears ownership only when the disable transition reports `notRegistered` or `notFound`. Unknown or still-registered postconditions retain `loginRegistrationCleanup` for retry.
+- Added direct HTTP 401 and 403 presentation tests; both map to `invalidCredential` without exposing dependency error text.
+
+### RED/GREEN evidence
+
+- Commit-time TOCTOU RED: a fresh preview followed by externally appearing hooks caused one unsafe uninstall. GREEN: the authoritative install receipt classified them as preexisting and uninstall count remained zero.
+- Login postcondition RED: a disable transition ending in `unknown` cleared ownership. GREEN: the obligation remains until a later terminal absence status.
+- Caller-cancellation RED: a blocked verifier retained the view model and the caller did not return. GREEN: the caller returns before release and the weak reference is nil.
+- Focused split-action tests prove uninstall retry calls only uninstall, rollback calls only repair, mixed adoption calls install, and artifact-only repair performs no destructive action.
+
+### Final verification
+
+- `swift test --filter AppViewModelTests`: 57 passed, 0 failures.
+- `swift test --filter IntegrationInstallerTests`: 27 passed, 0 failures.
+- `swift test --filter LoginItemControllerTests`: 8 passed, 0 failures.
+- Shared-waiter plus cancellation/deinit subset: 20 consecutive runs passed.
+- `swift test`: 321 passed, 0 failures.
+- `swift build -c release`: exit 0.
+- `git diff --check`: exit 0 with no output.
+- Security/orphan scan: no polling/yields, external invocation barrier, debug output, dynamic evaluation, TODO/FIXME markers, commented-out code, production credential literals, or live references to the removed aggregate integration obligation.
+
+### Remaining concern
+
+- Artifact cleanup remains a typed, visible manual obligation because the installer does not expose a safe committed-artifact cleanup operation. It is intentionally not mislabeled as configuration repair.

@@ -5,6 +5,16 @@ import XCTest
 @testable import AgentLightCore
 
 final class IntegrationInstallerTests: XCTestCase {
+    func testLegacyInstallerConformerGetsConservativeReceiptWithoutSourceBreak() async throws {
+        let installer = LegacyIntegrationInstaller()
+
+        let receipt = try await installer.installWithReceipt()
+        let installCount = await installer.installCount
+
+        XCTAssertEqual(receipt.overallOwnership, .mixed)
+        XCTAssertEqual(installCount, 1)
+    }
+
     func testInstallIsIdempotentAndPreservesUnrelatedHooks() throws {
         let original = Data(#"{"hooks":{"Custom":[{"hooks":[{"type":"command","command":"custom"}]}]}}"#.utf8)
         let editor = IntegrationConfigEditor(source: .codex, relayPath: "/tmp/AgentLightRelay")
@@ -183,6 +193,45 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertEqual(ownership[.codex], true)
         XCTAssertEqual(ownership[.claudeCode], false)
         XCTAssertEqual(ownership[.cursor], false)
+    }
+
+    func testInstallReceiptUsesCommitTimeSnapshotsWhenEntriesAppearAfterFreshPreview() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+        let preview = try await installer.preview()
+        XCTAssertTrue(preview.allSatisfy { !$0.hadOwnedEntries })
+
+        try await installer.install()
+        let receipt = try await installer.installWithReceipt()
+
+        XCTAssertEqual(receipt.overallOwnership, .fullyPreexisting)
+        XCTAssertEqual(receipt.sources.map(\.ownership), [.fullyPreexisting, .fullyPreexisting, .fullyPreexisting])
+    }
+
+    func testInstallReceiptDetectsPartialEventDriftFromCommitTimeSnapshot() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        try FileManager.default.createDirectory(
+            at: paths.codex.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let marker = AppIdentity.integrationIdentifier
+        let partial = Data(
+            #"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"relay --integration-id \#(marker) --source codex --event Stop"}]}]}}"#.utf8
+        )
+        try partial.write(to: paths.codex)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+
+        let receipt = try await installer.installWithReceipt()
+        let ownership = Dictionary(uniqueKeysWithValues: receipt.sources.map { ($0.source, $0.ownership) })
+
+        XCTAssertEqual(ownership[.codex], .partial)
+        XCTAssertEqual(ownership[.claudeCode], .fresh)
+        XCTAssertEqual(ownership[.cursor], .fresh)
+        XCTAssertEqual(receipt.overallOwnership, .mixed)
     }
 
     func testInvalidExistingJSONFailsWithoutChangingFileOrLeavingArtifacts() async throws {
@@ -412,9 +461,10 @@ final class IntegrationInstallerTests: XCTestCase {
             try await installer.install()
             XCTFail("Expected committed cleanup failure")
         } catch let error as IntegrationError {
-            guard case let .committedWithCleanupFailure(failures) = error else {
+            guard case let .committedWithCleanupFailure(receipt, failures) = error else {
                 return XCTFail("Unexpected error: \(error)")
             }
+            XCTAssertEqual(receipt.overallOwnership, .fresh)
             XCTAssertFalse(failures.isEmpty)
         }
 
@@ -712,6 +762,15 @@ private final class FaultInjectingFileOperations: IntegrationFileOperating, @unc
         defer { lock.unlock() }
         return body()
     }
+}
+
+private actor LegacyIntegrationInstaller: IntegrationInstalling {
+    private(set) var installCount = 0
+
+    func preview() async throws -> [IntegrationPreview] { [] }
+    func install() async throws { installCount += 1 }
+    func repair() async throws {}
+    func uninstall() async throws {}
 }
 
 private final class FailingSecondExchangeRenamer: IntegrationAtomicRenaming, @unchecked Sendable {
