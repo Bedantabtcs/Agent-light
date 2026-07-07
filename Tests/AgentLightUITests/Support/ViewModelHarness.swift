@@ -4,7 +4,7 @@ import AgentLightProtocol
 @testable import AgentLightUI
 
 enum HarnessCall: Equatable, Sendable {
-    case verify, preview, install, repair, uninstall
+    case verify, preview, install, repair, uninstall, verifyArtifacts
     case loadCredentials, saveCredentials, deleteCredentials
     case enableLogin, disableLogin
     case startMonitoring, pauseMonitoring, resumeMonitoring, stopMonitoring
@@ -88,7 +88,9 @@ actor FakeVerifier: TuyaConnectionVerifying {
     private var blockedCalls: Set<Int> = []
     private var releases: [Int: CheckedContinuation<Void, Never>] = [:]
     private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var cancellationWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private(set) var verifyCount = 0
+    private(set) var cancellationCount = 0
     private(set) var lastCredentials: TuyaCredentials?
 
     init(calls: HarnessCallRecorder) { self.calls = calls }
@@ -104,7 +106,7 @@ actor FakeVerifier: TuyaConnectionVerifying {
         if blockedCalls.contains(call) {
             await withTaskCancellationHandler {
                 await withCheckedContinuation { releases[call] = $0 }
-            } onCancel: {}
+            } onCancel: { Task { await self.recordCancellation() } }
         }
         if let error = errors[call] { throw error }
         return Self.capabilities
@@ -119,6 +121,17 @@ actor FakeVerifier: TuyaConnectionVerifying {
     }
     func capturedCredentials() -> TuyaCredentials? { lastCredentials }
     func count() -> Int { verifyCount }
+    func waitForCancellationCount(_ expected: Int) async {
+        if cancellationCount >= expected { return }
+        await withCheckedContinuation { cancellationWaiters.append((expected, $0)) }
+    }
+
+    private func recordCancellation() {
+        cancellationCount += 1
+        let ready = cancellationWaiters.filter { cancellationCount >= $0.0 }
+        cancellationWaiters.removeAll { cancellationCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+    }
 
     private static let capabilities: ResolvedLightCapabilities = {
         let specification = TuyaSpecification(
@@ -143,6 +156,8 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     private var previewError: (any Error & Sendable)?
     private var repairError: (any Error & Sendable)?
     private var uninstallError: (any Error & Sendable)?
+    private var artifactVerificationError: (any Error & Sendable)?
+    private var artifactCleanupVerified = false
     private var installBlocked = false
     private var blockedPreviewCalls: Set<Int> = []
     private var repairBlocked = false
@@ -161,6 +176,7 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     private(set) var installCount = 0
     private(set) var repairCount = 0
     private(set) var uninstallCount = 0
+    private(set) var artifactVerificationCount = 0
 
     init(calls: HarnessCallRecorder) { self.calls = calls }
 
@@ -231,10 +247,21 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
         if let uninstallError { throw uninstallError }
     }
 
+    func verifyArtifactCleanup() async throws -> Bool {
+        calls.append(.verifyArtifacts)
+        artifactVerificationCount += 1
+        if let artifactVerificationError { throw artifactVerificationError }
+        return artifactCleanupVerified
+    }
+
     func setInstallError(_ error: (any Error & Sendable)?) { installError = error }
     func setPreviewError(_ error: (any Error & Sendable)?) { previewError = error }
     func setRepairError(_ error: (any Error & Sendable)?) { repairError = error }
     func setUninstallError(_ error: (any Error & Sendable)?) { uninstallError = error }
+    func setArtifactVerification(clean: Bool, error: (any Error & Sendable)? = nil) {
+        artifactCleanupVerified = clean
+        artifactVerificationError = error
+    }
     func setPreviewOwnership(_ ownership: [Bool]) {
         previewOwnership = ownership
         installOwnership = ownership.map { $0 ? .fullyPreexisting : .fresh }
@@ -284,6 +311,12 @@ actor FakeMonitor: MonitoringOrchestrating {
     private var startError: (any Error & Sendable)?
     private var resumeError: (any Error & Sendable)?
     private var pauseBlocked = false
+    private var startBlocked = false
+    private var startRelease: CheckedContinuation<Void, Never>?
+    private var startWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var snapshotBlocked = false
+    private var snapshotRelease: CheckedContinuation<Void, Never>?
+    private var snapshotWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var pauseRelease: CheckedContinuation<Void, Never>?
     private var pauseWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var resumeBlocked = false
@@ -303,6 +336,7 @@ actor FakeMonitor: MonitoringOrchestrating {
     private(set) var updateSubscriptionCount = 0
     private(set) var terminationCount = 0
     private(set) var latestSubscriptionID: UUID?
+    private(set) var snapshotCount = 0
     var activeSubscriptionCount: Int { continuations.count }
 
     init(calls: HarnessCallRecorder, initialSnapshot: MonitoringSnapshot) {
@@ -313,6 +347,10 @@ actor FakeMonitor: MonitoringOrchestrating {
     func start() async throws {
         calls.append(.startMonitoring)
         startCount += 1
+        let ready = startWaiters.filter { startCount >= $0.0 }
+        startWaiters.removeAll { startCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+        if startBlocked { await withCheckedContinuation { startRelease = $0 } }
         if let startError { throw startError }
     }
     func accept(_ event: AgentEvent) async {}
@@ -343,7 +381,15 @@ actor FakeMonitor: MonitoringOrchestrating {
     }
     func reconnect() async {}
     func recoverIfNeeded() async throws {}
-    func currentSnapshot() async -> MonitoringSnapshot { calls.append(.currentSnapshot); return snapshot }
+    func currentSnapshot() async -> MonitoringSnapshot {
+        calls.append(.currentSnapshot)
+        snapshotCount += 1
+        let ready = snapshotWaiters.filter { snapshotCount >= $0.0 }
+        snapshotWaiters.removeAll { snapshotCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+        if snapshotBlocked { await withCheckedContinuation { snapshotRelease = $0 } }
+        return snapshot
+    }
     func updates() -> AsyncStream<MonitoringSnapshot> {
         calls.append(.updates)
         updateSubscriptionCount += 1
@@ -369,6 +415,18 @@ actor FakeMonitor: MonitoringOrchestrating {
     func finish(_ id: UUID) { historicalContinuations[id]?.finish() }
     func setStartError(_ error: (any Error & Sendable)?) { startError = error }
     func setResumeError(_ error: (any Error & Sendable)?) { resumeError = error }
+    func blockStart() { startBlocked = true }
+    func releaseStart() { startBlocked = false; startRelease?.resume(); startRelease = nil }
+    func waitForStartCount(_ expected: Int) async {
+        if startCount >= expected { return }
+        await withCheckedContinuation { startWaiters.append((expected, $0)) }
+    }
+    func blockSnapshot() { snapshotBlocked = true }
+    func releaseSnapshot() { snapshotBlocked = false; snapshotRelease?.resume(); snapshotRelease = nil }
+    func waitForSnapshotCount(_ expected: Int) async {
+        if snapshotCount >= expected { return }
+        await withCheckedContinuation { snapshotWaiters.append((expected, $0)) }
+    }
     func blockPause() { pauseBlocked = true }
     func releasePause() { pauseBlocked = false; pauseRelease?.resume(); pauseRelease = nil }
     func waitForPauseCount(_ expected: Int) async {

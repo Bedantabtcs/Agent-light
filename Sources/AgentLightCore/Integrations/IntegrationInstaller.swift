@@ -53,7 +53,22 @@ public struct IntegrationInstallReceipt: Equatable, Sendable {
         self.sources = sources
     }
 
+    public static func validated(
+        sources: [IntegrationSourceReceipt]
+    ) throws -> IntegrationInstallReceipt {
+        let receipt = IntegrationInstallReceipt(sources: sources)
+        guard receipt.isValid else { throw IntegrationReceiptValidationError.invalidSources }
+        return receipt
+    }
+
+    public var isValid: Bool {
+        let counts = Dictionary(grouping: sources, by: \.source).mapValues(\.count)
+        return sources.count == AgentSource.allCases.count
+            && AgentSource.allCases.allSatisfy { counts[$0] == 1 }
+    }
+
     public var overallOwnership: IntegrationOverallOwnership {
+        guard isValid else { return .mixed }
         if !sources.isEmpty, sources.allSatisfy({ $0.ownership == .fresh }) { return .fresh }
         if !sources.isEmpty, sources.allSatisfy({ $0.ownership == .fullyPreexisting }) {
             return .fullyPreexisting
@@ -62,12 +77,17 @@ public struct IntegrationInstallReceipt: Equatable, Sendable {
     }
 }
 
+public enum IntegrationReceiptValidationError: Error, Equatable, Sendable {
+    case invalidSources
+}
+
 public protocol IntegrationInstalling: Sendable {
     func preview() async throws -> [IntegrationPreview]
     func install() async throws
     func installWithReceipt() async throws -> IntegrationInstallReceipt
     func repair() async throws
     func uninstall() async throws
+    func verifyArtifactCleanup() async throws -> Bool
 }
 
 public extension IntegrationInstalling {
@@ -79,6 +99,8 @@ public extension IntegrationInstalling {
             }
         )
     }
+
+    func verifyArtifactCleanup() async throws -> Bool { false }
 }
 
 public enum IntegrationError: Error, Equatable {
@@ -90,7 +112,8 @@ public enum IntegrationError: Error, Equatable {
     case destinationChanged(String)
     case fileOperation(String)
     case verificationFailed(String)
-    case committedWithCleanupFailure(receipt: IntegrationInstallReceipt, failures: [String])
+    case committedWithCleanupFailure([String])
+    case committedWithReceiptCleanupFailure(receipt: IntegrationInstallReceipt, failures: [String])
     case artifactCleanupFailure([String])
     case rollbackFailed([String])
 }
@@ -375,6 +398,22 @@ protocol IntegrationFileOperating: Sendable {
     func syncDirectory(at url: URL) throws
 }
 
+protocol IntegrationArtifactInspecting: Sendable {
+    func names(in directory: URL) throws -> [String]
+}
+
+struct FileManagerIntegrationArtifactInspector: IntegrationArtifactInspecting {
+    func names(in directory: URL) throws -> [String] {
+        do {
+            return try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain
+                && (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) {
+            return []
+        }
+    }
+}
+
 protocol IntegrationAtomicRenaming: Sendable {
     func createExclusively(from source: URL, to destination: URL) throws
     func exchange(_ first: URL, with second: URL) throws
@@ -586,6 +625,7 @@ public struct IntegrationInstaller: IntegrationInstalling {
     public let relayPath: String
     public let paths: IntegrationConfigurationPaths
     private let fileOperations: any IntegrationFileOperating
+    private let artifactInspector: any IntegrationArtifactInspecting
 
     public init(
         relayPath: String,
@@ -594,16 +634,19 @@ public struct IntegrationInstaller: IntegrationInstalling {
         self.relayPath = relayPath
         self.paths = paths
         fileOperations = POSIXIntegrationFileOperations()
+        artifactInspector = FileManagerIntegrationArtifactInspector()
     }
 
     init(
         relayPath: String,
         paths: IntegrationConfigurationPaths,
-        fileOperations: any IntegrationFileOperating
+        fileOperations: any IntegrationFileOperating,
+        artifactInspector: any IntegrationArtifactInspecting = FileManagerIntegrationArtifactInspector()
     ) {
         self.relayPath = relayPath
         self.paths = paths
         self.fileOperations = fileOperations
+        self.artifactInspector = artifactInspector
     }
 
     public init(relayPath: String, homeDirectory: URL) {
@@ -653,7 +696,7 @@ public struct IntegrationInstaller: IntegrationInstalling {
         let cleanupFailures = try AtomicConfigurationWriter(fileOperations: fileOperations)
             .apply(prepared.map(\.0))
         if !cleanupFailures.isEmpty {
-            throw IntegrationError.committedWithCleanupFailure(
+            throw IntegrationError.committedWithReceiptCleanupFailure(
                 receipt: receipt,
                 failures: cleanupFailures
             )
@@ -667,6 +710,22 @@ public struct IntegrationInstaller: IntegrationInstalling {
 
     public func uninstall() async throws {
         try apply(includeMissing: false) { editor, data in try editor.uninstall(from: data) }
+    }
+
+    public func verifyArtifactCleanup() async throws -> Bool {
+        for configuration in paths.all {
+            let directory = configuration.url.deletingLastPathComponent()
+            let base = configuration.url.lastPathComponent
+            let prefixes = [
+                ".\(base).agent-light-staged-",
+                ".\(base).agent-light-rollback-"
+            ]
+            let names = try artifactInspector.names(in: directory)
+            if names.contains(where: { name in prefixes.contains(where: name.hasPrefix) }) {
+                return false
+            }
+        }
+        return true
     }
 
     private func apply(

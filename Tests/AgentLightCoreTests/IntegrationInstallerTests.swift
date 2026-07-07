@@ -5,6 +5,38 @@ import XCTest
 @testable import AgentLightCore
 
 final class IntegrationInstallerTests: XCTestCase {
+    func testReceiptValidationRequiresExactlyOneEntryForEverySource() throws {
+        let complete = AgentSource.allCases.map {
+            IntegrationSourceReceipt(source: $0, ownership: .fresh)
+        }
+        XCTAssertNoThrow(try IntegrationInstallReceipt.validated(sources: complete))
+
+        XCTAssertThrowsError(
+            try IntegrationInstallReceipt.validated(sources: Array(complete.dropLast()))
+        )
+        XCTAssertThrowsError(
+            try IntegrationInstallReceipt.validated(sources: complete + [complete[0]])
+        )
+    }
+
+    func testInvalidReceiptOwnershipIsConservativelyMixed() {
+        let receipt = IntegrationInstallReceipt(
+            sources: [IntegrationSourceReceipt(source: .codex, ownership: .fresh)]
+        )
+
+        XCTAssertFalse(receipt.isValid)
+        XCTAssertEqual(receipt.overallOwnership, .mixed)
+    }
+
+    func testLegacyCommittedCleanupErrorRemainsConstructible() {
+        let error = IntegrationError.committedWithCleanupFailure(["CANARY_ARTIFACT"])
+
+        guard case let .committedWithCleanupFailure(failures) = error else {
+            return XCTFail("Expected legacy committed cleanup error")
+        }
+        XCTAssertEqual(failures, ["CANARY_ARTIFACT"])
+    }
+
     func testLegacyInstallerConformerGetsConservativeReceiptWithoutSourceBreak() async throws {
         let installer = LegacyIntegrationInstaller()
 
@@ -13,6 +45,42 @@ final class IntegrationInstallerTests: XCTestCase {
 
         XCTAssertEqual(receipt.overallOwnership, .mixed)
         XCTAssertEqual(installCount, 1)
+    }
+
+    func testArtifactVerificationFindsOnlyKnownAgentLightArtifactsWithoutDeleting() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+        let directory = paths.codex.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let unrelated = directory.appending(path: ".unrelated.agent-light-rollback-CANARY")
+        try Data("unrelated".utf8).write(to: unrelated)
+
+        let cleanBeforeRetainedArtifact = try await installer.verifyArtifactCleanup()
+        XCTAssertTrue(cleanBeforeRetainedArtifact)
+
+        let retained = directory.appending(
+            path: ".\(paths.codex.lastPathComponent).agent-light-rollback-CANARY"
+        )
+        try Data("retained".utf8).write(to: retained)
+
+        let cleanAfterRetainedArtifact = try await installer.verifyArtifactCleanup()
+        XCTAssertFalse(cleanAfterRetainedArtifact)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: retained.path))
+    }
+
+    func testArtifactVerificationPropagatesInspectionFailure() async {
+        let root = temporaryRoot()
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(
+            relayPath: "/tmp/CANARY_RELAY",
+            paths: paths,
+            fileOperations: POSIXIntegrationFileOperations(),
+            artifactInspector: FailingArtifactInspector()
+        )
+
+        await XCTAssertThrowsErrorAsync(try await installer.verifyArtifactCleanup())
     }
 
     func testInstallIsIdempotentAndPreservesUnrelatedHooks() throws {
@@ -461,7 +529,7 @@ final class IntegrationInstallerTests: XCTestCase {
             try await installer.install()
             XCTFail("Expected committed cleanup failure")
         } catch let error as IntegrationError {
-            guard case let .committedWithCleanupFailure(receipt, failures) = error else {
+            guard case let .committedWithReceiptCleanupFailure(receipt, failures) = error else {
                 return XCTFail("Unexpected error: \(error)")
             }
             XCTAssertEqual(receipt.overallOwnership, .fresh)
@@ -771,6 +839,12 @@ private actor LegacyIntegrationInstaller: IntegrationInstalling {
     func install() async throws { installCount += 1 }
     func repair() async throws {}
     func uninstall() async throws {}
+}
+
+private struct FailingArtifactInspector: IntegrationArtifactInspecting {
+    func names(in directory: URL) throws -> [String] {
+        throw IntegrationError.fileOperation("CANARY_INSPECTION_FAILURE")
+    }
 }
 
 private final class FailingSecondExchangeRenamer: IntegrationAtomicRenaming, @unchecked Sendable {

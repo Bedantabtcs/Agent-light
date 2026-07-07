@@ -11,7 +11,7 @@ Base HEAD: `5364a68b4094f22196a08b0cb0481e451fd48f2a`
 
 ## Protocol findings
 
-- `IntegrationInstalling` has no separate public verification or restoration method. Its concrete `install()` performs post-write verification and internal atomic rollback. The view model uses `uninstall()` only after an install is known to have committed.
+- `IntegrationInstalling` exposes authoritative install receipts plus read-only retained-artifact verification. Its concrete install still performs post-write verification and internal atomic rollback; artifact verification never deletes files.
 - `IntegrationError.committedWithCleanupFailure` means installation committed, so approval compensation uninstalls the owned entries. `IntegrationError.rollbackFailed` is not safe to compensate destructively; the view model preserves `repairRequired` across disconnect until `repairIntegrations()` succeeds.
 - `LoginItemControlling` exposes system approval indirectly: `setEnabled(true)` returns while `isEnabled()` remains false. The view model maps that outcome to the sanitized `loginApprovalRequired` presentation case and does not claim ownership of or disable a login item it did not enable.
 - `MonitoringOrchestrating.updates()` includes the current snapshot in the production implementation. The view model still reads `currentSnapshot()` first, then maintains one cancellable stream subscription guarded by a monitor epoch.
@@ -128,7 +128,7 @@ Starting commit: `117f46adc6488c7c5e67c6221a457b0f5f7dc8ed`
 - The observation task has an ID and epoch, clears only its own handle on natural completion, marks the connection disconnected/idle, and permits resubscription.
 - The stream loop holds the view model only while applying an update; deinitialization cancels all owned tasks and does not leave the stream subscribed.
 - HTTP 401/403 map to invalid credentials, 408 and 5xx plus selected URL/transport failures map offline, 429 maps rate-limited, capability errors map unsupported, and unknown errors remain sanitized.
-- All UI polling and scheduler-yield synchronization was replaced with call-number continuations, stream subscription/termination barriers, observation expectations, and explicit invocation barriers.
+- All UI polling and scheduler-yield synchronization was replaced with call-number continuations, stream subscription/termination barriers, observation expectations, and waiter-count barriers inside the shared operation/dependency test seams.
 
 ### Review RED evidence
 
@@ -200,4 +200,49 @@ Starting commit: `0a1e1bb8bfe99e786146c5a1ff0496fbbe52276a`
 
 ### Remaining concern
 
-- Artifact cleanup remains a typed, visible manual obligation because the installer does not expose a safe committed-artifact cleanup operation. It is intentionally not mislabeled as configuration repair.
+- Artifact cleanup remains a typed, visible manual obligation because the installer intentionally exposes verification but no automatic deletion. Manual cleanup can now be verified and the obligation cleared safely.
+
+---
+
+## Second Re-review Correction Batch
+
+Date: 2026-07-07
+Starting commit: `56c48e9d464daa1f99cc04232f9e1a3432036e87`
+
+### Receipt and artifact safety
+
+- `IntegrationInstallReceipt` now validates exactly one entry for every `AgentSource`; duplicates and omissions are invalid and resolve conservatively to mixed ownership.
+- Restored source-compatible `committedWithCleanupFailure([String])` and added a separate receipt-bearing committed error for the concrete installer. Legacy committed errors create mixed plus artifact obligations and are never destructively uninstalled.
+- Added `verifyArtifactCleanup()`. The concrete implementation scans only known configuration directories and exact Agent Light staged/rollback filename prefixes; it never removes files. Existing conformers receive a conservative `false` default.
+- Uninstall failures preserve `artifactCleanupFailure` across approval compensation, abandoned install/disconnect coordination, direct disconnect, and uninstall retry. Artifact failures are never downgraded to an ordinary uninstall retry.
+- Artifact repair clears the obligation only after verification confirms absence. Present artifacts and inspection errors remain repair-required.
+
+### Dependency-owned lifecycle
+
+- Added a Sendable ownership ledger actor. Installation, credential replacement/creation, login registration, monitoring ownership, and cleanup obligations are recorded immediately after each completed step.
+- Approval is one dependency-only transaction through install, credentials, login, monitor start, initial snapshot, and compensation. It returns a typed result and only weakly commits presentation state.
+- Disconnect creates an independent cleanup task from the ledger and pending operation completions. Caller cancellation or view-model deallocation does not cancel required monitor, login, credential, or integration cleanup.
+- Blocked monitor start, initial snapshot, compensation stop, integration uninstall, and disconnect-awaiting-approval tests prove the view model deallocates while ledger cleanup continues.
+
+### Shared operation and pause safety
+
+- Shared waiters now register before pre-cancellation is observed. A pre-canceled sole waiter unregisters immediately and cancels the zero-waiter driver.
+- Added deterministic waiter-count barriers inside `SharedOperation`; duplicate approval, pause, resume, repair, and disconnect tests wait for two registered callers before dependency release.
+- Initiating and noninitiating approval waiter cancellation both preserve one shared driver while another waiter remains.
+- Pause cancellation now returns a typed outcome. If resume compensation fails, the view model cancels observation, commits paused state, and presents a sanitized offline error instead of claiming monitoring.
+
+### RED/GREEN evidence
+
+- Receipt/error RED: missing validation APIs and legacy committed-error construction failed compilation. GREEN: validation, conservative invalid ownership, and both error forms pass.
+- Artifact RED: compensation/disconnect downgraded artifact failures, invalid receipts entered monitoring, and verified absence could not clear the obligation. GREEN: all six focused behaviors pass.
+- Pause RED: failed cancellation compensation left phase monitoring with no error. GREEN: phase is paused, observation is reset, and the error is offline.
+- Pre-cancel RED root cause was registration after the cancellation check; the regression test now observes dependency cancellation and view-model deallocation.
+
+### Verification
+
+- `swift test --filter IntegrationInstallerTests`: 32 passed, 0 failures.
+- `swift test --filter LoginItemControllerTests`: 8 passed, 0 failures.
+- `swift test --filter AppViewModelTests`: 71 passed, 0 failures.
+- Shared-waiter, cancellation, ledger, and deinit subset: 20 consecutive runs; 15 tests per run, 0 failures.
+- `swift test`: 340 passed, 0 failures.
+- `swift build -c release`: exit 0.
