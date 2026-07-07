@@ -5,6 +5,10 @@ import XCTest
 @testable import AgentLightCore
 
 final class IntegrationInstallerTests: XCTestCase {
+    func testFourArgumentPreviewInitializerRemainsSourceCompatible() {
+        let preview = IntegrationPreview(source: .codex, path: "/CANARY", before: "{}", after: "{}")
+        XCTAssertFalse(preview.hadOwnedEntries)
+    }
     func testReceiptValidationRequiresExactlyOneEntryForEverySource() throws {
         let complete = AgentSource.allCases.map {
             IntegrationSourceReceipt(source: $0, ownership: .fresh)

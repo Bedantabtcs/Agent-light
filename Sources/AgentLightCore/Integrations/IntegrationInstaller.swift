@@ -22,6 +22,10 @@ public struct IntegrationPreview: Equatable, Sendable {
         self.after = after
         self.hadOwnedEntries = hadOwnedEntries
     }
+
+    public init(source: AgentSource, path: String, before: String, after: String) {
+        self.init(source: source, path: path, before: before, after: after, hadOwnedEntries: false)
+    }
 }
 
 public enum IntegrationSourceOwnership: Equatable, Sendable {

@@ -234,6 +234,52 @@ Starting commit: `0a1e1bb8bfe99e786146c5a1ff0496fbbe52276a`
 
 ---
 
+## Final Ledger Lease Correction Batch
+
+Date: 2026-07-07
+Starting commit: `f23c014ff486e596e25da2dd6b21bb0cdec82a0b`
+
+### Hydration and single-flight ownership
+
+- Every actionable public view-model operation reloads the ownership ledger before dependency work. Locally non-actionable duplicate connect/approval calls are gated or join their existing shared operation.
+- `AppViewModeling` now exposes `synchronizeOwnership()`. Explicit synchronization cancels and awaits local connect work before applying the final leased snapshot, and it waits for an active approval transaction rather than applying an intermediate state.
+- `AppOwnershipLedger` now grants FIFO token leases. Approval and durable disconnect cleanup hold one lease across all external awaits and final ledger mutation; queued approvals revalidate ownership after acquiring the lease.
+- Integration repair also derives its plan from a snapshot taken after lease acquisition and retains that lease through the external repair and final ledger update.
+- Disconnect hydrates and cleans inside its durable dependency-owned lease. Caller cancellation and view-model deallocation do not cancel required cleanup.
+- Replacement view models wait for an active cleanup lease. A replacement connect cannot verify against an intermediate snapshot, and a replacement disconnect observes the completed cleanup without repeating monitor, login, credential, or integration side effects.
+
+### Compatibility and construction
+
+- Restored the four-argument `IntegrationPreview` initializer. It delegates to the ownership-aware initializer with conservative `hadOwnedEntries: false` behavior.
+- Restored the five-dependency `AppViewModel` initializer. It creates a private process-memory ledger for source compatibility.
+- The six-dependency initializer with an explicitly shared `AppOwnershipLedger` remains the recommended construction for replacement view models. The five-dependency convenience initializer cannot coordinate ownership across separately constructed view models because each instance owns a distinct ledger.
+- The ledger remains process-memory-only and intentionally does not persist credentials or cleanup state across application termination.
+
+### RED/GREEN evidence
+
+- RED: a previously synchronized replacement performed a second verification after another view model committed a cleanup obligation. GREEN: the action rehydrates and remains repair-required without verification.
+- RED: a replacement connect ran while old cleanup held a blocked uninstall, then lost the final obligation. GREEN: it waits for the lease, performs no new dependency action, and applies the committed uninstall-retry state.
+- RED: two view models queued approval and both installed, saved credentials, enabled login, and started monitoring. GREEN: the queued approval revalidates under the lease and adopts the completed transaction without repeating side effects.
+- RED: explicit synchronization during blocked local connect left phase `verifying`. GREEN: it cancels and awaits the connect generation, rejects the stale completion, and returns to onboarding.
+- GREEN: synchronization during blocked approval waits for the final transaction; replacement disconnect joins blocked cleanup with exactly one stop, login disable, credential delete, and uninstall.
+
+### Final verification
+
+- `swift test --filter AppViewModelTests`: 83 passed, 0 failures.
+- `swift test --filter IntegrationInstallerTests`: 33 passed, 0 failures.
+- `swift test --filter LoginItemControllerTests`: 8 passed, 0 failures.
+- Cross-instance hydration/lease subset: 20 consecutive runs; 6 tests per run, 0 failures.
+- `swift test`: 353 passed, 0 failures.
+- `swift build -c release`: exit 0.
+- `git diff --check`: exit 0 with no output.
+- Security scan: no polling/sleeps, debug output, dynamic evaluation, TODO/FIXME markers, force tries/casts, private-key markers, or non-canary test credentials in changed files.
+
+### Remaining concern
+
+- The compatibility initializer isolates its ledger by design. Callers that can replace a view model while work is active must inject and retain one shared `AppOwnershipLedger` through the six-dependency initializer.
+
+---
+
 ## Second Re-review Correction Batch
 
 Date: 2026-07-07

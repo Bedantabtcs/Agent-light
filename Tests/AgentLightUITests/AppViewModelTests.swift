@@ -5,6 +5,16 @@ import Observation
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testFiveDependencyInitializerRemainsSourceCompatible() {
+        let harness = ViewModelHarness()
+        _ = AppViewModel(
+            credentials: harness.credentials,
+            integrations: harness.integrations,
+            monitor: harness.monitor,
+            loginItem: harness.loginItem,
+            verifier: harness.verifier
+        )
+    }
     func testConnectTrimsEveryFieldBeforeVerificationAndDoesNotSaveCredentials() async throws {
         let harness = ViewModelHarness()
         let draft = ConnectionDraft(
@@ -1162,6 +1172,143 @@ final class AppViewModelTests: XCTestCase {
 
         XCTAssertEqual(replacement.outstandingObligations, [])
         XCTAssertEqual(replacement.phase, .onboarding)
+    }
+
+    func testEveryActionRehydratesAPreviouslySynchronizedReplacement() async {
+        let harness = ViewModelHarness()
+        let owner = makeViewModel(using: harness)
+        await owner.connect(using: harness.validDraft)
+        await owner.approveIntegrations()
+        let replacement = makeViewModel(using: harness)
+        await replacement.synchronizeOwnership()
+        await harness.integrations.setUninstallError(HarnessSensitiveError("CANARY_UNINSTALL"))
+        await owner.disconnect()
+
+        await replacement.connect(using: harness.validDraft)
+
+        let verifyCount = await harness.verifier.count()
+        XCTAssertEqual(verifyCount, 1)
+        XCTAssertEqual(replacement.phase, .repairRequired)
+        XCTAssertEqual(replacement.outstandingObligations, [.integrationUninstallRetry])
+    }
+
+    func testReplacementConnectWaitsForBlockedCleanupLeaseAndPreservesFinalObligation() async {
+        let harness = ViewModelHarness()
+        let owner = makeViewModel(using: harness)
+        await owner.connect(using: harness.validDraft)
+        await owner.approveIntegrations()
+        let replacement = makeViewModel(using: harness)
+        await replacement.synchronizeOwnership()
+        await harness.integrations.setUninstallError(HarnessSensitiveError("CANARY_UNINSTALL"))
+        await harness.integrations.blockUninstall()
+        let cleanup = Task { await owner.disconnect() }
+        await harness.integrations.waitForUninstallCount(1)
+
+        let connect = Task { await replacement.connect(using: harness.validDraft) }
+        await replacement.waitForActionEntry(.connect, count: 1)
+
+        let blockedVerifyCount = await harness.verifier.count()
+        let blockedUninstallCount = await harness.integrations.counts().uninstall
+        XCTAssertEqual(blockedVerifyCount, 1)
+        XCTAssertEqual(blockedUninstallCount, 1)
+        await harness.integrations.releaseUninstall()
+        await cleanup.value
+        await connect.value
+
+        let finalVerifyCount = await harness.verifier.count()
+        let finalUninstallCount = await harness.integrations.counts().uninstall
+        XCTAssertEqual(finalVerifyCount, 1)
+        XCTAssertEqual(finalUninstallCount, 1)
+        XCTAssertEqual(replacement.phase, .repairRequired)
+        XCTAssertEqual(replacement.outstandingObligations, [.integrationUninstallRetry])
+    }
+
+    func testReplacementDisconnectJoinsBlockedCleanupWithoutRepeatingExternalCleanup() async {
+        let harness = ViewModelHarness()
+        let owner = makeViewModel(using: harness)
+        await owner.connect(using: harness.validDraft)
+        await owner.approveIntegrations()
+        let replacement = makeViewModel(using: harness)
+        await harness.integrations.blockUninstall()
+        let ownerCleanup = Task { await owner.disconnect() }
+        await harness.integrations.waitForUninstallCount(1)
+
+        let replacementCleanup = Task { await replacement.disconnect() }
+        await replacement.waitForActionEntry(.disconnect, count: 1)
+        let blockedUninstallCount = await harness.integrations.counts().uninstall
+        XCTAssertEqual(blockedUninstallCount, 1)
+        await harness.integrations.releaseUninstall()
+        await ownerCleanup.value
+        await replacementCleanup.value
+
+        let finalUninstallCount = await harness.integrations.counts().uninstall
+        let monitorStopCount = await harness.monitor.metrics().stop
+        XCTAssertEqual(finalUninstallCount, 1)
+        XCTAssertEqual(harness.credentials.deleteCount, 1)
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
+        XCTAssertEqual(monitorStopCount, 1)
+        XCTAssertEqual(replacement.outstandingObligations, [])
+        XCTAssertEqual(replacement.phase, .onboarding)
+    }
+
+    func testSynchronizeDuringLocalConnectCancelsAndPreventsStaleApply() async {
+        let harness = ViewModelHarness()
+        await harness.verifier.block(call: 1)
+        let connect = Task { await harness.viewModel.connect(using: harness.validDraft) }
+        await harness.verifier.waitForVerifyCount(1)
+
+        let synchronization = Task { await harness.viewModel.synchronizeOwnership() }
+        await harness.verifier.waitForCancellationCount(1)
+        await harness.verifier.release(call: 1)
+        await connect.value
+        await synchronization.value
+
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+        XCTAssertEqual(harness.viewModel.integrationPreviews, [])
+        XCTAssertNil(harness.viewModel.presentedError)
+    }
+
+    func testSynchronizeDuringLocalApprovalWaitsForFinalTransactionWithoutStaleApply() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.integrations.blockInstall()
+        let approval = Task { await harness.viewModel.approveIntegrations() }
+        await harness.integrations.waitForInstallCount(1)
+
+        let synchronization = Task { await harness.viewModel.synchronizeOwnership() }
+        await harness.integrations.releaseInstall()
+        await approval.value
+        await synchronization.value
+
+        let counts = await harness.integrations.counts()
+        XCTAssertEqual(counts.install, 1)
+        XCTAssertEqual(harness.credentials.saveCount, 1)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+    }
+
+    func testQueuedApprovalRevalidatesLedgerAfterAcquiringLease() async {
+        let harness = ViewModelHarness()
+        let first = makeViewModel(using: harness)
+        let second = makeViewModel(using: harness)
+        await first.connect(using: harness.validDraft)
+        await second.connect(using: harness.validDraft)
+        await harness.integrations.blockInstall()
+        let firstApproval = Task { await first.approveIntegrations() }
+        await harness.integrations.waitForInstallCount(1)
+        let secondApproval = Task { await second.approveIntegrations() }
+        await second.waitForActionEntry(.approval, count: 1)
+
+        await harness.integrations.releaseInstall()
+        await firstApproval.value
+        await secondApproval.value
+
+        let installCount = await harness.integrations.counts().install
+        let monitorStartCount = await harness.monitor.metrics().start
+        XCTAssertEqual(installCount, 1)
+        XCTAssertEqual(harness.credentials.saveCount, 1)
+        XCTAssertEqual(harness.loginItem.enableCount, 1)
+        XCTAssertEqual(monitorStartCount, 1)
     }
 
     func testCanceledPauseCallerReturnsAndBlockedMonitorDoesNotRetainViewModel() async {
