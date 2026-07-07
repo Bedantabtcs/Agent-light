@@ -2783,6 +2783,45 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.loginItem.disableCount, 0)
     }
 
+    func testPauseBlockedReturningFromHydrationCannotRunAfterCompletedShutdown() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        harness.viewModel.blockNextOwnershipHydrationReturnForTesting()
+        let pause = Task { await harness.viewModel.pause() }
+        await harness.viewModel.waitForBlockedOwnershipHydrationReturnForTesting()
+
+        await harness.viewModel.shutdownMonitoring()
+        harness.viewModel.resumeBlockedOwnershipHydrationReturnForTesting()
+        await pause.value
+
+        let metrics = await harness.monitor.metrics()
+        let snapshot = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(metrics.pause, 0)
+        XCTAssertEqual(metrics.stop, 1)
+        XCTAssertFalse(harness.viewModel.monitoringActive)
+        XCTAssertFalse(snapshot.monitoringOwned)
+    }
+
+    func testResumeBlockedReturningFromHydrationCannotRunAfterCompletedShutdown() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.viewModel.pause()
+        harness.viewModel.blockNextOwnershipHydrationReturnForTesting()
+        let resume = Task { await harness.viewModel.resume() }
+        await harness.viewModel.waitForBlockedOwnershipHydrationReturnForTesting()
+
+        await harness.viewModel.shutdownMonitoring()
+        harness.viewModel.resumeBlockedOwnershipHydrationReturnForTesting()
+        await resume.value
+
+        let metrics = await harness.monitor.metrics()
+        let snapshot = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(metrics.resume, 0)
+        XCTAssertEqual(metrics.stop, 1)
+        XCTAssertFalse(harness.viewModel.monitoringActive)
+        XCTAssertFalse(snapshot.monitoringOwned)
+    }
+
     func testShutdownWaitsForApprovalAndDoesNotConvertItIntoRollback() async throws {
         let store = ControllableSetupOwnershipStore()
         let harness = ViewModelHarness(ownershipStore: store)
@@ -2813,6 +2852,49 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(integrationCounts.uninstall, 0)
         XCTAssertEqual(harness.loginItem.disableCount, 0)
         XCTAssertEqual(harness.viewModel.phase, .monitoring)
+    }
+
+    func testApprovalRefusesEntryAfterCompletedShutdownGeneration() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.viewModel.shutdownMonitoring()
+
+        await harness.viewModel.approveIntegrations()
+
+        let integrationCounts = await harness.integrations.counts()
+        let monitorMetrics = await harness.monitor.metrics()
+        XCTAssertEqual(integrationCounts.install, 0)
+        XCTAssertEqual(harness.credentials.saveCount, 0)
+        XCTAssertEqual(harness.loginItem.enableCount, 0)
+        XCTAssertEqual(monitorMetrics.start, 0)
+        XCTAssertEqual(harness.viewModel.phase, .integrationReview)
+    }
+
+    func testShutdownWaitsForActualApprovalCompensationAfterCallerCancellation() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.monitor.blockSnapshot()
+        let approval = Task { await harness.viewModel.approveIntegrations() }
+        await harness.monitor.waitForSnapshotCount(1)
+
+        approval.cancel()
+        await approval.value
+        let shutdown = Task { await harness.viewModel.shutdownMonitoring() }
+        await Task.yield()
+        let blockedMetrics = await harness.monitor.metrics()
+        XCTAssertEqual(blockedMetrics.stop, 0)
+
+        await harness.monitor.releaseSnapshot()
+        await shutdown.value
+
+        let integrationCounts = await harness.integrations.counts()
+        let monitorMetrics = await harness.monitor.metrics()
+        let snapshot = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(monitorMetrics.stop, 1)
+        XCTAssertEqual(harness.credentials.deleteCount, 1)
+        XCTAssertEqual(integrationCounts.uninstall, 1)
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
+        XCTAssertFalse(snapshot.hasOwnedState)
     }
 
     func testShutdownWaitsForResumeAndPreservesMonitoringSetupPhase() async throws {

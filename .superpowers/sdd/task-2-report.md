@@ -37,6 +37,40 @@
 
 No HOME configuration, real credentials, login item, hook file, bulb, installed app, browser, or GitHub state was accessed or mutated.
 
+## Review correction: generation and path-level lifecycle proof
+
+The Task 2 review identified two registration-window races and missing path-level integration coverage. The correction adds:
+
+- A monotonic monitoring lifecycle generation. Shutdown and explicit disconnect invalidate it synchronously before any suspension. Pause, resume, and approval claim the current generation synchronously and recheck it after pre-registration suspension points.
+- A completed shutdown remains authoritative after `shutdownTask` is cleared. Stale pause/resume entrants blocked at hydration cannot register an operation or call the monitor.
+- Registered pause/resume operations remain owned by shutdown and finish their explicit phase transition before the bulb restore. Explicit Connect and startup ownership synchronization create a new generation for intentional reactivation.
+- Approval registers its operation before its first suspension or refuses a generation already invalidated by shutdown. Shutdown awaits the underlying approval/compensation driver directly; cancellation-aware waiter return is not treated as child completion.
+- `AppEnvironment` no longer uses the pre-registration `startupApprovalInProgress` Boolean. Startup cancellation and shutdown run concurrently, so a not-yet-entered approval sees the advanced view-model generation while an already-registered approval is awaited through compensation.
+- A deterministic pre-approval test boundary is injected only through the internal environment initializer.
+- Real `AppEnvironment` + real `AppViewModel` path tests use only fake system boundaries and seed credentials, verified owned hooks, login registration, and a durable receipt. They cover stop, injected Quit, ready deinit, concurrent explicit Disconnect, queued restart, pre-approval stop, and Quit waiting for canceled-approval compensation.
+
+### Correction RED evidence
+
+- Pause/resume hydration-window tests first failed compilation on the missing deterministic gate. With the gate present, pause and resume each called the monitor once after shutdown completed; resume also reactivated monitoring.
+- The environment pre-approval-entry test failed compilation because `beforeApproval` did not exist.
+- The real path tests failed compilation until the real environment/view-model fixture and system-boundary fakes were added.
+- The first complete AppViewModel run exposed over-broad invalidation: registered pause/resume operations lost their phase transition, and explicit Connect after cleanup could not approve. The generation checks were narrowed to pre-registration entrants and Connect now activates a fresh generation.
+- The first release build failed because the DEBUG hydration gate lacked a non-DEBUG no-op. The release-only compile branch was added and reverified.
+
+### Correction verification
+
+- `swift test --filter AppEnvironmentTests`: 29 passed, 0 failures.
+- `swift test --filter AppViewModelTests`: 143 passed, 0 failures.
+- Real path-level lifecycle tests: 7 passed, 0 failures.
+- Stress: 20 full AppEnvironment runs and 20 focused generation/approval runs passed.
+- `swift test --parallel`: 489 tests executed, exit 0.
+- `swift build -c release`: exit 0.
+- `git diff --check`: clean.
+- Production security and scope scans: clean.
+- Process scan: no orphaned AgentLight XCTest process.
+
+The correction did not access or mutate HOME configuration, live credentials, login registration, hook files, a physical bulb, an installed app, browser state, or GitHub.
+
 ## Concerns
 
 - None blocking Task 2. Live launch-at-login relaunch and physical bulb restore remain manual acceptance checks outside automated implementation.

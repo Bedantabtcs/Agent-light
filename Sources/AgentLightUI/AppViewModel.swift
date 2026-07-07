@@ -150,6 +150,8 @@ public final class AppViewModel: AppViewModeling {
     @ObservationIgnored private var pendingCredentials: TuyaCredentials?
     @ObservationIgnored private var connectGeneration: UInt64 = 0
     @ObservationIgnored private var monitorEpoch: UInt64 = 0
+    @ObservationIgnored private var monitoringLifecycleGeneration: UInt64 = 0
+    @ObservationIgnored private var monitoringLifecycleShutdown = false
     @ObservationIgnored private var connectTask: SharedOperation?
     @ObservationIgnored private var observationTask: Task<Void, Never>?
     @ObservationIgnored private var observationID: UUID?
@@ -167,6 +169,10 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
     @ObservationIgnored private var actionEntryCounts: [OperationKind: Int] = [:]
     @ObservationIgnored private var actionEntryBarriers: [(OperationKind, Int, CheckedContinuation<Void, Never>)] = []
+    @ObservationIgnored private var shouldBlockNextOwnershipHydrationReturn = false
+    @ObservationIgnored private var ownershipHydrationReturnBlocked = false
+    @ObservationIgnored private var ownershipHydrationReturnContinuation: CheckedContinuation<Void, Never>?
+    @ObservationIgnored private var ownershipHydrationReturnWaiters: [CheckedContinuation<Void, Never>] = []
 #endif
 
     public init(
@@ -223,6 +229,7 @@ public final class AppViewModel: AppViewModeling {
         guard connectTask == nil,
               approvalTask == nil,
               phase == .onboarding || phase == .integrationReview else { return }
+        _ = activateMonitoringLifecycle()
         guard await hydrateOwnership() else { return }
         guard (phase == .onboarding || phase == .integrationReview),
               outstandingObligations.isEmpty,
@@ -261,10 +268,7 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
         recordActionEntry(.approval)
 #endif
-        if let shutdownTask {
-            await shutdownTask.wait()
-            return
-        }
+        guard let lifecycleGeneration = claimMonitoringLifecycleEntry() else { return }
         if let approvalTask {
             await approvalTask.wait()
             return
@@ -294,14 +298,21 @@ public final class AppViewModel: AppViewModeling {
                 await ledger.releaseLease(lease)
                 return
             }
+            guard self?.monitoringLifecycleAllows(lifecycleGeneration) == true else {
+                self?.cancelApproval(id: id)
+                await ledger.releaseLease(lease)
+                return
+            }
             let existing = await ledger.snapshot()
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled,
+                  self?.monitoringLifecycleAllows(lifecycleGeneration) == true else {
                 self?.cancelApproval(id: id)
                 await ledger.releaseLease(lease)
                 return
             }
             await ledger.registerPresentationHandle(presentationHandle)
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled,
+                  self?.monitoringLifecycleAllows(lifecycleGeneration) == true else {
                 self?.cancelApproval(id: id)
                 await ledger.releaseLease(lease)
                 return
@@ -346,36 +357,38 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
         recordActionEntry(.pause)
 #endif
-        if let shutdownTask {
-            await shutdownTask.wait()
-            return
-        }
+        guard let lifecycleGeneration = claimMonitoringLifecycleEntry() else { return }
         guard await hydrateOwnership() else { return }
+        guard monitoringLifecycleAllows(lifecycleGeneration) else { return }
         if let disconnectTask {
             await disconnectTask.wait()
             return
         }
         if let resumeTask {
             await resumeTask.wait()
+            guard monitoringLifecycleAllows(lifecycleGeneration) else { return }
         }
         if let pauseTask {
             await pauseTask.wait()
             return
         }
+        guard monitoringLifecycleAllows(lifecycleGeneration) else { return }
         guard phase == .monitoring else { return }
         let monitor = monitor
         let task = Task { [weak self, monitor] in
+            guard self?.monitoringLifecycleAllows(lifecycleGeneration) == true else { return }
             await monitor.pause()
+            guard let self else { return }
             if Task.isCancelled {
                 do {
                     try await monitor.resume()
-                    self?.applyPause(.cancelledAndRestored)
+                    self.applyPause(.cancelledAndRestored)
                 } catch {
-                    self?.applyPause(.pausedWithFailure(Self.presentationError(for: error)))
+                    self.applyPause(.pausedWithFailure(Self.presentationError(for: error)))
                 }
                 return
             }
-            self?.applyPause(.paused)
+            self.applyPause(.paused)
         }
         let operation = SharedOperation(task: task)
         pauseTask = operation
@@ -409,26 +422,27 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
         recordActionEntry(.resume)
 #endif
-        if let shutdownTask {
-            await shutdownTask.wait()
-            return
-        }
+        guard let lifecycleGeneration = claimMonitoringLifecycleEntry() else { return }
         guard await hydrateOwnership() else { return }
+        guard monitoringLifecycleAllows(lifecycleGeneration) else { return }
         if let disconnectTask {
             await disconnectTask.wait()
             return
         }
         if let pauseTask {
             await pauseTask.wait()
+            guard monitoringLifecycleAllows(lifecycleGeneration) else { return }
         }
         if let resumeTask {
             await resumeTask.wait()
             return
         }
+        guard monitoringLifecycleAllows(lifecycleGeneration) else { return }
         guard phase == .paused else { return }
         let monitor = monitor
         let task = Task { [weak self, monitor] in
             do {
+                guard self?.monitoringLifecycleAllows(lifecycleGeneration) == true else { return }
                 try await monitor.resume()
                 if Task.isCancelled {
                     await monitor.pause()
@@ -447,7 +461,8 @@ public final class AppViewModel: AppViewModeling {
                 self.ownsMonitoring = true
                 self.monitoringActive = true
                 self.installObservation(observation)
-                guard !Task.isCancelled, self.phase == .paused else { return }
+                guard !Task.isCancelled,
+                      self.phase == .paused else { return }
                 self.phase = .monitoring
                 self.presentedError = nil
             } catch {
@@ -563,6 +578,7 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
         recordActionEntry(.disconnect)
 #endif
+        invalidateMonitoringLifecycle()
         if let disconnectTask {
             await disconnectTask.wait()
             return
@@ -629,12 +645,13 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
         recordActionEntry(.shutdown)
 #endif
+        invalidateMonitoringLifecycle()
         if let disconnectTask {
-            await disconnectTask.wait()
+            await disconnectTask.waitForDriverCompletion()
             return
         }
         if let shutdownTask {
-            await shutdownTask.wait()
+            await shutdownTask.waitForDriverCompletion()
             return
         }
         let pendingApproval = approvalTask
@@ -644,10 +661,10 @@ public final class AppViewModel: AppViewModeling {
         let monitor = monitor
         let ledger = ownershipLedger
         let task = Task { [weak self, monitor, ledger] in
-            await pendingApproval?.wait()
-            await pendingPause?.wait()
-            await pendingResume?.wait()
-            await pendingRepair?.wait()
+            await pendingApproval?.waitForDriverCompletion()
+            await pendingPause?.waitForDriverCompletion()
+            await pendingResume?.waitForDriverCompletion()
+            await pendingRepair?.waitForDriverCompletion()
             do {
                 try await ledger.hydrate()
             } catch {
@@ -897,24 +914,44 @@ public final class AppViewModel: AppViewModeling {
     }
 
     public func synchronizeOwnership() async {
+        if let shutdownTask { await shutdownTask.waitForDriverCompletion() }
+        let lifecycleGeneration = activateMonitoringLifecycle()
         connectGeneration &+= 1
         let pendingConnect = connectTask
         pendingConnect?.cancel()
         await pendingConnect?.wait()
+        guard monitoringLifecycleAllows(lifecycleGeneration) else { return }
         do {
             try await ownershipLedger.hydrate()
         } catch {
             // The ledger has already replaced corrupt/unsupported state with a sanitized repair obligation.
         }
+        guard monitoringLifecycleAllows(lifecycleGeneration) else { return }
         guard let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        guard monitoringLifecycleAllows(lifecycleGeneration) else {
+            await ownershipLedger.releaseLease(lease)
+            return
+        }
         await ownershipLedger.registerPresentationHandle(presentationHandle)
+        guard monitoringLifecycleAllows(lifecycleGeneration) else {
+            await ownershipLedger.releaseLease(lease)
+            return
+        }
         let snapshot = await ownershipLedger.snapshot()
+        guard monitoringLifecycleAllows(lifecycleGeneration) else {
+            await ownershipLedger.releaseLease(lease)
+            return
+        }
         syncOwnership(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
         if snapshot.canResumeMonitoringAfterRelaunch {
             do {
+                guard monitoringLifecycleAllows(lifecycleGeneration) else {
+                    await ownershipLedger.releaseLease(lease)
+                    return
+                }
                 try await monitor.start()
-                if Task.isCancelled {
+                if Task.isCancelled || !monitoringLifecycleAllows(lifecycleGeneration) {
                     await monitor.stop()
                     await ownershipLedger.setMonitoringOwned(false)
                     await ownershipLedger.releaseLease(lease)
@@ -922,7 +959,7 @@ public final class AppViewModel: AppViewModeling {
                 }
                 await ownershipLedger.setMonitoringOwned(true)
                 let observation = await Self.preparedObservation(from: monitor)
-                if Task.isCancelled {
+                if Task.isCancelled || !monitoringLifecycleAllows(lifecycleGeneration) {
                     await monitor.stop()
                     await ownershipLedger.setMonitoringOwned(false)
                     await ownershipLedger.releaseLease(lease)
@@ -975,6 +1012,7 @@ public final class AppViewModel: AppViewModeling {
         guard !snapshot.obligations.isEmpty else {
             reconcileEmptyLedgerPresentation(snapshot)
             await ownershipLedger.releaseLease(lease)
+            await blockOwnershipHydrationReturnIfNeeded()
             return true
         }
         connectGeneration &+= 1
@@ -982,6 +1020,7 @@ public final class AppViewModel: AppViewModeling {
         phase = .repairRequired
         presentedError = Self.presentationError(for: snapshot)
         await ownershipLedger.releaseLease(lease)
+        await blockOwnershipHydrationReturnIfNeeded()
         return true
     }
 
@@ -993,7 +1032,53 @@ public final class AppViewModel: AppViewModeling {
         presentedError = nil
     }
 
+    private func claimMonitoringLifecycleEntry() -> UInt64? {
+        guard !monitoringLifecycleShutdown else { return nil }
+        return monitoringLifecycleGeneration
+    }
+
+    private func monitoringLifecycleAllows(_ generation: UInt64) -> Bool {
+        !monitoringLifecycleShutdown && monitoringLifecycleGeneration == generation
+    }
+
+    @discardableResult
+    private func activateMonitoringLifecycle() -> UInt64 {
+        monitoringLifecycleGeneration &+= 1
+        monitoringLifecycleShutdown = false
+        return monitoringLifecycleGeneration
+    }
+
+    private func invalidateMonitoringLifecycle() {
+        monitoringLifecycleGeneration &+= 1
+        monitoringLifecycleShutdown = true
+    }
+
 #if DEBUG
+    func blockNextOwnershipHydrationReturnForTesting() {
+        shouldBlockNextOwnershipHydrationReturn = true
+    }
+
+    func waitForBlockedOwnershipHydrationReturnForTesting() async {
+        if ownershipHydrationReturnBlocked { return }
+        await withCheckedContinuation { ownershipHydrationReturnWaiters.append($0) }
+    }
+
+    func resumeBlockedOwnershipHydrationReturnForTesting() {
+        ownershipHydrationReturnContinuation?.resume()
+        ownershipHydrationReturnContinuation = nil
+    }
+
+    private func blockOwnershipHydrationReturnIfNeeded() async {
+        guard shouldBlockNextOwnershipHydrationReturn else { return }
+        shouldBlockNextOwnershipHydrationReturn = false
+        ownershipHydrationReturnBlocked = true
+        let waiters = ownershipHydrationReturnWaiters
+        ownershipHydrationReturnWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { ownershipHydrationReturnContinuation = $0 }
+        ownershipHydrationReturnBlocked = false
+    }
+
     func waitForActionEntry(_ kind: OperationKind, count: Int) async {
         if actionEntryCounts[kind, default: 0] >= count { return }
         await withCheckedContinuation { actionEntryBarriers.append((kind, count, $0)) }
@@ -1023,6 +1108,10 @@ public final class AppViewModel: AppViewModeling {
         }
         await operation?.waitForWaiterCount(count)
     }
+#endif
+
+#if !DEBUG
+    private func blockOwnershipHydrationReturnIfNeeded() async {}
 #endif
 
     private static func connectResult(
@@ -2640,6 +2729,10 @@ private final class SharedOperation {
                 self?.cancelWaiter(id)
             }
         }
+    }
+
+    func waitForDriverCompletion() async {
+        await task.value
     }
 
     func onFinish(_ action: @escaping () -> Void) {

@@ -4,6 +4,7 @@ import XCTest
 import AppKit
 import SwiftUI
 import AgentLightCore
+import AgentLightProtocol
 import AgentLightUI
 @testable import AgentLightApp
 
@@ -288,6 +289,38 @@ final class AppEnvironmentTests: XCTestCase {
         await viewModel.releaseApproval()
         await stopping.value
         XCTAssertFalse(recorder.values.contains(.disconnect))
+        XCTAssertFalse(recorder.values.contains(.relayStart))
+    }
+
+    func testStopAdvancesShutdownBeforeApprovalMethodEntry() async throws {
+        let recorder = EnvironmentRecorder()
+        let approvalEntryGate = EnvironmentGate()
+        await approvalEntryGate.block()
+        let viewModel = EnvironmentViewModel(recorder: recorder)
+        let stored = TuyaCredentials(
+            endpoint: try XCTUnwrap(URL(string: "https://openapi.tuyain.com")),
+            accessID: "CANARY_ACCESS_ID",
+            accessSecret: "CANARY_ACCESS_SECRET",
+            deviceID: "CANARY_DEVICE_ID"
+        )
+        let environment = AppEnvironment(
+            viewModel: viewModel,
+            credentials: EnvironmentCredentials(recorder: recorder, stored: stored),
+            monitor: EnvironmentMonitor(recorder: recorder),
+            relay: EnvironmentRelay(recorder: recorder),
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {},
+            beforeApproval: { await approvalEntryGate.enter() }
+        )
+        environment.requestStart()
+        await approvalEntryGate.waitForEntry()
+
+        let stopping = Task { await environment.stop() }
+        await viewModel.waitForShutdownMonitoring()
+
+        XCTAssertFalse(recorder.values.contains(.approve))
+        await approvalEntryGate.release()
+        await stopping.value
         XCTAssertFalse(recorder.values.contains(.relayStart))
     }
 
@@ -582,6 +615,154 @@ final class AppEnvironmentTests: XCTestCase {
         let finalRelayCount = await relay.count()
         XCTAssertEqual(finalRelayCount, 1)
     }
+
+    func testRealLifecycleStopRetainsSeededSetupAndRestoresOnce() async throws {
+        let fixture = try PathLifecycleFixture(seededSetup: true)
+        let environment = fixture.makeEnvironment()
+        await environment.start()
+
+        await environment.stop()
+
+        let metrics = await fixture.metrics()
+        let receipt = try await fixture.receiptStore.load()
+        XCTAssertEqual(metrics, .retainedAfterSingleRestore)
+        XCTAssertEqual(receipt, fixture.seededReceipt)
+    }
+
+    func testRealLifecycleQuitRetainsSeededSetupBeforeInjectedTermination() async throws {
+        let fixture = try PathLifecycleFixture(seededSetup: true)
+        let environment = fixture.makeEnvironment(
+            terminateApplication: { fixture.recorder.append(.terminate) }
+        )
+        await environment.start()
+
+        environment.requestQuit()
+        await spinMainActor(until: { fixture.recorder.values.contains(.terminate) })
+
+        let metrics = await fixture.metrics()
+        let receipt = try await fixture.receiptStore.load()
+        XCTAssertEqual(metrics, .retainedAfterSingleRestore)
+        XCTAssertEqual(receipt, fixture.seededReceipt)
+    }
+
+    func testRealReadyEnvironmentDeinitRetainsSeededSetupAndRestoresOnce() async throws {
+        let fixture = try PathLifecycleFixture(seededSetup: true)
+        weak var weakEnvironment: AppEnvironment?
+        var environment: AppEnvironment? = fixture.makeEnvironment()
+        weakEnvironment = environment
+        await environment?.start()
+
+        environment = nil
+        XCTAssertNil(weakEnvironment)
+        await fixture.monitor.waitForStopCount(1)
+
+        let metrics = await fixture.metrics()
+        let receipt = try await fixture.receiptStore.load()
+        XCTAssertEqual(metrics, .retainedAfterSingleRestore)
+        XCTAssertEqual(receipt, fixture.seededReceipt)
+    }
+
+    func testRealEnvironmentStopConcurrentWithExplicitDisconnectRestoresOnceThenRemovesSetup() async throws {
+        let fixture = try PathLifecycleFixture(seededSetup: true)
+        let environment = fixture.makeEnvironment()
+        await environment.start()
+        await fixture.monitor.blockStop()
+
+        let stopping = Task { await environment.stop() }
+        await fixture.monitor.waitForStopCount(1)
+        let disconnecting = Task { await fixture.viewModel.disconnect() }
+        await Task.yield()
+        let blockedMetrics = await fixture.monitor.metrics()
+        XCTAssertEqual(blockedMetrics.stop, 1)
+
+        await fixture.monitor.releaseStop()
+        await stopping.value
+        await disconnecting.value
+
+        let metrics = await fixture.metrics()
+        let receipt = try await fixture.receiptStore.load()
+        XCTAssertEqual(metrics, .removedAfterSingleRestore)
+        XCTAssertNil(receipt)
+    }
+
+    func testRealQueuedRestartReusesReceiptWithoutReinstallOrCredentialRewrite() async throws {
+        let fixture = try PathLifecycleFixture(seededSetup: true)
+        let environment = fixture.makeEnvironment()
+        await environment.start()
+        await fixture.monitor.blockStop()
+
+        let stopping = Task { await environment.stop() }
+        await fixture.monitor.waitForStopCount(1)
+        environment.requestStart()
+        await fixture.monitor.releaseStop()
+        await stopping.value
+        await spinMainActor(until: { environment.status == .ready })
+
+        let metrics = await fixture.metrics()
+        let receipt = try await fixture.receiptStore.load()
+        XCTAssertEqual(metrics.monitorStarts, 2)
+        XCTAssertEqual(metrics.monitorStops, 1)
+        XCTAssertEqual(metrics.credentialSaves, 0)
+        XCTAssertEqual(metrics.integrationInstalls, 0)
+        XCTAssertEqual(receipt, fixture.seededReceipt)
+    }
+
+    func testRealQuitWaitsForCanceledApprovalCompensationBeforeTermination() async throws {
+        let fixture = try PathLifecycleFixture(seededSetup: false)
+        await fixture.monitor.blockSnapshot()
+        let environment = fixture.makeEnvironment(
+            terminateApplication: { fixture.recorder.append(.terminate) }
+        )
+        environment.requestStart()
+        await fixture.monitor.waitForSnapshot()
+
+        environment.requestQuit()
+        await Task.yield()
+        XCTAssertFalse(fixture.recorder.values.contains(.terminate))
+
+        await fixture.monitor.releaseSnapshot()
+        await spinMainActor(until: { fixture.recorder.values.contains(.terminate) })
+
+        let metrics = await fixture.metrics()
+        let receipt = try await fixture.receiptStore.load()
+        XCTAssertEqual(metrics, .compensatedAfterSingleRestore)
+        XCTAssertNil(receipt)
+    }
+
+    func testRealStopBeforeApprovalEntryPreventsSetupMutation() async throws {
+        let fixture = try PathLifecycleFixture(seededSetup: false)
+        let approvalEntryGate = EnvironmentGate()
+        await approvalEntryGate.block()
+        let environment = fixture.makeEnvironment(
+            beforeApproval: { await approvalEntryGate.enter() }
+        )
+        environment.requestStart()
+        await approvalEntryGate.waitForEntry()
+
+        let stopping = Task { await environment.stop() }
+        await spinMainActor(until: { fixture.recorder.values.contains(.relayStop) })
+        XCTAssertFalse(fixture.recorder.values.contains(.relayStart))
+
+        await approvalEntryGate.release()
+        await stopping.value
+
+        let metrics = await fixture.metrics()
+        let receipt = try await fixture.receiptStore.load()
+        XCTAssertEqual(
+            metrics,
+            PathLifecycleMetrics(
+                credentialSaves: 0,
+                credentialDeletes: 0,
+                integrationInstalls: 0,
+                integrationUninstalls: 0,
+                loginRegisters: 0,
+                loginUnregisters: 0,
+                monitorStarts: 0,
+                monitorStops: 0
+            )
+        )
+        XCTAssertNil(receipt)
+    }
 }
 
 @MainActor
@@ -868,5 +1049,297 @@ private actor EnvironmentGate {
         isBlocked = false
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+}
+
+private struct PathLifecycleMetrics: Equatable, Sendable {
+    let credentialSaves: Int
+    let credentialDeletes: Int
+    let integrationInstalls: Int
+    let integrationUninstalls: Int
+    let loginRegisters: Int
+    let loginUnregisters: Int
+    let monitorStarts: Int
+    let monitorStops: Int
+
+    static let retainedAfterSingleRestore = PathLifecycleMetrics(
+        credentialSaves: 0,
+        credentialDeletes: 0,
+        integrationInstalls: 0,
+        integrationUninstalls: 0,
+        loginRegisters: 0,
+        loginUnregisters: 0,
+        monitorStarts: 1,
+        monitorStops: 1
+    )
+
+    static let removedAfterSingleRestore = PathLifecycleMetrics(
+        credentialSaves: 0,
+        credentialDeletes: 1,
+        integrationInstalls: 0,
+        integrationUninstalls: 1,
+        loginRegisters: 0,
+        loginUnregisters: 1,
+        monitorStarts: 1,
+        monitorStops: 1
+    )
+
+    static let compensatedAfterSingleRestore = PathLifecycleMetrics(
+        credentialSaves: 2,
+        credentialDeletes: 0,
+        integrationInstalls: 1,
+        integrationUninstalls: 1,
+        loginRegisters: 1,
+        loginUnregisters: 1,
+        monitorStarts: 1,
+        monitorStops: 1
+    )
+}
+
+private final class PathCredentialStore: CredentialStoring, PreviousCredentialStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: TuyaCredentials?
+    private var previous: TuyaCredentials?
+    private var saves = 0
+    private var deletes = 0
+
+    init(stored: TuyaCredentials?) {
+        self.stored = stored
+    }
+
+    var saveCount: Int { lock.withLock { saves } }
+    var deleteCount: Int { lock.withLock { deletes } }
+
+    func save(_ credentials: TuyaCredentials) throws {
+        lock.withLock {
+            saves += 1
+            stored = credentials
+        }
+    }
+
+    func load() throws -> TuyaCredentials? { lock.withLock { stored } }
+
+    func delete() throws {
+        lock.withLock {
+            deletes += 1
+            stored = nil
+        }
+    }
+
+    func savePrevious(_ credentials: TuyaCredentials) throws {
+        lock.withLock { previous = credentials }
+    }
+
+    func loadPrevious() throws -> TuyaCredentials? { lock.withLock { previous } }
+
+    func deletePrevious() throws {
+        lock.withLock { previous = nil }
+    }
+}
+
+private actor PathIntegrationInstaller: IntegrationInstalling {
+    private let receipt: IntegrationInstallReceipt
+    private var installs = 0
+    private var uninstalls = 0
+
+    init(receipt: IntegrationInstallReceipt) {
+        self.receipt = receipt
+    }
+
+    func preview() async throws -> [IntegrationPreview] {
+        AgentSource.allCases.map {
+            IntegrationPreview(
+                source: $0,
+                path: "/CANARY/\($0.rawValue).json",
+                before: "{}",
+                after: "{}",
+                hadOwnedEntries: false
+            )
+        }
+    }
+
+    func install() async throws { installs += 1 }
+
+    func installWithReceipt() async throws -> IntegrationInstallReceipt {
+        installs += 1
+        return receipt
+    }
+
+    func repair() async throws {}
+    func repair(using receipt: IntegrationInstallReceipt) async throws -> IntegrationInstallReceipt { receipt }
+    func uninstall() async throws { uninstalls += 1 }
+    func uninstall(using receipt: IntegrationInstallReceipt) async throws { uninstalls += 1 }
+    func verifyArtifactCleanup() async throws -> Bool { false }
+    func metrics() -> (install: Int, uninstall: Int) { (installs, uninstalls) }
+}
+
+@MainActor
+private final class PathLoginItem: LoginItemControlling {
+    private var current: LoginItemStatus
+    private(set) var registerCount = 0
+    private(set) var unregisterCount = 0
+
+    init(current: LoginItemStatus) {
+        self.current = current
+    }
+
+    func status() -> LoginItemStatus { current }
+
+    func setEnabled(_ enabled: Bool) throws -> LoginItemTransition {
+        let previous = current
+        if enabled {
+            registerCount += 1
+            current = .enabled
+            return LoginItemTransition(
+                previous: previous,
+                current: current,
+                didRegister: previous != .enabled,
+                didUnregister: false
+            )
+        }
+        unregisterCount += 1
+        current = .notRegistered
+        return LoginItemTransition(
+            previous: previous,
+            current: current,
+            didRegister: false,
+            didUnregister: previous == .enabled || previous == .requiresApproval
+        )
+    }
+}
+
+private actor PathMonitor: MonitoringOrchestrating {
+    private let stopGate = EnvironmentGate()
+    private let snapshotGate = EnvironmentGate()
+    private var starts = 0
+    private var stops = 0
+
+    func start() async throws { starts += 1 }
+    func accept(_ event: AgentEvent) async {}
+    func pause() async {}
+    func resume() async throws {}
+
+    func stop() async {
+        stops += 1
+        await stopGate.enter()
+    }
+
+    func reconnect() async {}
+    func recoverIfNeeded() async throws {}
+
+    func updates() async -> AsyncStream<MonitoringSnapshot> {
+        AsyncStream { _ in }
+    }
+
+    func currentSnapshot() async -> MonitoringSnapshot {
+        await snapshotGate.enter()
+        return MonitoringSnapshot(state: .idle, sessions: [], connection: .connected)
+    }
+
+    func blockStop() async { await stopGate.block() }
+    func waitForStopCount(_ expected: Int) async {
+        while stops < expected { await Task.yield() }
+    }
+    func releaseStop() async { await stopGate.release() }
+    func blockSnapshot() async { await snapshotGate.block() }
+    func waitForSnapshot() async { await snapshotGate.waitForEntry() }
+    func releaseSnapshot() async { await snapshotGate.release() }
+    func metrics() -> (start: Int, stop: Int) { (starts, stops) }
+}
+
+private actor PathVerifier: TuyaConnectionVerifying {
+    func verify(_ credentials: TuyaCredentials) async throws -> ResolvedLightCapabilities {
+        let specification = TuyaSpecification(
+            category: "dj",
+            functions: [
+                TuyaDataPointSpecification(code: "switch_led", type: "Boolean", values: "{}"),
+                TuyaDataPointSpecification(
+                    code: "colour_data_v2",
+                    type: "Json",
+                    values: "{\"h\":{\"min\":0,\"max\":360,\"scale\":0,\"step\":1},\"s\":{\"min\":0,\"max\":1000,\"scale\":0,\"step\":1},\"v\":{\"min\":0,\"max\":1000,\"scale\":0,\"step\":1}}"
+                )
+            ],
+            status: []
+        )
+        return try TuyaCapabilityResolver.resolve(specification: specification)
+    }
+}
+
+@MainActor
+private final class PathLifecycleFixture {
+    let recorder = EnvironmentRecorder()
+    let credentialStore: PathCredentialStore
+    let integrations: PathIntegrationInstaller
+    let loginItem: PathLoginItem
+    let monitor = PathMonitor()
+    let receiptStore: MemorySetupOwnershipStore
+    let seededReceipt: SetupOwnershipReceipt
+    let viewModel: AppViewModel
+
+    init(seededSetup: Bool) throws {
+        let credentials = TuyaCredentials(
+            endpoint: try XCTUnwrap(URL(string: "https://openapi.tuyain.com")),
+            accessID: "CANARY_ACCESS_ID",
+            accessSecret: "CANARY_ACCESS_SECRET",
+            deviceID: "CANARY_DEVICE_ID"
+        )
+        let integrationReceipt = IntegrationInstallReceipt(
+            sources: AgentSource.allCases.map {
+                IntegrationSourceReceipt(
+                    source: $0,
+                    ownership: .fresh,
+                    marker: AppIdentity.integrationIdentifier,
+                    installedContentFingerprint: String(repeating: "d", count: 64)
+                )
+            }
+        )
+        seededReceipt = SetupOwnershipReceipt(
+            integration: .uninstallable(integrationReceipt),
+            credential: .created,
+            login: .owned
+        )
+        credentialStore = PathCredentialStore(stored: credentials)
+        integrations = PathIntegrationInstaller(receipt: integrationReceipt)
+        loginItem = PathLoginItem(current: seededSetup ? .enabled : .notRegistered)
+        receiptStore = MemorySetupOwnershipStore(receipt: seededSetup ? seededReceipt : nil)
+        viewModel = AppViewModel(
+            credentials: credentialStore,
+            integrations: integrations,
+            monitor: monitor,
+            loginItem: loginItem,
+            verifier: PathVerifier(),
+            ownershipLedger: AppOwnershipLedger(store: receiptStore)
+        )
+    }
+
+    func makeEnvironment(
+        beforeApproval: @escaping @Sendable () async -> Void = {},
+        terminateApplication: @escaping @MainActor @Sendable () -> Void = {}
+    ) -> AppEnvironment {
+        AppEnvironment(
+            viewModel: viewModel,
+            credentials: credentialStore,
+            monitor: monitor,
+            relay: EnvironmentRelay(recorder: recorder),
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {},
+            beforeApproval: beforeApproval,
+            terminateApplication: terminateApplication
+        )
+    }
+
+    func metrics() async -> PathLifecycleMetrics {
+        let integrationMetrics = await integrations.metrics()
+        let monitorMetrics = await monitor.metrics()
+        return PathLifecycleMetrics(
+            credentialSaves: credentialStore.saveCount,
+            credentialDeletes: credentialStore.deleteCount,
+            integrationInstalls: integrationMetrics.install,
+            integrationUninstalls: integrationMetrics.uninstall,
+            loginRegisters: loginItem.registerCount,
+            loginUnregisters: loginItem.unregisterCount,
+            monitorStarts: monitorMetrics.start,
+            monitorStops: monitorMetrics.stop
+        )
     }
 }
