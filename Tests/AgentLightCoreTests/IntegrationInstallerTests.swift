@@ -135,6 +135,7 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertEqual(previews.map(\.source), AgentSource.allCases)
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.codex.path))
         XCTAssertTrue(previews.allSatisfy { $0.before.isEmpty && $0.after.contains(AppIdentity.integrationIdentifier) })
+        XCTAssertTrue(previews.allSatisfy { !$0.hadOwnedEntries })
 
         try await installer.install()
         for url in paths.all.map(\.url) {
@@ -153,6 +154,35 @@ final class IntegrationInstallerTests: XCTestCase {
             XCTAssertEqual(try JSONValue.decode(Data(contentsOf: url)), .object([:]))
         }
         XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testPreviewReportsFullyPreexistingOwnedEntriesUsingExactParser() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+        try await installer.install()
+
+        let previews = try await installer.preview()
+
+        XCTAssertEqual(previews.map(\.hadOwnedEntries), [true, true, true])
+    }
+
+    func testPreviewReportsPartialPreexistingOwnedEntriesPerSource() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+        try await installer.install()
+        try FileManager.default.removeItem(at: paths.claudeCode)
+        try FileManager.default.removeItem(at: paths.cursor)
+
+        let previews = try await installer.preview()
+        let ownership = Dictionary(uniqueKeysWithValues: previews.map { ($0.source, $0.hadOwnedEntries) })
+
+        XCTAssertEqual(ownership[.codex], true)
+        XCTAssertEqual(ownership[.claudeCode], false)
+        XCTAssertEqual(ownership[.cursor], false)
     }
 
     func testInvalidExistingJSONFailsWithoutChangingFileOrLeavingArtifacts() async throws {

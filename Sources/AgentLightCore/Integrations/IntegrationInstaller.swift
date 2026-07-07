@@ -7,12 +7,20 @@ public struct IntegrationPreview: Equatable, Sendable {
     public let path: String
     public let before: String
     public let after: String
+    public let hadOwnedEntries: Bool
 
-    public init(source: AgentSource, path: String, before: String, after: String) {
+    public init(
+        source: AgentSource,
+        path: String,
+        before: String,
+        after: String,
+        hadOwnedEntries: Bool
+    ) {
         self.source = source
         self.path = path
         self.before = before
         self.after = after
+        self.hadOwnedEntries = hadOwnedEntries
     }
 }
 
@@ -87,6 +95,11 @@ public struct IntegrationConfigEditor: Sendable {
             root.removeValue(forKey: "version")
         }
         return try JSONValue.object(root).encodedData()
+    }
+
+    func hasOwnedEntries(in data: Data) throws -> Bool {
+        var root = try rootObject(from: data)
+        return removeOwnedCommands(from: &root)
     }
 
     private var events: [String] {
@@ -542,15 +555,17 @@ public struct IntegrationInstaller: IntegrationInstalling {
     public func preview() async throws -> [IntegrationPreview] {
         try paths.all.map { configuration in
             let before = try fileOperations.snapshot(at: configuration.url).data
-            let after = try IntegrationConfigEditor(
+            let editor = IntegrationConfigEditor(
                 source: configuration.source,
                 relayPath: relayPath
-            ).install(into: before)
+            )
+            let after = try editor.install(into: before)
             return IntegrationPreview(
                 source: configuration.source,
                 path: configuration.url.path,
                 before: String(decoding: before, as: UTF8.self),
-                after: String(decoding: after, as: UTF8.self)
+                after: String(decoding: after, as: UTF8.self),
+                hadOwnedEntries: try editor.hasOwnedEntries(in: before)
             )
         }
     }

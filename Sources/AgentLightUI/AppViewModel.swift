@@ -14,7 +14,7 @@ public protocol AppViewModeling: AnyObject {
     var sessions: [AgentEvent] { get }
     var integrationPreviews: [IntegrationPreview] { get }
     var presentedError: PresentationError? { get }
-    var requiresRepair: Bool { get }
+    var outstandingObligations: Set<OutstandingObligation> { get }
     func connect(using draft: ConnectionDraft) async
     func approveIntegrations() async
     func pause() async
@@ -59,6 +59,13 @@ public enum PresentationError: Error, Equatable, Sendable {
     case operationFailed
 }
 
+public enum OutstandingObligation: Hashable, Sendable {
+    case integration
+    case credentialRestore
+    case credentialDelete
+    case loginRegistrationCleanup
+}
+
 @MainActor
 @Observable
 public final class AppViewModel: AppViewModeling {
@@ -68,7 +75,7 @@ public final class AppViewModel: AppViewModeling {
     public private(set) var sessions: [AgentEvent] = []
     public private(set) var integrationPreviews: [IntegrationPreview] = []
     public private(set) var presentedError: PresentationError?
-    public private(set) var requiresRepair = false
+    public private(set) var outstandingObligations: Set<OutstandingObligation> = []
 
     @ObservationIgnored private let credentials: any CredentialStoring
     @ObservationIgnored private let integrations: any IntegrationInstalling
@@ -81,17 +88,18 @@ public final class AppViewModel: AppViewModeling {
     @ObservationIgnored private var monitorEpoch: UInt64 = 0
     @ObservationIgnored private var connectTask: Task<Void, Never>?
     @ObservationIgnored private var observationTask: Task<Void, Never>?
+    @ObservationIgnored private var observationID: UUID?
     @ObservationIgnored private var approvalTask: Task<Void, Never>?
     @ObservationIgnored private var approvalID: UUID?
     @ObservationIgnored private var pauseTask: Task<Void, Never>?
     @ObservationIgnored private var resumeTask: Task<Void, Never>?
     @ObservationIgnored private var repairTask: Task<Void, Never>?
     @ObservationIgnored private var disconnectTask: Task<Void, Never>?
-    @ObservationIgnored private var ownsIntegrations = false
-    @ObservationIgnored private var ownsCredentials = false
+    @ObservationIgnored private var integrationOwnership: IntegrationOwnership = .none
+    @ObservationIgnored private var pendingIntegrationOwnership: IntegrationOwnership = .none
+    @ObservationIgnored private var credentialOwnership: CredentialOwnership = .none
+    @ObservationIgnored private var loginRegistrationOwned = false
     @ObservationIgnored private var ownsMonitoring = false
-    @ObservationIgnored private var integrationStateUncertain = false
-    @ObservationIgnored private var setupApproved = false
     @ObservationIgnored private var disconnectedCleanupComplete = false
 
     public init(
@@ -108,19 +116,20 @@ public final class AppViewModel: AppViewModeling {
         self.verifier = verifier
     }
 
+    deinit {
+        observationTask?.cancel()
+        connectTask?.cancel()
+        approvalTask?.cancel()
+        pauseTask?.cancel()
+        resumeTask?.cancel()
+        repairTask?.cancel()
+        disconnectTask?.cancel()
+    }
+
     public func connect(using draft: ConnectionDraft) async {
-        if let pendingApproval = approvalTask {
-            pendingApproval.cancel()
-            await pendingApproval.value
-            approvalTask = nil
-            approvalID = nil
-        }
-        guard !integrationStateUncertain else {
-            phase = .repairRequired
-            requiresRepair = true
-            presentedError = .integrationConflict
-            return
-        }
+        guard (phase == .onboarding || phase == .integrationReview),
+              outstandingObligations.isEmpty,
+              approvalTask == nil else { return }
         connectGeneration &+= 1
         let generation = connectGeneration
         connectTask?.cancel()
@@ -128,9 +137,9 @@ public final class AppViewModel: AppViewModeling {
         phase = .verifying
         connectionStatus = .disconnected
         presentedError = nil
-        requiresRepair = false
         integrationPreviews = []
         pendingCredentials = nil
+        pendingIntegrationOwnership = .none
         disconnectedCleanupComplete = false
 
         let task = Task { [weak self] in
@@ -149,7 +158,9 @@ public final class AppViewModel: AppViewModeling {
             await approvalTask.value
             return
         }
-        guard (phase == .integrationReview || phase == .repairRequired), pendingCredentials != nil else {
+        guard phase == .integrationReview,
+              outstandingObligations.isEmpty,
+              pendingCredentials != nil else {
             return
         }
         let id = UUID()
@@ -245,16 +256,17 @@ public final class AppViewModel: AppViewModeling {
             do {
                 try await self.integrations.repair()
                 guard !Task.isCancelled else { return }
-                self.ownsIntegrations = true
-                self.integrationStateUncertain = false
-                self.requiresRepair = false
-                self.presentedError = nil
+                self.integrationOwnership = .preexisting
+                self.outstandingObligations.remove(.integration)
                 if originalPhase == .repairRequired {
-                    self.phase = self.pendingCredentials == nil ? .onboarding : .integrationReview
+                    if self.outstandingObligations.isEmpty {
+                        self.presentedError = nil
+                        self.phase = self.pendingCredentials == nil ? .onboarding : .integrationReview
+                    }
                 }
             } catch {
                 guard !Task.isCancelled else { return }
-                self.requiresRepair = true
+                self.outstandingObligations.insert(.integration)
                 self.phase = .repairRequired
                 self.presentedError = Self.presentationError(for: error)
             }
@@ -318,6 +330,7 @@ public final class AppViewModel: AppViewModeling {
             guard isCurrentConnect(generation) else { return }
             pendingCredentials = temporary
             integrationPreviews = previews
+            pendingIntegrationOwnership = Self.integrationOwnership(for: previews)
             presentedError = nil
             phase = .integrationReview
         } catch is CancellationError {
@@ -335,28 +348,25 @@ public final class AppViewModel: AppViewModeling {
         guard let pendingCredentials else { return }
         phase = .approving
         presentedError = nil
-        requiresRepair = false
 
         var installed = false
         var saved = false
-        var enabledLogin = false
         var startedMonitoring = false
-        var priorCredentials: TuyaCredentials?
 
         do {
             do {
                 try await integrations.install()
                 installed = true
-                ownsIntegrations = true
+                integrationOwnership = pendingIntegrationOwnership
             } catch let error as IntegrationError {
                 switch error {
                 case .committedWithCleanupFailure:
                     installed = true
-                    ownsIntegrations = true
+                    integrationOwnership = pendingIntegrationOwnership
                     throw error
                 case .rollbackFailed:
-                    integrationStateUncertain = true
-                    requiresRepair = true
+                    integrationOwnership = .uncertain
+                    outstandingObligations.insert(.integration)
                     phase = .repairRequired
                     presentedError = .integrationConflict
                     return
@@ -366,15 +376,14 @@ public final class AppViewModel: AppViewModeling {
             }
             try ensureCurrentApproval(id)
 
-            priorCredentials = try credentials.load()
+            let priorCredentials = try credentials.load()
             try credentials.save(pendingCredentials)
             saved = true
-            ownsCredentials = true
+            credentialOwnership = priorCredentials.map(CredentialOwnership.replaced) ?? .created
 
-            let loginWasEnabled = loginItem.isEnabled()
-            try loginItem.setEnabled(true)
-            guard loginItem.isEnabled() else { throw InternalError.loginApprovalRequired }
-            enabledLogin = !loginWasEnabled
+            let loginTransition = try loginItem.setEnabled(true)
+            loginRegistrationOwned = loginTransition.didRegister
+            guard loginTransition.current == .enabled else { throw InternalError.loginApprovalRequired }
 
             try ensureCurrentApproval(id)
             try await monitor.start()
@@ -384,7 +393,6 @@ public final class AppViewModel: AppViewModeling {
             await beginObservation()
             try ensureCurrentApproval(id)
 
-            setupApproved = true
             disconnectedCleanupComplete = false
             phase = .monitoring
             presentedError = nil
@@ -392,8 +400,6 @@ public final class AppViewModel: AppViewModeling {
             await compensateApproval(
                 installed: installed,
                 saved: saved,
-                priorCredentials: priorCredentials,
-                enabledLogin: enabledLogin,
                 startedMonitoring: startedMonitoring,
                 originalError: nil
             )
@@ -401,8 +407,6 @@ public final class AppViewModel: AppViewModeling {
             await compensateApproval(
                 installed: installed,
                 saved: saved,
-                priorCredentials: priorCredentials,
-                enabledLogin: enabledLogin,
                 startedMonitoring: startedMonitoring,
                 originalError: error
             )
@@ -412,89 +416,109 @@ public final class AppViewModel: AppViewModeling {
     private func compensateApproval(
         installed: Bool,
         saved: Bool,
-        priorCredentials: TuyaCredentials?,
-        enabledLogin: Bool,
         startedMonitoring: Bool,
         originalError: (any Error)?
     ) async {
-        var compensationFailed = false
         cancelObservation(resetState: true)
 
         if startedMonitoring {
             await monitor.stop()
             ownsMonitoring = false
         }
-        if enabledLogin {
-            do { try loginItem.setEnabled(false) } catch { compensationFailed = true }
-        }
-        if saved {
-            do {
-                if let priorCredentials {
-                    try credentials.save(priorCredentials)
-                } else {
-                    try credentials.delete()
-                }
-                ownsCredentials = false
-            } catch {
-                compensationFailed = true
-            }
-        }
-        if installed {
-            do {
-                try await integrations.uninstall()
-                ownsIntegrations = false
-            } catch {
-                compensationFailed = true
-            }
-        }
+        cleanupLoginRegistration()
+        if saved { cleanupCredentials() }
+        if installed { await cleanupIntegrations() }
 
-        setupApproved = false
-        requiresRepair = compensationFailed
-        phase = compensationFailed ? .repairRequired : .integrationReview
+        phase = outstandingObligations.isEmpty ? .integrationReview : .repairRequired
         if let originalError {
             presentedError = Self.presentationError(for: originalError)
         }
     }
 
     private func performDisconnect() async {
-        var cleanupFailed = integrationStateUncertain
-
         if ownsMonitoring {
             await monitor.stop()
             ownsMonitoring = false
         }
-        if setupApproved || loginItem.isEnabled() {
-            do { try loginItem.setEnabled(false) } catch { cleanupFailed = true }
-        }
-        if ownsCredentials {
-            do {
-                try credentials.delete()
-                ownsCredentials = false
-            } catch {
-                cleanupFailed = true
-            }
-        }
-        if ownsIntegrations {
-            do {
-                try await integrations.uninstall()
-                ownsIntegrations = false
-            } catch {
-                cleanupFailed = true
-            }
-        }
+        cleanupLoginRegistration()
+        cleanupCredentials()
+        await cleanupIntegrations()
 
         pendingCredentials = nil
         integrationPreviews = []
         currentState = .idle
         sessions = []
         connectionStatus = .disconnected
-        setupApproved = false
-        requiresRepair = cleanupFailed
-        phase = cleanupFailed ? .repairRequired : .onboarding
-        presentedError = integrationStateUncertain
-            ? .integrationConflict
-            : (cleanupFailed ? .operationFailed : nil)
-        disconnectedCleanupComplete = !cleanupFailed
+        phase = outstandingObligations.isEmpty ? .onboarding : .repairRequired
+        if outstandingObligations.isEmpty {
+            presentedError = nil
+        } else if presentedError == nil {
+            presentedError = outstandingObligations.contains(.integration)
+                ? .integrationConflict
+                : .operationFailed
+        }
+        disconnectedCleanupComplete = outstandingObligations.isEmpty
+    }
+
+    private func cleanupLoginRegistration() {
+        guard loginRegistrationOwned else {
+            outstandingObligations.remove(.loginRegistrationCleanup)
+            return
+        }
+        do {
+            _ = try loginItem.setEnabled(false)
+            loginRegistrationOwned = false
+            outstandingObligations.remove(.loginRegistrationCleanup)
+        } catch {
+            outstandingObligations.insert(.loginRegistrationCleanup)
+        }
+    }
+
+    private func cleanupCredentials() {
+        do {
+            switch credentialOwnership {
+            case .none:
+                outstandingObligations.remove(.credentialRestore)
+                outstandingObligations.remove(.credentialDelete)
+                return
+            case .created:
+                try credentials.delete()
+                outstandingObligations.remove(.credentialDelete)
+            case let .replaced(previous):
+                try credentials.save(previous)
+                outstandingObligations.remove(.credentialRestore)
+            }
+            credentialOwnership = .none
+        } catch {
+            switch credentialOwnership {
+            case .created:
+                outstandingObligations.insert(.credentialDelete)
+            case .replaced:
+                outstandingObligations.insert(.credentialRestore)
+            case .none:
+                break
+            }
+        }
+    }
+
+    private func cleanupIntegrations() async {
+        switch integrationOwnership {
+        case .none:
+            return
+        case .preexisting:
+            integrationOwnership = .none
+            outstandingObligations.remove(.integration)
+        case .uninstallable:
+            do {
+                try await integrations.uninstall()
+                integrationOwnership = .none
+                outstandingObligations.remove(.integration)
+            } catch {
+                outstandingObligations.insert(.integration)
+            }
+        case .mixed, .uncertain:
+            outstandingObligations.insert(.integration)
+        }
     }
 
     private func beginObservation() async {
@@ -508,22 +532,42 @@ public final class AppViewModel: AppViewModeling {
         apply(snapshot)
         let stream = await monitor.updates()
         guard epoch == monitorEpoch, !Task.isCancelled else { return }
+        let id = UUID()
+        observationID = id
         observationTask = Task { [weak self] in
-            for await update in stream {
-                guard let self, epoch == self.monitorEpoch, !Task.isCancelled else { return }
-                self.apply(update)
+            var iterator = stream.makeAsyncIterator()
+            while let update = await iterator.next() {
+                guard !Task.isCancelled else { return }
+                do {
+                    guard let owner = self,
+                          owner.observationID == id,
+                          epoch == owner.monitorEpoch else { return }
+                    owner.apply(update)
+                }
             }
+            guard !Task.isCancelled else { return }
+            self?.observationEnded(id: id, epoch: epoch)
         }
     }
 
     private func cancelObservation(resetState: Bool) {
         monitorEpoch &+= 1
+        observationID = nil
         observationTask?.cancel()
         observationTask = nil
         if resetState {
             currentState = .idle
             sessions = []
         }
+    }
+
+    private func observationEnded(id: UUID, epoch: UInt64) {
+        guard observationID == id, monitorEpoch == epoch else { return }
+        observationID = nil
+        observationTask = nil
+        connectionStatus = .disconnected
+        currentState = .idle
+        sessions = []
     }
 
     private func apply(_ snapshot: MonitoringSnapshot) {
@@ -569,6 +613,16 @@ public final class AppViewModel: AppViewModeling {
         )
     }
 
+    private static func integrationOwnership(
+        for previews: [IntegrationPreview]
+    ) -> IntegrationOwnership {
+        guard !previews.isEmpty else { return .uncertain }
+        let existingCount = previews.count(where: \.hadOwnedEntries)
+        if existingCount == 0 { return .uninstallable }
+        if existingCount == previews.count { return .preexisting }
+        return .mixed
+    }
+
     private static func presentationError(for error: any Error) -> PresentationError {
         if let validation = error as? ValidationError {
             switch validation {
@@ -586,6 +640,7 @@ public final class AppViewModel: AppViewModeling {
             case .transport: return .bulbOffline
             case .httpStatus(429): return .rateLimited
             case .httpStatus(401), .httpStatus(403): return .invalidCredential
+            case .httpStatus(408), .httpStatus(500...599): return .bulbOffline
             case .httpStatus, .malformedResponse, .apiFailure: return .operationFailed
             }
         }
@@ -611,4 +666,18 @@ private enum ValidationError: Error {
 
 private enum InternalError: Error {
     case loginApprovalRequired
+}
+
+private enum CredentialOwnership: Equatable {
+    case none
+    case created
+    case replaced(TuyaCredentials)
+}
+
+private enum IntegrationOwnership: Equatable {
+    case none
+    case uninstallable
+    case preexisting
+    case mixed
+    case uncertain
 }

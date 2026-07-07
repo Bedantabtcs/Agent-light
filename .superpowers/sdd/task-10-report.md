@@ -104,4 +104,51 @@ GREEN: exit 0; 1 test passed after uncertain ownership was retained as `repairRe
 ## Concerns for review
 
 - Repair after `IntegrationError.rollbackFailed` requires explicit user action because the current installer protocol cannot prove ownership or restore an exact pre-attempt snapshot.
-- System login approval cannot be distinguished from other non-enabled service statuses through the public protocol; the exposed behavior is intentionally conservative and sanitized.
+- The original boolean login-boundary concern below was resolved by the review correction batch, which added explicit status and transition ownership.
+
+---
+
+## Review Correction Batch
+
+Date: 2026-07-07
+Starting commit: `117f46adc6488c7c5e67c6221a457b0f5f7dc8ed`
+
+### Ownership and cleanup
+
+- Approval now retains whether credentials were newly created or replaced a prior item. Compensation and disconnect delete only newly created credentials and restore replaced credentials.
+- Credential delete/restore failures remain retryable as typed `credentialDelete` or `credentialRestore` obligations.
+- Login cleanup uses Task 9 transition ownership. Pre-enabled and preexisting approval-pending registrations are never disabled; a registration created by the approval attempt is unregistered even when it enters system-approval state.
+- Integration previews now carry exact per-source `hadOwnedEntries` metadata from the installer parser. Fresh installs are uninstallable; fully preexisting installs are preserved; mixed installs are preserved with an explicit integration obligation.
+- `rollbackFailed` cannot be approved again. Explicit repair is required and clears only the integration obligation.
+- The boolean repair flag was replaced with `Set<OutstandingObligation>` covering integration, credential restore/delete, and login registration cleanup.
+
+### State and observation
+
+- Connect is accepted only from onboarding or integration review with no outstanding obligations. Calls during verification, approval, monitoring, pause, or repair state are ignored without disturbing monitoring.
+- The observation task has an ID and epoch, clears only its own handle on natural completion, marks the connection disconnected/idle, and permits resubscription.
+- The stream loop holds the view model only while applying an update; deinitialization cancels all owned tasks and does not leave the stream subscribed.
+- HTTP 401/403 map to invalid credentials, 408 and 5xx plus selected URL/transport failures map offline, 429 maps rate-limited, capability errors map unsupported, and unknown errors remain sanitized.
+- All UI polling and scheduler-yield synchronization was replaced with call-number continuations, stream subscription/termination barriers, observation expectations, and explicit invocation barriers.
+
+### Review RED evidence
+
+- `swift test --filter LoginItemControllerTests`: exit 1; missing status and transition ownership types.
+- `swift test --filter IntegrationInstallerTests/testPreviewReports`: exit 1; `IntegrationPreview.hadOwnedEntries` missing.
+- Ownership matrix compile RED: `AppViewModel.outstandingObligations` and typed obligation cases missing.
+- Natural stream/deinit focused run did not complete because the completed observation handle retained the model and prevented resubscription/cancellation.
+
+### Review GREEN and final verification
+
+- `swift test --filter LoginItemControllerTests`: 8 passed, 0 failures.
+- `swift test --filter IntegrationInstallerTests`: 24 passed, 0 failures.
+- `swift test --filter AgentLightUITests`: 44 passed, 0 failures.
+- Concurrency/stale-stream subset: 20 consecutive runs passed under a 60-second process alarm.
+- `swift test`: 305 passed, 0 failures.
+- `swift build -c release`: exit 0.
+- `git diff --cached --check`: exit 0 with no output.
+- Security/orphan scan: no polling/yields, removed boolean repair/login APIs, force casts/tries, debug output, dynamic evaluation, TODO/FIXME markers, production credential literals, or orphaned old API references.
+- Test credential scan: explicit `CANARY_*` values and intentional blank validation fields only.
+
+### Remaining concern
+
+- Mixed preexisting integration ownership cannot be destructively separated with the current installer API. Agent Light preserves all entries and requires explicit repair/adoption instead of removing entries that may predate this approval attempt.

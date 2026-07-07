@@ -1,5 +1,6 @@
 import XCTest
 import AgentLightCore
+import Observation
 @testable import AgentLightUI
 
 @MainActor
@@ -29,12 +30,12 @@ final class AppViewModelTests: XCTestCase {
 
     func testConnectRejectsInvalidFieldsBeforeCallingDependencies() async {
         let invalidDrafts = [
-            ConnectionDraft(endpoint: "http://openapi.tuyaus.com", accessID: "a", accessSecret: "s", deviceID: "d"),
-            ConnectionDraft(endpoint: "https://user@openapi.tuyaus.com", accessID: "a", accessSecret: "s", deviceID: "d"),
-            ConnectionDraft(endpoint: "https://openapi.tuyaus.com/path", accessID: "a", accessSecret: "s", deviceID: "d"),
-            ConnectionDraft(endpoint: "https://openapi.tuyaus.com", accessID: " ", accessSecret: "s", deviceID: "d"),
-            ConnectionDraft(endpoint: "https://openapi.tuyaus.com", accessID: "a", accessSecret: " ", deviceID: "d"),
-            ConnectionDraft(endpoint: "https://openapi.tuyaus.com", accessID: "a", accessSecret: "s", deviceID: " ")
+            ConnectionDraft(endpoint: "http://openapi.tuyaus.com", accessID: "CANARY_ID", accessSecret: "CANARY_SECRET", deviceID: "CANARY_DEVICE"),
+            ConnectionDraft(endpoint: "https://user@openapi.tuyaus.com", accessID: "CANARY_ID", accessSecret: "CANARY_SECRET", deviceID: "CANARY_DEVICE"),
+            ConnectionDraft(endpoint: "https://openapi.tuyaus.com/path", accessID: "CANARY_ID", accessSecret: "CANARY_SECRET", deviceID: "CANARY_DEVICE"),
+            ConnectionDraft(endpoint: "https://openapi.tuyaus.com", accessID: " ", accessSecret: "CANARY_SECRET", deviceID: "CANARY_DEVICE"),
+            ConnectionDraft(endpoint: "https://openapi.tuyaus.com", accessID: "CANARY_ID", accessSecret: " ", deviceID: "CANARY_DEVICE"),
+            ConnectionDraft(endpoint: "https://openapi.tuyaus.com", accessID: "CANARY_ID", accessSecret: "CANARY_SECRET", deviceID: " ")
         ]
 
         for draft in invalidDrafts {
@@ -138,11 +139,11 @@ final class AppViewModelTests: XCTestCase {
 
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
         XCTAssertEqual(harness.viewModel.presentedError, .rateLimited)
-        XCTAssertTrue(harness.viewModel.requiresRepair)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integration])
         XCTAssertFalse(String(describing: harness.viewModel.presentedError).contains("CANARY"))
     }
 
-    func testSecondConnectSupersedesCancellationIgnoringFirstVerification() async {
+    func testSecondConnectDuringVerificationIsIgnoredWithoutCancelingFirst() async {
         let harness = ViewModelHarness()
         await harness.verifier.block(call: 1)
         let first = Task { await harness.viewModel.connect(using: harness.validDraft) }
@@ -157,11 +158,11 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.phase, .integrationReview)
         let captured = await harness.verifier.capturedCredentials()
         let previewCount = await harness.integrations.counts().preview
-        XCTAssertEqual(captured?.deviceID, "CANARY_SECOND_DEVICE")
+        XCTAssertEqual(captured?.deviceID, "CANARY_DEVICE_ID")
         XCTAssertEqual(previewCount, 1)
     }
 
-    func testSecondConnectSupersedesCancellationIgnoringFirstPreview() async {
+    func testSecondConnectDuringPreviewIsIgnoredWithoutCancelingFirst() async {
         let harness = ViewModelHarness()
         await harness.integrations.blockPreview()
         let first = Task { await harness.viewModel.connect(using: harness.validDraft) }
@@ -176,7 +177,7 @@ final class AppViewModelTests: XCTestCase {
 
         XCTAssertEqual(harness.viewModel.phase, .integrationReview)
         let captured = await harness.verifier.capturedCredentials()
-        XCTAssertEqual(captured?.deviceID, "CANARY_SECOND_DEVICE")
+        XCTAssertEqual(captured?.deviceID, "CANARY_DEVICE_ID")
     }
 
     func testDisconnectDuringVerificationPreventsStaleCompletionMutation() async {
@@ -202,8 +203,12 @@ final class AppViewModelTests: XCTestCase {
         await harness.integrations.blockInstall()
         let first = Task { await harness.viewModel.approveIntegrations() }
         await harness.integrations.waitForInstallCount(1)
-        let second = Task { await harness.viewModel.approveIntegrations() }
-        await Task.yield()
+        let overlap = AsyncInvocationBarrier()
+        let second = Task {
+            await overlap.arrive()
+            await harness.viewModel.approveIntegrations()
+        }
+        await overlap.wait()
         await harness.integrations.releaseInstall()
         await first.value
         await second.value
@@ -215,6 +220,22 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(startCount, 1)
     }
 
+    func testConnectDuringApprovalIsIgnoredWithoutStartingAnotherVerification() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.integrations.blockInstall()
+        let approval = Task { await harness.viewModel.approveIntegrations() }
+        await harness.integrations.waitForInstallCount(1)
+
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        let verifyCount = await harness.verifier.count()
+        XCTAssertEqual(verifyCount, 1)
+        await harness.integrations.releaseInstall()
+        await approval.value
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+    }
+
     func testDisconnectDuringCancellationIgnoringInstallWaitsThenCompensates() async {
         let harness = ViewModelHarness()
         await harness.viewModel.connect(using: harness.validDraft)
@@ -222,8 +243,12 @@ final class AppViewModelTests: XCTestCase {
         let approval = Task { await harness.viewModel.approveIntegrations() }
         await harness.integrations.waitForInstallCount(1)
 
-        let disconnect = Task { await harness.viewModel.disconnect() }
-        await Task.yield()
+        let overlap = AsyncInvocationBarrier()
+        let disconnect = Task {
+            await overlap.arrive()
+            await harness.viewModel.disconnect()
+        }
+        await overlap.wait()
         await harness.integrations.releaseInstall()
         await approval.value
         await disconnect.value
@@ -245,6 +270,212 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.phase, .integrationReview)
         XCTAssertEqual(harness.viewModel.presentedError, .operationFailed)
         XCTAssertEqual(harness.calls.values, [.install, .loadCredentials, .uninstall])
+    }
+
+    func testDisconnectRestoresCredentialsThatPreexistedApproval() async throws {
+        let harness = ViewModelHarness()
+        let previous = harness.previousCredentials
+        harness.credentials.seed(previous)
+        await harness.connectAndApprove()
+
+        await harness.viewModel.disconnect()
+
+        XCTAssertEqual(harness.credentials.storedCredentials(), previous)
+        XCTAssertEqual(harness.credentials.saveCount, 2)
+        XCTAssertEqual(harness.credentials.deleteCount, 0)
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+    }
+
+    func testCredentialRestoreFailureCreatesTypedObligationAndRetryClearsIt() async {
+        let harness = ViewModelHarness()
+        harness.credentials.seed(harness.previousCredentials)
+        harness.credentials.setSaveError(HarnessSensitiveError("CANARY_RESTORE_FAILURE"), forCall: 2)
+        await harness.connectAndApprove()
+
+        await harness.viewModel.disconnect()
+
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.credentialRestore])
+        XCTAssertEqual(harness.viewModel.presentedError, .operationFailed)
+
+        harness.credentials.setSaveError(nil, forCall: 2)
+        await harness.viewModel.disconnect()
+
+        XCTAssertEqual(harness.credentials.storedCredentials(), harness.previousCredentials)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+    }
+
+    func testApprovalCompensationRestoreFailurePreservesOriginalRateLimitError() async {
+        let harness = ViewModelHarness()
+        harness.credentials.seed(harness.previousCredentials)
+        harness.credentials.setSaveError(HarnessSensitiveError("CANARY_RESTORE_FAILURE"), forCall: 2)
+        await harness.monitor.setStartError(TuyaClientError.httpStatus(429))
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        await harness.viewModel.approveIntegrations()
+
+        XCTAssertEqual(harness.viewModel.presentedError, .rateLimited)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.credentialRestore])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
+    func testCredentialDeleteFailureCreatesTypedObligationAndRetryClearsIt() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        harness.credentials.setDeleteError(HarnessSensitiveError("CANARY_DELETE_FAILURE"))
+
+        await harness.viewModel.disconnect()
+
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.credentialDelete])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+
+        harness.credentials.setDeleteError(nil)
+        await harness.viewModel.disconnect()
+
+        XCTAssertNil(harness.credentials.storedCredentials())
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+    }
+
+    func testPreenabledLoginItemIsNeverDisabledByDisconnect() async {
+        let harness = ViewModelHarness()
+        harness.loginItem.currentStatus = .enabled
+        await harness.connectAndApprove()
+
+        await harness.viewModel.disconnect()
+
+        XCTAssertEqual(harness.loginItem.currentStatus, .enabled)
+        XCTAssertEqual(harness.loginItem.disableCount, 0)
+    }
+
+    func testNewApprovalPendingRegistrationIsUnregisteredDuringCompensation() async {
+        let harness = ViewModelHarness()
+        harness.loginItem.registerResult = .requiresApproval
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        await harness.viewModel.approveIntegrations()
+
+        XCTAssertEqual(harness.viewModel.presentedError, .loginApprovalRequired)
+        XCTAssertEqual(harness.loginItem.currentStatus, .notRegistered)
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
+    }
+
+    func testNewApprovalPendingUnregisterFailurePreservesOriginalErrorAndTypedObligation() async {
+        let harness = ViewModelHarness()
+        harness.loginItem.registerResult = .requiresApproval
+        harness.loginItem.disableError = HarnessSensitiveError("CANARY_UNREGISTER_FAILURE")
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        await harness.viewModel.approveIntegrations()
+
+        XCTAssertEqual(harness.viewModel.presentedError, .loginApprovalRequired)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.loginRegistrationCleanup])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+
+        harness.loginItem.disableError = nil
+        await harness.viewModel.disconnect()
+        XCTAssertEqual(harness.loginItem.currentStatus, .notRegistered)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+    }
+
+    func testPreexistingApprovalPendingRegistrationIsNeverUnregistered() async {
+        let harness = ViewModelHarness()
+        harness.loginItem.currentStatus = .requiresApproval
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        await harness.viewModel.approveIntegrations()
+
+        XCTAssertEqual(harness.viewModel.presentedError, .loginApprovalRequired)
+        XCTAssertEqual(harness.loginItem.currentStatus, .requiresApproval)
+        XCTAssertEqual(harness.loginItem.disableCount, 0)
+    }
+
+    func testLoginUnregisterFailureCreatesTypedCleanupObligation() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        harness.loginItem.disableError = HarnessSensitiveError("CANARY_UNREGISTER_FAILURE")
+
+        await harness.viewModel.disconnect()
+
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.loginRegistrationCleanup])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
+    func testPreexistingIntegrationsAreNeverUninstalled() async {
+        let harness = ViewModelHarness()
+        await harness.integrations.setPreviewOwnership([true, true, true])
+        await harness.connectAndApprove()
+
+        await harness.viewModel.disconnect()
+
+        let uninstallCount = await harness.integrations.counts().uninstall
+        XCTAssertEqual(uninstallCount, 0)
+        XCTAssertFalse(harness.viewModel.outstandingObligations.contains(.integration))
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+    }
+
+    func testPartialPreexistingIntegrationsPreserveEntriesAndCreateExplicitObligation() async {
+        let harness = ViewModelHarness()
+        await harness.integrations.setPreviewOwnership([true, false, false])
+        await harness.connectAndApprove()
+
+        await harness.viewModel.disconnect()
+
+        let uninstallCount = await harness.integrations.counts().uninstall
+        XCTAssertEqual(uninstallCount, 0)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integration])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
+    func testApprovalFailureNeverUninstallsFullyPreexistingIntegrations() async {
+        let harness = ViewModelHarness()
+        await harness.integrations.setPreviewOwnership([true, true, true])
+        await harness.monitor.setStartError(TuyaClientError.transport)
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        await harness.viewModel.approveIntegrations()
+
+        let uninstallCount = await harness.integrations.counts().uninstall
+        XCTAssertEqual(uninstallCount, 0)
+        XCTAssertEqual(harness.viewModel.phase, .integrationReview)
+        XCTAssertEqual(harness.viewModel.presentedError, .bulbOffline)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+    }
+
+    func testApprovalFailurePreservesPartialIntegrationsAsExplicitObligation() async {
+        let harness = ViewModelHarness()
+        await harness.integrations.setPreviewOwnership([true, false, false])
+        await harness.monitor.setStartError(TuyaClientError.transport)
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        await harness.viewModel.approveIntegrations()
+
+        let uninstallCount = await harness.integrations.counts().uninstall
+        XCTAssertEqual(uninstallCount, 0)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.presentedError, .bulbOffline)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integration])
+    }
+
+    func testRepairClearsOnlyIntegrationObligationAndPreservesOtherCleanupFailure() async {
+        let harness = ViewModelHarness()
+        await harness.integrations.setPreviewOwnership([true, false, false])
+        await harness.connectAndApprove()
+        harness.credentials.setDeleteError(HarnessSensitiveError("CANARY_DELETE_FAILURE"))
+        await harness.viewModel.disconnect()
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integration, .credentialDelete])
+
+        await harness.viewModel.repairIntegrations()
+
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.credentialDelete])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+
+        harness.credentials.setDeleteError(nil)
+        await harness.viewModel.disconnect()
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
     }
 
     func testCommittedInstallFailureUninstallsCommittedOwnedHooks() async {
@@ -274,14 +505,18 @@ final class AppViewModelTests: XCTestCase {
 
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
         XCTAssertEqual(harness.viewModel.presentedError, .integrationConflict)
-        XCTAssertTrue(harness.viewModel.requiresRepair)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integration])
         XCTAssertEqual(harness.calls.values, [.install])
+
+        await harness.viewModel.approveIntegrations()
+        let installCount = await harness.integrations.counts().install
+        XCTAssertEqual(installCount, 1)
 
         await harness.viewModel.disconnect()
 
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
         XCTAssertEqual(harness.viewModel.presentedError, .integrationConflict)
-        XCTAssertTrue(harness.viewModel.requiresRepair)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integration])
     }
 
     func testPreviewConflictRemainsOnboardingAndNeverPersists() async {
@@ -305,8 +540,14 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.connectionStatus, .connected)
 
         let update = MonitoringSnapshot(state: .error, sessions: [.canaryError], connection: .disconnected)
+        let changed = expectation(description: "monitor snapshot applied")
+        withObservationTracking {
+            _ = harness.viewModel.currentState
+        } onChange: {
+            changed.fulfill()
+        }
         await harness.monitor.emit(update)
-        await waitUntil { harness.viewModel.currentState == .error }
+        await fulfillment(of: [changed])
 
         XCTAssertEqual(harness.viewModel.sessions, [.canaryError])
         XCTAssertEqual(harness.viewModel.connectionStatus, .disconnected)
@@ -318,7 +559,7 @@ final class AppViewModelTests: XCTestCase {
 
         await harness.viewModel.pause()
         await harness.viewModel.pause()
-        await waitUntil { await harness.monitor.terminationCount == 1 }
+        await harness.monitor.waitForTerminationCount(1)
 
         XCTAssertEqual(harness.viewModel.phase, .paused)
         XCTAssertEqual(harness.viewModel.currentState, .idle)
@@ -336,6 +577,40 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(resumedMetrics.activeSubscriptions, 1)
     }
 
+    func testOverlappingDuplicatePauseAndResumeShareEachInFlightOperation() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.monitor.blockPause()
+        let firstPause = Task { await harness.viewModel.pause() }
+        await harness.monitor.waitForPauseCount(1)
+        let pauseOverlap = AsyncInvocationBarrier()
+        let secondPause = Task {
+            await pauseOverlap.arrive()
+            await harness.viewModel.pause()
+        }
+        await pauseOverlap.wait()
+        await harness.monitor.releasePause()
+        await firstPause.value
+        await secondPause.value
+        let pauseCount = await harness.monitor.metrics().pause
+        XCTAssertEqual(pauseCount, 1)
+
+        await harness.monitor.blockResume()
+        let firstResume = Task { await harness.viewModel.resume() }
+        await harness.monitor.waitForResumeCount(1)
+        let resumeOverlap = AsyncInvocationBarrier()
+        let secondResume = Task {
+            await resumeOverlap.arrive()
+            await harness.viewModel.resume()
+        }
+        await resumeOverlap.wait()
+        await harness.monitor.releaseResume()
+        await firstResume.value
+        await secondResume.value
+        let resumeCount = await harness.monitor.metrics().resume
+        XCTAssertEqual(resumeCount, 1)
+    }
+
     func testResumeRequestedDuringPauseRunsAfterPauseCompletes() async {
         let harness = ViewModelHarness()
         await harness.connectAndApprove()
@@ -343,8 +618,12 @@ final class AppViewModelTests: XCTestCase {
         let pause = Task { await harness.viewModel.pause() }
         await harness.monitor.waitForPauseCount(1)
 
-        let resume = Task { await harness.viewModel.resume() }
-        await Task.yield()
+        let overlap = AsyncInvocationBarrier()
+        let resume = Task {
+            await overlap.arrive()
+            await harness.viewModel.resume()
+        }
+        await overlap.wait()
         await harness.monitor.releasePause()
         await pause.value
         await resume.value
@@ -356,11 +635,11 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(metrics.activeSubscriptions, 1)
     }
 
-    func testOldMonitoringStreamCannotMutateNewEpoch() async {
+    func testOldMonitoringStreamCannotMutateNewEpoch() async throws {
         let harness = ViewModelHarness()
         await harness.connectAndApprove()
         let oldSubscriptionValue = await harness.monitor.metrics().latestSubscriptionID
-        let oldSubscription = try! XCTUnwrap(oldSubscriptionValue)
+        let oldSubscription = try XCTUnwrap(oldSubscriptionValue)
         await harness.viewModel.pause()
         await harness.viewModel.resume()
 
@@ -368,11 +647,113 @@ final class AppViewModelTests: XCTestCase {
             MonitoringSnapshot(state: .error, sessions: [.canaryError], connection: .disconnected),
             to: oldSubscription
         )
-        await Task.yield()
-
         XCTAssertNotEqual(harness.viewModel.currentState, .error)
         let activeSubscriptions = await harness.monitor.metrics().activeSubscriptions
         XCTAssertEqual(activeSubscriptions, 1)
+    }
+
+    func testNaturalStreamEndClearsHandleMarksDisconnectedAndAllowsResubscribe() async throws {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        let subscriptionValue = await harness.monitor.metrics().latestSubscriptionID
+        let subscription = try XCTUnwrap(subscriptionValue)
+        let disconnected = expectation(description: "stream end marks disconnected")
+        withObservationTracking {
+            _ = harness.viewModel.connectionStatus
+        } onChange: {
+            disconnected.fulfill()
+        }
+
+        await harness.monitor.finish(subscription)
+        await fulfillment(of: [disconnected], timeout: 1)
+        await harness.monitor.waitForTerminationCount(1)
+
+        XCTAssertEqual(harness.viewModel.connectionStatus, .disconnected)
+        guard harness.viewModel.connectionStatus == .disconnected else { return }
+        await harness.viewModel.observeMonitoring()
+        await harness.monitor.waitForSubscriptionCount(2)
+        let activeSubscriptions = await harness.monitor.metrics().activeSubscriptions
+        XCTAssertEqual(activeSubscriptions, 1)
+    }
+
+    func testObservationTaskDoesNotRetainViewModelAfterOwnerRelease() async {
+        let harness = ViewModelHarness()
+        let weakBox = WeakViewModelBox()
+        do {
+            let model = AppViewModel(
+                credentials: harness.credentials,
+                integrations: harness.integrations,
+                monitor: harness.monitor,
+                loginItem: harness.loginItem,
+                verifier: harness.verifier
+            )
+            weakBox.value = model
+            await model.connect(using: harness.validDraft)
+            await model.approveIntegrations()
+            await harness.monitor.waitForSubscriptionCount(1)
+        }
+
+        XCTAssertNil(weakBox.value)
+        guard weakBox.value == nil else { return }
+        await harness.monitor.waitForTerminationCount(1)
+    }
+
+    func testConnectIsIgnoredWhileMonitoringWithoutCancelingObservation() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        let before = await harness.monitor.metrics()
+
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        let after = await harness.monitor.metrics()
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertEqual(after.subscriptions, before.subscriptions)
+        XCTAssertEqual(after.activeSubscriptions, 1)
+        let verifyCount = await harness.verifier.count()
+        XCTAssertEqual(verifyCount, 1)
+    }
+
+    func testConnectIsIgnoredWhilePausedWithoutRestartingOrObservingMonitor() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.viewModel.pause()
+        await harness.monitor.waitForTerminationCount(1)
+
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        XCTAssertEqual(harness.viewModel.phase, .paused)
+        let activeSubscriptions = await harness.monitor.metrics().activeSubscriptions
+        let verifyCount = await harness.verifier.count()
+        XCTAssertEqual(activeSubscriptions, 0)
+        XCTAssertEqual(verifyCount, 1)
+    }
+
+    func testConnectIsBlockedWhileAnyCleanupObligationRemains() async {
+        let harness = ViewModelHarness()
+        await harness.integrations.setPreviewOwnership([true, false, false])
+        await harness.connectAndApprove()
+        await harness.viewModel.disconnect()
+        let verifyCount = await harness.verifier.count()
+
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        let afterVerifyCount = await harness.verifier.count()
+        XCTAssertEqual(afterVerifyCount, verifyCount)
+    }
+
+    func testResumeFailureStaysPausedWithSanitizedOfflineError() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.viewModel.pause()
+        await harness.monitor.setResumeError(TuyaClientError.transport)
+
+        await harness.viewModel.resume()
+
+        XCTAssertEqual(harness.viewModel.phase, .paused)
+        XCTAssertEqual(harness.viewModel.presentedError, .bulbOffline)
+        let activeSubscriptions = await harness.monitor.metrics().activeSubscriptions
+        XCTAssertEqual(activeSubscriptions, 0)
     }
 
     func testRepairIsIdempotentAndReportsConflict() async {
@@ -381,8 +762,12 @@ final class AppViewModelTests: XCTestCase {
         await harness.integrations.blockRepair()
         let first = Task { await harness.viewModel.repairIntegrations() }
         await harness.integrations.waitForRepairCount(1)
-        let second = Task { await harness.viewModel.repairIntegrations() }
-        await Task.yield()
+        let overlap = AsyncInvocationBarrier()
+        let second = Task {
+            await overlap.arrive()
+            await harness.viewModel.repairIntegrations()
+        }
+        await overlap.wait()
         await harness.integrations.releaseRepair()
         await first.value
         await second.value
@@ -400,8 +785,16 @@ final class AppViewModelTests: XCTestCase {
         await harness.connectAndApprove()
         harness.calls.removeAll()
 
+        await harness.monitor.blockStop()
         let first = Task { await harness.viewModel.disconnect() }
-        let second = Task { await harness.viewModel.disconnect() }
+        await harness.monitor.waitForStopCount(1)
+        let overlap = AsyncInvocationBarrier()
+        let second = Task {
+            await overlap.arrive()
+            await harness.viewModel.disconnect()
+        }
+        await overlap.wait()
+        await harness.monitor.releaseStop()
         await first.value
         await second.value
 
@@ -422,7 +815,12 @@ final class AppViewModelTests: XCTestCase {
             (TuyaClientError.invalidEndpoint, .invalidEndpoint),
             (TuyaClientError.authenticationFailure, .invalidCredential),
             (TuyaClientError.httpStatus(429), .rateLimited),
+            (TuyaClientError.httpStatus(408), .bulbOffline),
+            (TuyaClientError.httpStatus(500), .bulbOffline),
+            (TuyaClientError.httpStatus(503), .bulbOffline),
             (TuyaClientError.transport, .bulbOffline),
+            (URLError(.timedOut), .bulbOffline),
+            (URLError(.notConnectedToInternet), .bulbOffline),
             (CapabilityError.missingColor, .unsupportedBulb),
             (IntegrationError.destinationChanged("CANARY_PRIVATE_PATH"), .integrationConflict),
             (HarnessSensitiveError("CANARY_ACCESS_SECRET"), .operationFailed)
@@ -437,15 +835,4 @@ final class AppViewModelTests: XCTestCase {
         }
     }
 
-    private func waitUntil(
-        _ predicate: @MainActor () async -> Bool,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) async {
-        for _ in 0..<100 where !(await predicate()) {
-            await Task.yield()
-        }
-        let satisfied = await predicate()
-        XCTAssertTrue(satisfied, file: file, line: line)
-    }
 }

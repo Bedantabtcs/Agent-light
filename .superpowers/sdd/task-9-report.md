@@ -87,6 +87,29 @@ Implement Task 10 from docs/superpowers/plans/2026-07-06-agent-light-macos-imple
 
 ---
 
+## Task 10 Review Follow-up: Login Transition Ownership
+
+Date: 2026-07-07
+
+### Correction
+
+- Replaced the lossy boolean login boundary with public `LoginItemStatus` and `LoginItemTransition` values.
+- `setEnabled(_:)` now returns prior/current status plus `didRegister` and `didUnregister` ownership.
+- A newly registered item that enters `.requiresApproval` reports `didRegister == true`; a preexisting approval-pending or enabled item reports no ownership.
+- Unknown status remains fail-closed and adapter errors remain sanitized.
+
+### RED/GREEN
+
+- RED: `swift test --filter LoginItemControllerTests` exited 1 because `LoginItemStatus` and `LoginItemTransition` did not exist.
+- GREEN: `swift test --filter LoginItemControllerTests` exited 0; 8 tests passed, 0 failures.
+
+### Verification
+
+- Full package verification after the Task 10 corrections: 305 tests passed, 0 failures.
+- Release build completed successfully.
+
+---
+
 ## Review Fix: Symmetric Credential Validation and Unknown Login Status
 
 ### Corrections

@@ -2,8 +2,36 @@ import ServiceManagement
 
 @MainActor
 public protocol LoginItemControlling {
-    func isEnabled() -> Bool
-    func setEnabled(_ enabled: Bool) throws
+    func status() -> LoginItemStatus
+    @discardableResult
+    func setEnabled(_ enabled: Bool) throws -> LoginItemTransition
+}
+
+public enum LoginItemStatus: Equatable, Sendable {
+    case notRegistered
+    case enabled
+    case requiresApproval
+    case notFound
+    case unknown
+}
+
+public struct LoginItemTransition: Equatable, Sendable {
+    public let previous: LoginItemStatus
+    public let current: LoginItemStatus
+    public let didRegister: Bool
+    public let didUnregister: Bool
+
+    public init(
+        previous: LoginItemStatus,
+        current: LoginItemStatus,
+        didRegister: Bool,
+        didUnregister: Bool
+    ) {
+        self.previous = previous
+        self.current = current
+        self.didRegister = didRegister
+        self.didUnregister = didUnregister
+    }
 }
 
 public enum LoginItemControllerError: Error, Equatable, Sendable {
@@ -22,17 +50,9 @@ extension LoginItemControllerError: LocalizedError {
     }
 }
 
-enum LoginItemServiceStatus: Equatable, Sendable {
-    case notRegistered
-    case enabled
-    case requiresApproval
-    case notFound
-    case unknown
-}
-
 @MainActor
 protocol LoginItemServiceAdapting: AnyObject {
-    var status: LoginItemServiceStatus { get }
+    var status: LoginItemStatus { get }
     func register() throws
     func unregister() throws
 }
@@ -45,7 +65,7 @@ final class MainAppServiceAdapter: LoginItemServiceAdapting {
         self.service = service
     }
 
-    var status: LoginItemServiceStatus {
+    var status: LoginItemStatus {
         switch service.status {
         case .notRegistered:
             .notRegistered
@@ -81,21 +101,27 @@ public final class LoginItemController: LoginItemControlling {
         self.service = service
     }
 
-    public func isEnabled() -> Bool {
-        service.status == .enabled
+    public func status() -> LoginItemStatus {
+        service.status
     }
 
-    public func setEnabled(_ enabled: Bool) throws {
-        switch (enabled, service.status) {
+    @discardableResult
+    public func setEnabled(_ enabled: Bool) throws -> LoginItemTransition {
+        let previous = service.status
+        var didRegister = false
+        var didUnregister = false
+        switch (enabled, previous) {
         case (true, .notRegistered), (true, .notFound):
             do {
                 try service.register()
+                didRegister = true
             } catch {
                 throw LoginItemControllerError.registrationFailed
             }
         case (false, .enabled), (false, .requiresApproval):
             do {
                 try service.unregister()
+                didUnregister = true
             } catch {
                 throw LoginItemControllerError.unregistrationFailed
             }
@@ -105,7 +131,13 @@ public final class LoginItemController: LoginItemControlling {
              (false, .notRegistered),
              (false, .notFound),
              (false, .unknown):
-            return
+            break
         }
+        return LoginItemTransition(
+            previous: previous,
+            current: service.status,
+            didRegister: didRegister,
+            didUnregister: didUnregister
+        )
     }
 }

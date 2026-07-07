@@ -37,6 +37,7 @@ final class FakeCredentialStore: CredentialStoring, @unchecked Sendable {
     private var saveError: (any Error & Sendable)?
     private var loadError: (any Error & Sendable)?
     private var deleteError: (any Error & Sendable)?
+    private var saveErrors: [Int: any Error & Sendable] = [:]
     private var saves = 0
     private var deletes = 0
 
@@ -48,6 +49,7 @@ final class FakeCredentialStore: CredentialStoring, @unchecked Sendable {
         calls.append(.saveCredentials)
         try lock.withLock {
             saves += 1
+            if let error = saveErrors[saves] { throw error }
             if let saveError { throw saveError }
             stored = credentials
         }
@@ -71,8 +73,13 @@ final class FakeCredentialStore: CredentialStoring, @unchecked Sendable {
     }
 
     func setSaveError(_ error: (any Error & Sendable)?) { lock.withLock { saveError = error } }
+    func setSaveError(_ error: (any Error & Sendable)?, forCall call: Int) {
+        lock.withLock { saveErrors[call] = error }
+    }
     func setLoadError(_ error: (any Error & Sendable)?) { lock.withLock { loadError = error } }
     func setDeleteError(_ error: (any Error & Sendable)?) { lock.withLock { deleteError = error } }
+    func seed(_ credentials: TuyaCredentials) { lock.withLock { stored = credentials } }
+    func storedCredentials() -> TuyaCredentials? { lock.withLock { stored } }
 }
 
 actor FakeVerifier: TuyaConnectionVerifying {
@@ -122,7 +129,11 @@ actor FakeVerifier: TuyaConnectionVerifying {
             ],
             status: []
         )
-        return try! TuyaCapabilityResolver.resolve(specification: specification)
+        do {
+            return try TuyaCapabilityResolver.resolve(specification: specification)
+        } catch {
+            preconditionFailure("Static canary capability schema must resolve")
+        }
     }()
 }
 
@@ -133,14 +144,15 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     private var repairError: (any Error & Sendable)?
     private var uninstallError: (any Error & Sendable)?
     private var installBlocked = false
-    private var previewBlocked = false
+    private var blockedPreviewCalls: Set<Int> = []
     private var repairBlocked = false
     private var installRelease: CheckedContinuation<Void, Never>?
-    private var previewRelease: CheckedContinuation<Void, Never>?
+    private var previewReleases: [Int: CheckedContinuation<Void, Never>] = [:]
     private var repairRelease: CheckedContinuation<Void, Never>?
     private var installWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var previewWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var repairWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var previewOwnership: [Bool] = [false, false, false]
     private(set) var previewCount = 0
     private(set) var installCount = 0
     private(set) var repairCount = 0
@@ -151,16 +163,25 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     func preview() async throws -> [IntegrationPreview] {
         calls.append(.preview)
         previewCount += 1
+        let call = previewCount
         let ready = previewWaiters.filter { previewCount >= $0.0 }
         previewWaiters.removeAll { previewCount >= $0.0 }
         for waiter in ready { waiter.1.resume() }
-        if previewBlocked {
+        if blockedPreviewCalls.contains(call) {
             await withTaskCancellationHandler {
-                await withCheckedContinuation { previewRelease = $0 }
+                await withCheckedContinuation { previewReleases[call] = $0 }
             } onCancel: {}
         }
         if let previewError { throw previewError }
-        return [IntegrationPreview(source: .codex, path: "/CANARY/hooks.json", before: "{}", after: "{}")]
+        return zip(AgentSource.allCases, previewOwnership).map { source, hadOwnedEntries in
+            IntegrationPreview(
+                source: source,
+                path: "/CANARY/\(source.rawValue).json",
+                before: "{}",
+                after: "{}",
+                hadOwnedEntries: hadOwnedEntries
+            )
+        }
     }
 
     func install() async throws {
@@ -193,14 +214,18 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     func setPreviewError(_ error: (any Error & Sendable)?) { previewError = error }
     func setRepairError(_ error: (any Error & Sendable)?) { repairError = error }
     func setUninstallError(_ error: (any Error & Sendable)?) { uninstallError = error }
+    func setPreviewOwnership(_ ownership: [Bool]) { previewOwnership = ownership }
     func blockInstall() { installBlocked = true }
     func releaseInstall() { installBlocked = false; installRelease?.resume(); installRelease = nil }
     func waitForInstallCount(_ expected: Int) async {
         if installCount >= expected { return }
         await withCheckedContinuation { installWaiters.append((expected, $0)) }
     }
-    func blockPreview() { previewBlocked = true }
-    func releasePreview() { previewBlocked = false; previewRelease?.resume(); previewRelease = nil }
+    func blockPreview(call: Int = 1) { blockedPreviewCalls.insert(call) }
+    func releasePreview(call: Int = 1) {
+        blockedPreviewCalls.remove(call)
+        previewReleases.removeValue(forKey: call)?.resume()
+    }
     func waitForPreviewCount(_ expected: Int) async {
         if previewCount >= expected { return }
         await withCheckedContinuation { previewWaiters.append((expected, $0)) }
@@ -224,6 +249,14 @@ actor FakeMonitor: MonitoringOrchestrating {
     private var pauseBlocked = false
     private var pauseRelease: CheckedContinuation<Void, Never>?
     private var pauseWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var resumeBlocked = false
+    private var resumeRelease: CheckedContinuation<Void, Never>?
+    private var resumeWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var stopBlocked = false
+    private var stopRelease: CheckedContinuation<Void, Never>?
+    private var stopWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var subscriptionWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var terminationWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var continuations: [UUID: AsyncStream<MonitoringSnapshot>.Continuation] = [:]
     private var historicalContinuations: [UUID: AsyncStream<MonitoringSnapshot>.Continuation] = [:]
     private(set) var startCount = 0
@@ -257,15 +290,29 @@ actor FakeMonitor: MonitoringOrchestrating {
     func resume() async throws {
         calls.append(.resumeMonitoring)
         resumeCount += 1
+        let ready = resumeWaiters.filter { resumeCount >= $0.0 }
+        resumeWaiters.removeAll { resumeCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+        if resumeBlocked { await withCheckedContinuation { resumeRelease = $0 } }
         if let resumeError { throw resumeError }
     }
-    func stop() async { calls.append(.stopMonitoring); stopCount += 1 }
+    func stop() async {
+        calls.append(.stopMonitoring)
+        stopCount += 1
+        let ready = stopWaiters.filter { stopCount >= $0.0 }
+        stopWaiters.removeAll { stopCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+        if stopBlocked { await withCheckedContinuation { stopRelease = $0 } }
+    }
     func reconnect() async {}
     func recoverIfNeeded() async throws {}
     func currentSnapshot() async -> MonitoringSnapshot { calls.append(.currentSnapshot); return snapshot }
     func updates() -> AsyncStream<MonitoringSnapshot> {
         calls.append(.updates)
         updateSubscriptionCount += 1
+        let ready = subscriptionWaiters.filter { updateSubscriptionCount >= $0.0 }
+        subscriptionWaiters.removeAll { updateSubscriptionCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
         let id = UUID()
         latestSubscriptionID = id
         return AsyncStream { continuation in
@@ -282,12 +329,34 @@ actor FakeMonitor: MonitoringOrchestrating {
         for continuation in continuations.values { continuation.yield(value) }
     }
     func emit(_ value: MonitoringSnapshot, to id: UUID) { historicalContinuations[id]?.yield(value) }
+    func finish(_ id: UUID) { historicalContinuations[id]?.finish() }
     func setStartError(_ error: (any Error & Sendable)?) { startError = error }
+    func setResumeError(_ error: (any Error & Sendable)?) { resumeError = error }
     func blockPause() { pauseBlocked = true }
     func releasePause() { pauseBlocked = false; pauseRelease?.resume(); pauseRelease = nil }
     func waitForPauseCount(_ expected: Int) async {
         if pauseCount >= expected { return }
         await withCheckedContinuation { pauseWaiters.append((expected, $0)) }
+    }
+    func blockResume() { resumeBlocked = true }
+    func releaseResume() { resumeBlocked = false; resumeRelease?.resume(); resumeRelease = nil }
+    func waitForResumeCount(_ expected: Int) async {
+        if resumeCount >= expected { return }
+        await withCheckedContinuation { resumeWaiters.append((expected, $0)) }
+    }
+    func blockStop() { stopBlocked = true }
+    func releaseStop() { stopBlocked = false; stopRelease?.resume(); stopRelease = nil }
+    func waitForStopCount(_ expected: Int) async {
+        if stopCount >= expected { return }
+        await withCheckedContinuation { stopWaiters.append((expected, $0)) }
+    }
+    func waitForSubscriptionCount(_ expected: Int) async {
+        if updateSubscriptionCount >= expected { return }
+        await withCheckedContinuation { subscriptionWaiters.append((expected, $0)) }
+    }
+    func waitForTerminationCount(_ expected: Int) async {
+        if terminationCount >= expected { return }
+        await withCheckedContinuation { terminationWaiters.append((expected, $0)) }
     }
     func metrics() -> (
         start: Int,
@@ -310,26 +379,81 @@ actor FakeMonitor: MonitoringOrchestrating {
             latestSubscriptionID
         )
     }
-    private func terminate(_ id: UUID) { continuations[id] = nil; terminationCount += 1 }
+    private func terminate(_ id: UUID) {
+        continuations[id] = nil
+        terminationCount += 1
+        let ready = terminationWaiters.filter { terminationCount >= $0.0 }
+        terminationWaiters.removeAll { terminationCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+    }
+}
+
+actor AsyncInvocationBarrier {
+    private var arrived = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func arrive() {
+        arrived = true
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume() }
+    }
+
+    func wait() async {
+        if arrived { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+@MainActor
+final class WeakViewModelBox {
+    weak var value: AppViewModel?
 }
 
 @MainActor
 final class FakeLoginItem: LoginItemControlling {
     private let calls: HarnessCallRecorder
-    var enabled = false
-    var approvalRequired = false
+    var currentStatus: LoginItemStatus = .notRegistered
+    var registerResult: LoginItemStatus = .enabled
     var enableError: (any Error)?
+    var disableError: (any Error)?
     private(set) var enableCount = 0
     private(set) var disableCount = 0
 
     init(calls: HarnessCallRecorder) { self.calls = calls }
-    func isEnabled() -> Bool { enabled }
-    func setEnabled(_ enabled: Bool) throws {
+    var enabled: Bool {
+        get { currentStatus == .enabled }
+        set { currentStatus = newValue ? .enabled : .notRegistered }
+    }
+    var approvalRequired: Bool {
+        get { currentStatus == .requiresApproval }
+        set { currentStatus = newValue ? .requiresApproval : .notRegistered }
+    }
+    func status() -> LoginItemStatus { currentStatus }
+    func setEnabled(_ enabled: Bool) throws -> LoginItemTransition {
+        let previous = status()
         calls.append(enabled ? .enableLogin : .disableLogin)
         if enabled { enableCount += 1 } else { disableCount += 1 }
-        if let enableError { throw enableError }
-        if enabled && approvalRequired { return }
-        self.enabled = enabled
+        if enabled {
+            if let enableError { throw enableError }
+            let didRegister = previous == .notRegistered || previous == .notFound
+            if didRegister { currentStatus = registerResult }
+            return LoginItemTransition(
+                previous: previous,
+                current: currentStatus,
+                didRegister: didRegister,
+                didUnregister: false
+            )
+        }
+        if let disableError { throw disableError }
+        let didUnregister = previous == .enabled || previous == .requiresApproval
+        if didUnregister { currentStatus = .notRegistered }
+        return LoginItemTransition(
+            previous: previous,
+            current: status(),
+            didRegister: false,
+            didUnregister: didUnregister
+        )
     }
 }
 
@@ -346,6 +470,12 @@ final class ViewModelHarness {
         accessID: "CANARY_ACCESS_ID",
         accessSecret: "CANARY_ACCESS_SECRET",
         deviceID: "CANARY_DEVICE_ID"
+    )
+    let previousCredentials = TuyaCredentials(
+        endpoint: canaryURL("https://openapi.tuyain.com"),
+        accessID: "CANARY_PREVIOUS_ACCESS_ID",
+        accessSecret: "CANARY_PREVIOUS_ACCESS_SECRET",
+        deviceID: "CANARY_PREVIOUS_DEVICE_ID"
     )
     let viewModel: AppViewModel
 
@@ -384,6 +514,13 @@ final class ViewModelHarness {
         case .startMonitoring: await monitor.setStartError(error)
         }
     }
+}
+
+private func canaryURL(_ value: String) -> URL {
+    guard let url = URL(string: value) else {
+        preconditionFailure("Static canary URL must be valid")
+    }
+    return url
 }
 
 extension AgentEvent {
