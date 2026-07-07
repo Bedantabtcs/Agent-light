@@ -152,10 +152,12 @@ actor RecordingLightController: TuyaLightControlling {
     private var blockedRestore: [CheckedContinuation<Void, Never>] = []
     private var blockedCapture: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var blockedMatch: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var blockedIgnoringMatch: [CheckedContinuation<Void, Never>] = []
     private var shouldBlockApply = false
     private var shouldBlockRestore = false
     private var shouldBlockCapture = false
     private var shouldBlockMatch = false
+    private var shouldIgnoreMatchCancellation = false
     private var captureErrors: [any Error] = []
     private var matchErrors: [any Error] = []
     private var captureCancellationCount = 0
@@ -221,13 +223,23 @@ actor RecordingLightController: TuyaLightControlling {
         operations.append(.match(state))
         resumeOperationWaiters()
         if shouldBlockMatch {
-            let id = UUID()
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    blockedMatch[id] = continuation
+            if shouldIgnoreMatchCancellation {
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        blockedIgnoringMatch.append(continuation)
+                    }
+                } onCancel: {
+                    Task { await self.observeBlockedMatchCancellation() }
                 }
-            } onCancel: {
-                Task { await self.cancelBlockedMatch(id: id) }
+            } else {
+                let id = UUID()
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        blockedMatch[id] = continuation
+                    }
+                } onCancel: {
+                    Task { await self.cancelBlockedMatch(id: id) }
+                }
             }
         }
         if !matchErrors.isEmpty {
@@ -291,11 +303,18 @@ actor RecordingLightController: TuyaLightControlling {
         shouldBlockMatch = blocked
     }
 
+    func setMatchCancellationIgnored(_ ignored: Bool) {
+        shouldIgnoreMatchCancellation = ignored
+    }
+
     func releaseMatch() {
         shouldBlockMatch = false
         let continuations = blockedMatch.values
         blockedMatch.removeAll()
         for continuation in continuations { continuation.resume(returning: ()) }
+        let ignoringContinuations = blockedIgnoringMatch
+        blockedIgnoringMatch.removeAll()
+        for continuation in ignoringContinuations { continuation.resume() }
     }
 
     func enqueueCaptureErrors(_ errors: [any Error]) {
@@ -374,6 +393,14 @@ actor RecordingLightController: TuyaLightControlling {
         guard let continuation = blockedMatch.removeValue(forKey: id) else { return }
         matchCancellationCount += 1
         continuation.resume(throwing: CancellationError())
+        resumeCancellationWaiters(
+            count: matchCancellationCount,
+            waiters: &matchCancellationWaiters
+        )
+    }
+
+    private func observeBlockedMatchCancellation() {
+        matchCancellationCount += 1
         resumeCancellationWaiters(
             count: matchCancellationCount,
             waiters: &matchCancellationWaiters
@@ -482,6 +509,66 @@ actor BlockingSessionCoordinator: SessionCoordinating {
     }
 }
 
+actor SnapshotBlockingSessionCoordinator: SessionCoordinating {
+    private let underlying = SessionCoordinator()
+    private var callsUntilBlock: Int?
+    private var blockedWinner: AgentEvent?
+    private var blockedContinuation: CheckedContinuation<Void, Never>?
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func blockCurrentWinner(afterCalls calls: Int) {
+        precondition(calls > 0)
+        callsUntilBlock = calls
+    }
+
+    func waitUntilCurrentWinnerIsBlocked() async {
+        if blockedContinuation != nil { return }
+        await withCheckedContinuation { continuation in
+            blockedWaiters.append(continuation)
+        }
+    }
+
+    func releaseCurrentWinner() {
+        blockedContinuation?.resume()
+        blockedContinuation = nil
+    }
+
+    func accept(_ event: AgentEvent) async {
+        await underlying.accept(event)
+    }
+
+    func expireTerminalState(sessionID: String, sequence: UInt64) async {
+        await underlying.expireTerminalState(sessionID: sessionID, sequence: sequence)
+    }
+
+    func currentWinner() async -> AgentEvent? {
+        if let remaining = callsUntilBlock {
+            if remaining == 1 {
+                callsUntilBlock = nil
+                blockedWinner = await underlying.currentWinner()
+                let waiters = blockedWaiters
+                blockedWaiters.removeAll()
+                for waiter in waiters { waiter.resume() }
+                await withCheckedContinuation { continuation in
+                    blockedContinuation = continuation
+                }
+                defer { blockedWinner = nil }
+                return blockedWinner
+            }
+            callsUntilBlock = remaining - 1
+        }
+        return await underlying.currentWinner()
+    }
+
+    func snapshots() async -> [AgentEvent] {
+        await underlying.snapshots()
+    }
+
+    func reset() async {
+        await underlying.reset()
+    }
+}
+
 actor MemoryRecoveryStore: MonitoringRecoveryStoring {
     enum Operation: Equatable, Sendable {
         case load
@@ -500,7 +587,9 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
     private var blockedSaves: [Int: CheckedContinuation<Void, Never>] = [:]
     private var blockedSaveWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var shouldBlockNextClear = false
+    private var shouldIgnoreNextClearCancellation = false
     private var blockedClear: CheckedContinuation<Void, Error>?
+    private var blockedIgnoringClear: CheckedContinuation<Void, Never>?
     private var blockedClearWaiters: [CheckedContinuation<Void, Never>] = []
     private var clearCancellationCount = 0
     private var clearCancellationWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
@@ -572,12 +661,24 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
             let waiters = blockedClearWaiters
             blockedClearWaiters.removeAll()
             for waiter in waiters { waiter.resume() }
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    blockedClear = continuation
+            if shouldIgnoreNextClearCancellation {
+                shouldIgnoreNextClearCancellation = false
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        blockedIgnoringClear = continuation
+                    }
+                } onCancel: {
+                    Task { await self.observeBlockedClearCancellation() }
                 }
-            } onCancel: {
-                Task { await self.cancelBlockedClear() }
+                try Task.checkCancellation()
+            } else {
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        blockedClear = continuation
+                    }
+                } onCancel: {
+                    Task { await self.cancelBlockedClear() }
+                }
             }
         }
         guard stored == expected else {
@@ -613,8 +714,13 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
         shouldBlockNextClear = true
     }
 
+    func blockNextClearIgnoringCancellation() {
+        shouldBlockNextClear = true
+        shouldIgnoreNextClearCancellation = true
+    }
+
     func waitUntilClearIsBlocked() async {
-        if blockedClear != nil { return }
+        if blockedClear != nil || blockedIgnoringClear != nil { return }
         await withCheckedContinuation { continuation in
             blockedClearWaiters.append(continuation)
         }
@@ -627,11 +733,23 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
         }
     }
 
+    func releaseBlockedClear() {
+        blockedIgnoringClear?.resume()
+        blockedIgnoringClear = nil
+    }
+
     private func cancelBlockedClear() {
         guard let blockedClear else { return }
         self.blockedClear = nil
         clearCancellationCount += 1
         blockedClear.resume(throwing: CancellationError())
+        let ready = clearCancellationWaiters.filter { clearCancellationCount >= $0.0 }
+        clearCancellationWaiters.removeAll { clearCancellationCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+    }
+
+    private func observeBlockedClearCancellation() {
+        clearCancellationCount += 1
         let ready = clearCancellationWaiters.filter { clearCancellationCount >= $0.0 }
         clearCancellationWaiters.removeAll { clearCancellationCount >= $0.0 }
         for waiter in ready { waiter.1.resume() }

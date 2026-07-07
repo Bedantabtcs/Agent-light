@@ -105,3 +105,66 @@ Verification:
 - `swift build -c release`: exit 0. Log: `/tmp/task8-correction-2-rereview-release.log`.
 
 Remaining concerns are unchanged: no live-bulb or process-kill acceptance test was run.
+
+---
+
+## Final Re-review Correction: Terminal Drain and Post-await Currency
+
+### RED
+
+Before production changes, the focused command was:
+
+```sh
+perl -e 'alarm 60; exec @ARGV' swift test --filter 'MonitoringOrchestratorTests.test(FinalReconnectCancellation|MismatchingHealthRemains|NewerWinnerAccepted|CancellingSolePauseStill|CancellingSoleStopStill|ReconnectCallerAfterTerminal|CancellingNonInitiating)'
+```
+
+The bounded run failed as follows:
+
+- Cancelled pause rolled back to active, accepted and physically applied `working`, retained the recovery record, and published `working` instead of `idle`.
+- Cancelled stop rolled back to active and published `needsYou` instead of `idle`.
+- Final reconnect cancellation completed its caller while cancellation-ignoring health and pending-clear work remained blocked.
+- The remaining terminal-attachment/current-snapshot cases did not complete before the external bound under the old implementation.
+- The non-initiating shared reconnect waiter case passed, confirming that only the final-waiter ownership path needed to retain completion.
+
+Result: nonzero/bounded failure. Log: `/tmp/task8-rereview-red.log`.
+
+### GREEN
+
+- Final reconnect cancellation now moves the last cancelled waiter to operation-owned terminal completion. The driver completes that waiter only after owned health, pending clear, command delay, and physical apply have drained.
+- Terminal state is installed synchronously before any cancellation-path suspension. A reconnect arriving during terminal drain waits for the old operation completion and starts a fresh operation if monitoring remains active and disconnected.
+- Mismatch disables deduplication until a corrective physical write. Pre-write supersession preserves that forced-write state; only a completed physical write re-enables deduplication.
+- Every `currentWinner()` suspension in the physical-send path is followed by checks for task cancellation, exact throttle operation ID, generation, mode, reconnect ID/terminal state, and the expected locally accepted session sequence.
+- A cancelled pause or stop caller remains retained until safe reset, restore, and conditional clear complete. Caller cancellation no longer invalidates or rolls back deactivation; newer lifecycle requests still supersede through their own request/generation.
+- Pending-clear reconnect cancellation rechecks task and reconnect currency before health begins.
+
+Focused command:
+
+```sh
+swift test --filter 'MonitoringOrchestratorTests.test(FinalReconnectCancellation|MismatchingHealthRemains|NewerWinnerAccepted|CancellingSolePauseStill|CancellingSoleStopStill|ReconnectCallerAfterTerminal|CancellingNonInitiating)'
+```
+
+Result: 10 tests passed, 0 failures. Log: `/tmp/task8-rereview-green-focused.log`.
+
+### Final Verification
+
+- `swift test --filter MonitoringOrchestratorTests`: 85 passed, 0 failures. Log: `/tmp/task8-rereview-orchestrator.log`.
+- Direct externally bounded `xctest`: 10 critical tests × 20 runs = 200/200 passed under ten-second per-run bounds. Log: `/tmp/task8-rereview-races-20x.log`.
+- `swift test --filter 'MonitoringOrchestratorTests|FileMonitoringRecoveryStoreTests'`: 124 passed, 0 failures. Log: `/tmp/task8-rereview-final-relevant.log`.
+- `swift test`: 224 passed, 0 failures. Log: `/tmp/task8-rereview-final-full.log`.
+- `swift build -c release`: exit 0. Log: `/tmp/task8-rereview-final-release.log`.
+- `git diff --check`: exit 0; security scan found no debug output, TODO/FIXME markers, forced casts/tries, dynamic evaluation, credential literals, commented-out production code, or `Task.yield`. Log: `/tmp/task8-rereview-final-security-diff.log`.
+- No worktree `xctest` or `swift test` process remained. Log: `/tmp/task8-rereview-final-orphans.log`.
+
+### Next Step
+
+Test with:
+
+```sh
+swift test --filter 'MonitoringOrchestratorTests|FileMonitoringRecoveryStoreTests'
+swift test
+swift build -c release
+```
+
+Expected failure mode: a cancelled final reconnect caller must remain pending until cancellation-ignoring owned work is released; a mismatch superseded before physical write must remain disconnected and schedule the corrective winner.
+
+Next phase: none — ready for review/testing.

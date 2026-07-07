@@ -277,7 +277,7 @@ Coverage added for suspended restore/event reconciliation, pause-drain and suspe
 - Reconnect remains disconnected until the current winner applies; no-winner and deduplication succeed, failure stays disconnected, and supersession retains the operation for the newest winner.
 - Pause, stop, and final-waiter cancellation drain health delay, command delay, and physical apply before restoration or completion.
 - Cancelled shared start/reconnect callers resolve independently while remaining callers keep one shared dependency operation. A sole cancelled start drains capture and cannot later activate.
-- Added 13 deterministic reconnect/lifecycle tests without `Task.yield()` ordering.
-- Verification passed: 68 orchestrator tests, 107 relevant tests, 207 full tests, 200/200 bounded race repetitions, release build, diff check, and security scan.
+- Added deterministic reconnect/lifecycle tests without `Task.yield()` ordering, including final-caller drain, terminal attachment, forced-mismatch supersession, post-await winner currency, safe deactivation cancellation, and non-initiating reconnect cancellation.
+- Latest verification passed: 85 orchestrator tests, 124 relevant tests, 224 full tests, 200/200 bounded critical-race repetitions, release build, diff check, security scan, and orphan-process check.
 
-Full evidence: `.superpowers/sdd/task-8-correction-2-report.md`. Remaining concerns are unchanged: no live bulb or process-kill test was run.
+Full evidence: `.superpowers/sdd/task-8-correction-2-report.md`, including the final re-review correction. Remaining concerns are unchanged: no live bulb or process-kill test was run.
