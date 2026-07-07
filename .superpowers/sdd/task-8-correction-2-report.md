@@ -76,6 +76,62 @@ Next phase: none — ready for review/testing.
 
 ---
 
+## Final Blocker Correction: Stable Winner Snapshots
+
+### RED
+
+Six deterministic tests were added before production changes. Each uses coordinator barriers to capture a winner, complete or hold newer accepts while the orchestrator is suspended, and then release the stale snapshot:
+
+- post-health stale no-winner snapshot;
+- post-health stale deduplication snapshot;
+- throttle stale no-winner snapshot;
+- throttle stale deduplication snapshot;
+- supersession-resolver stale no-winner snapshot;
+- two overlapping in-flight accepts where revision does not change during the winner await.
+
+Direct `xctest` runs failed all six tests for the intended behavior: the old code terminally connected reconnect over a newer completed accept, or connected while two newer accepts remained in flight. Log: `/tmp/task8-final-blocker-red.log`.
+
+### GREEN
+
+- `accept` now increments an actor-isolated monotonic event revision when acceptance begins and when `coordinator.accept` completes.
+- An actor-isolated in-flight accept count covers multiple overlapping accepts.
+- `stableWinnerSnapshot(while:)` is the sole production caller of `coordinator.currentWinner()`. It validates caller-specific lifecycle, task, throttle, and reconnect identity before and after the await, then requires unchanged event revision and zero accepts in flight.
+- Post-health reconnect, reconnect throttle, and supersession resolution treat an unstable snapshot as non-terminal, retain disconnected reconnect ownership, and schedule a fresh winner window.
+- Normal throttle, idle restoration, terminal expiry, physical-send currency, and post-apply rescheduling use the same snapshot helper; unstable normal snapshots reschedule instead of restoring or deduplicating.
+
+Focused command:
+
+```sh
+swift test --filter 'MonitoringOrchestratorTests.test(PostHealthStale|FireThrottleStale|SupersessionResolverStale|PostHealthSnapshotRejects)'
+```
+
+Result: 6 tests passed, 0 failures. Log: `/tmp/task8-final-blocker-green.log`.
+
+### Final Verification
+
+- `swift test --filter MonitoringOrchestratorTests`: 91 passed, 0 failures. Log: `/tmp/task8-final-blocker-orchestrator.log`.
+- Direct externally bounded `xctest`: 6 critical races × 20 runs = 120/120 passed under ten-second per-run bounds. Log: `/tmp/task8-final-blocker-races-20x.log`.
+- `swift test --filter 'MonitoringOrchestratorTests|FileMonitoringRecoveryStoreTests'`: 130 passed, 0 failures. Log: `/tmp/task8-final-blocker-relevant.log`.
+- `swift test`: 230 passed, 0 failures. Log: `/tmp/task8-final-blocker-full.log`.
+- `swift build -c release`: exit 0. Log: `/tmp/task8-final-blocker-release.log`.
+- `git diff --check`, production security scan, `Task.yield` scan, and orphan-process scan: clean. Log: `/tmp/task8-final-blocker-security-diff.log` and `/tmp/task8-final-blocker-orphans.log`.
+
+### Next Step
+
+Test with:
+
+```sh
+swift test --filter 'MonitoringOrchestratorTests|FileMonitoringRecoveryStoreTests'
+swift test
+swift build -c release
+```
+
+Expected failure mode: if an accept overlaps a winner snapshot, reconnect remains disconnected and pending until a fresh one-second winner window; no stale no-winner or deduplication snapshot may terminally connect.
+
+Next phase: none — ready for review/testing.
+
+---
+
 ## Re-review Correction
 
 ### RED

@@ -210,6 +210,10 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         let cancelledWaiters: [MonitoringLifecycleWaiterCompletion]
     }
 
+    private struct StableWinnerSnapshot: Sendable {
+        let winner: AgentEvent?
+    }
+
     private struct TerminalTimer: Sendable {
         let id: UUID
         let task: Task<Void, Never>
@@ -239,6 +243,8 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private var lifecycleWaiterCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var nextSequence: UInt64 = 0
     private var latestSessionSequence: [String: UInt64] = [:]
+    private var eventMutationRevision: UInt64 = 0
+    private var inFlightAcceptCount = 0
     private var baseline: BulbBaseline?
     private var storedRecovery: StoredMonitoringRecovery?
     private var adoptedBaseline: BulbBaseline?
@@ -337,6 +343,8 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     public func accept(_ event: AgentEvent) async {
         guard mode == .active else { return }
         let token = generation
+        eventMutationRevision &+= 1
+        inFlightAcceptCount += 1
         nextSequence &+= 1
         let accepted = AgentEvent(
             source: event.source,
@@ -350,6 +358,8 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         terminalTasks[accepted.sessionID] = nil
 
         await coordinator.accept(accepted)
+        inFlightAcceptCount -= 1
+        eventMutationRevision &+= 1
         guard mode == .active,
               generation == token,
               latestSessionSequence[accepted.sessionID] == accepted.sequence else {
@@ -367,14 +377,40 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         await refreshSnapshot()
         guard mode == .active, generation == token else { return }
 
-        if accepted.state == .idle, await coordinator.currentWinner() == nil {
+        if accepted.state == .idle {
+            let winnerSnapshot = await stableWinnerSnapshot {
+                mode == .active
+                    && generation == token
+                    && latestSessionSequence[accepted.sessionID] == accepted.sequence
+            }
+            guard mode == .active,
+                  generation == token,
+                  latestSessionSequence[accepted.sessionID] == accepted.sequence else {
+                return
+            }
+            guard let winnerSnapshot else {
+                scheduleThrottleIfNeeded()
+                return
+            }
+            guard winnerSnapshot.winner == nil else {
+                scheduleThrottleIfNeeded()
+                return
+            }
             let reconnectID = reconnectOperation?.id
             if let reconnectID {
                 await cancelReconnectAndWait(id: reconnectID)
             }
             await cancelThrottleAndWait()
             guard mode == .active, generation == token else { return }
-            if await coordinator.currentWinner() == nil {
+            let drainedWinnerSnapshot = await stableWinnerSnapshot {
+                mode == .active && generation == token
+            }
+            guard mode == .active, generation == token else { return }
+            guard let drainedWinnerSnapshot else {
+                scheduleThrottleIfNeeded()
+                return
+            }
+            if drainedWinnerSnapshot.winner == nil {
                 _ = await restoreCurrentOwnership()
             } else {
                 scheduleThrottleIfNeeded()
@@ -527,7 +563,13 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         generation token: UInt64,
         allowsDeduplication: Bool
     ) async {
-        let winner = await coordinator.currentWinner()
+        let snapshot = await stableWinnerSnapshot {
+            !Task.isCancelled
+                && reconnectOperation?.id == id
+                && reconnectOperation?.terminal == nil
+                && generation == token
+                && mode == .active
+        }
         guard reconnectOperation?.id == id,
               reconnectOperation?.terminal == nil,
               generation == token,
@@ -535,6 +577,14 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             requestReconnectTerminal(id: id, terminal: .lifecycleCancelled)
             return
         }
+        guard let snapshot else {
+            scheduleReconnectWinnerRetry(
+                id: id,
+                allowsDeduplication: allowsDeduplication
+            )
+            return
+        }
+        let winner = snapshot.winner
         guard let winner, let color = winner.state.color else {
             requestReconnectTerminal(id: id, terminal: .connected)
             return
@@ -546,6 +596,23 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
         reconnectOperation?.allowsDeduplication = allowsDeduplication
         reconnectOperation?.phase = .commandWindow
+        scheduleThrottleIfNeeded()
+    }
+
+    private func scheduleReconnectWinnerRetry(
+        id: UUID,
+        allowsDeduplication: Bool? = nil
+    ) {
+        guard var operation = reconnectOperation,
+              operation.id == id,
+              operation.terminal == nil,
+              mode == .active else { return }
+        if let allowsDeduplication {
+            operation.allowsDeduplication = operation.allowsDeduplication
+                && allowsDeduplication
+        }
+        operation.phase = .commandWindow
+        reconnectOperation = operation
         scheduleThrottleIfNeeded()
     }
 
@@ -985,16 +1052,31 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             finishThrottle(id: id)
             return
         }
-        let winner = await coordinator.currentWinner()
-        guard throttleID == id,
-              isSendContextCurrent(
-                  operationID: id,
-                  generation: token,
-                  reconnectID: reconnectID
-              ) else {
+        let snapshot = await stableWinnerSnapshot {
+            isSendContextCurrent(
+                operationID: id,
+                generation: token,
+                reconnectID: reconnectID
+            )
+        }
+        guard isSendContextCurrent(
+            operationID: id,
+            generation: token,
+            reconnectID: reconnectID
+        ) else {
             finishThrottle(id: id)
             return
         }
+        guard let snapshot else {
+            finishThrottle(id: id)
+            if let reconnectID {
+                scheduleReconnectWinnerRetry(id: reconnectID)
+            } else {
+                scheduleThrottleIfNeeded()
+            }
+            return
+        }
+        let winner = snapshot.winner
         guard let winner, let color = winner.state.color else {
             finishThrottle(id: id)
             if let reconnectID {
@@ -1060,8 +1142,13 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         await refreshSnapshot()
         guard generation == token, mode == .active else { return }
         if case .failed = outcome { return }
-        let currentWinner = await coordinator.currentWinner()
-        if throttleRescheduleRequested || currentWinner?.sequence != winner.sequence {
+        let currentWinnerSnapshot = await stableWinnerSnapshot {
+            generation == token && mode == .active
+        }
+        guard generation == token, mode == .active else { return }
+        if throttleRescheduleRequested
+            || currentWinnerSnapshot == nil
+            || currentWinnerSnapshot?.winner?.sequence != winner.sequence {
             throttleRescheduleRequested = false
             scheduleThrottleIfNeeded()
         }
@@ -1187,20 +1274,14 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         generation token: UInt64,
         reconnectID: UUID?
     ) async -> Bool {
-        guard isSendContextCurrent(
-            operationID: operationID,
-            generation: token,
-            reconnectID: reconnectID
-        ) else {
-            return false
+        let snapshot = await stableWinnerSnapshot {
+            isSendContextCurrent(
+                operationID: operationID,
+                generation: token,
+                reconnectID: reconnectID
+            )
         }
-        let winner = await coordinator.currentWinner()
-        guard isSendContextCurrent(
-            operationID: operationID,
-            generation: token,
-            reconnectID: reconnectID
-        ),
-              let winner,
+        guard let winner = snapshot?.winner,
               winner.sequence == winnerSequence,
               latestSessionSequence[winner.sessionID] == winnerSequence,
               winner.state.color == desired.color else {
@@ -1406,14 +1487,30 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         await coordinator.expireTerminalState(sessionID: sessionID, sequence: sequence)
         guard mode == .active, generation == token else { return }
         await refreshSnapshot()
-        if await coordinator.currentWinner() == nil {
+        let winnerSnapshot = await stableWinnerSnapshot {
+            mode == .active && generation == token
+        }
+        guard mode == .active, generation == token else { return }
+        guard let winnerSnapshot else {
+            scheduleThrottleIfNeeded()
+            return
+        }
+        if winnerSnapshot.winner == nil {
             let reconnectID = reconnectOperation?.id
             if let reconnectID {
                 await cancelReconnectAndWait(id: reconnectID)
             }
             await cancelThrottleAndWait()
             guard mode == .active, generation == token else { return }
-            if await coordinator.currentWinner() == nil {
+            let drainedWinnerSnapshot = await stableWinnerSnapshot {
+                mode == .active && generation == token
+            }
+            guard mode == .active, generation == token else { return }
+            guard let drainedWinnerSnapshot else {
+                scheduleThrottleIfNeeded()
+                return
+            }
+            if drainedWinnerSnapshot.winner == nil {
                 _ = await restoreCurrentOwnership()
             } else {
                 scheduleThrottleIfNeeded()
@@ -1440,6 +1537,20 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             connection: connection
         )
         subscribers.yield(snapshot)
+    }
+
+    private func stableWinnerSnapshot(
+        while isCurrent: () -> Bool
+    ) async -> StableWinnerSnapshot? {
+        guard isCurrent() else { return nil }
+        let revision = eventMutationRevision
+        let winner = await coordinator.currentWinner()
+        guard isCurrent(),
+              eventMutationRevision == revision,
+              inFlightAcceptCount == 0 else {
+            return nil
+        }
+        return StableWinnerSnapshot(winner: winner)
     }
 
     private func resolveReconnectApply(
@@ -1495,7 +1606,13 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             requestReconnectTerminal(id: id, terminal: .lifecycleCancelled)
             return
         }
-        let currentWinner = await coordinator.currentWinner()
+        let snapshot = await stableWinnerSnapshot {
+            reconnectOperation?.id == id
+                && reconnectOperation?.terminal == nil
+                && generation == token
+                && mode == .active
+                && (!Task.isCancelled || throttleRescheduleRequested)
+        }
         guard reconnectOperation?.id == id,
               reconnectOperation?.terminal == nil,
               generation == token,
@@ -1503,6 +1620,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             requestReconnectTerminal(id: id, terminal: .lifecycleCancelled)
             return
         }
+        guard let snapshot else {
+            throttleRescheduleRequested = false
+            scheduleReconnectWinnerRetry(id: id)
+            return
+        }
+        let currentWinner = snapshot.winner
         guard let currentWinner, let color = currentWinner.state.color else {
             requestReconnectTerminal(id: id, terminal: .connected)
             return

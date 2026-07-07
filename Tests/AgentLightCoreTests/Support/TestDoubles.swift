@@ -71,6 +71,10 @@ actor ManualClock: AgentLightClock {
         sleepers.count
     }
 
+    func sleepRequestCount() -> Int {
+        requestedSleeps.count
+    }
+
     func waitForSleepCount(_ count: Int) async {
         if requestedSleeps.count >= count { return }
         let id = UUID()
@@ -515,6 +519,11 @@ actor SnapshotBlockingSessionCoordinator: SessionCoordinating {
     private var blockedWinner: AgentEvent?
     private var blockedContinuation: CheckedContinuation<Void, Never>?
     private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var acceptsRemainingToBlock = 0
+    private var blockedAccepts: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var blockedAcceptCountWaiters: [
+        UUID: (Int, CheckedContinuation<Void, Never>)
+    ] = [:]
 
     func blockCurrentWinner(afterCalls calls: Int) {
         precondition(calls > 0)
@@ -533,7 +542,40 @@ actor SnapshotBlockingSessionCoordinator: SessionCoordinating {
         blockedContinuation = nil
     }
 
+    func blockNextAccepts(_ count: Int) {
+        precondition(count > 0)
+        acceptsRemainingToBlock = count
+    }
+
+    func waitForBlockedAcceptCount(_ count: Int) async {
+        if blockedAccepts.count >= count { return }
+        let id = UUID()
+        await withCheckedContinuation { continuation in
+            blockedAcceptCountWaiters[id] = (count, continuation)
+        }
+    }
+
+    func releaseBlockedAccepts() {
+        let continuations = blockedAccepts.values
+        blockedAccepts.removeAll()
+        for continuation in continuations { continuation.resume() }
+    }
+
     func accept(_ event: AgentEvent) async {
+        if acceptsRemainingToBlock > 0 {
+            acceptsRemainingToBlock -= 1
+            let id = UUID()
+            await withCheckedContinuation { continuation in
+                blockedAccepts[id] = continuation
+                let ready = blockedAcceptCountWaiters.filter {
+                    blockedAccepts.count >= $0.value.0
+                }
+                for (waiterID, waiter) in ready {
+                    blockedAcceptCountWaiters[waiterID] = nil
+                    waiter.1.resume()
+                }
+            }
+        }
         await underlying.accept(event)
     }
 

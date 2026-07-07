@@ -1360,6 +1360,236 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.needsYou))
     }
 
+    func testPostHealthStaleNoWinnerSnapshotDoesNotConnectOverNewerAccept() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let setup = try await makeDisconnectedOrchestrator(coordinator: coordinator)
+        await coordinator.reset()
+        await coordinator.blockCurrentWinner(afterCalls: 1)
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await coordinator.waitUntilCurrentWinnerIsBlocked()
+
+        await setup.orchestrator.accept(makeEvent(session: "newer", state: .needsYou))
+        await coordinator.releaseCurrentWinner()
+        await XCTAssertAsyncTrue(await eventually {
+            let completionCount = await completions.value()
+            let sleepCount = await setup.clock.sleepRequestCount()
+            return completionCount > 0 || sleepCount >= 4
+        })
+
+        guard await completions.value() == 0 else {
+            XCTFail("Stale no-winner snapshot connected reconnect")
+            await reconnect.value
+            return
+        }
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await reconnect.value
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.needsYou))
+    }
+
+    func testPostHealthStaleDedupSnapshotDoesNotConnectOverNewerAccept() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let setup = try await makeDisconnectedOrchestrator(coordinator: coordinator)
+        await setup.orchestrator.accept(makeEvent(session: "dedup", state: .thinking))
+        await coordinator.blockCurrentWinner(afterCalls: 1)
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await coordinator.waitUntilCurrentWinnerIsBlocked()
+
+        await setup.orchestrator.accept(makeEvent(session: "newer", state: .needsYou))
+        await coordinator.releaseCurrentWinner()
+        await XCTAssertAsyncTrue(await eventually {
+            let completionCount = await completions.value()
+            let sleepCount = await setup.clock.sleepRequestCount()
+            return completionCount > 0 || sleepCount >= 4
+        })
+
+        guard await completions.value() == 0 else {
+            XCTFail("Stale dedup snapshot connected reconnect")
+            await reconnect.value
+            return
+        }
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await reconnect.value
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.needsYou))
+    }
+
+    func testFireThrottleStaleNoWinnerSnapshotDoesNotConnectOverNewerAccept() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let setup = try await makeDisconnectedOrchestrator(coordinator: coordinator)
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await coordinator.reset()
+        await coordinator.blockCurrentWinner(afterCalls: 1)
+        await setup.clock.advance(by: .seconds(1))
+        await coordinator.waitUntilCurrentWinnerIsBlocked()
+
+        await setup.orchestrator.accept(makeEvent(session: "newer", state: .needsYou))
+        await coordinator.releaseCurrentWinner()
+        await XCTAssertAsyncTrue(await eventually {
+            let completionCount = await completions.value()
+            let sleepCount = await setup.clock.sleepRequestCount()
+            return completionCount > 0 || sleepCount >= 5
+        })
+
+        guard await completions.value() == 0 else {
+            XCTFail("Stale throttle no-winner snapshot connected reconnect")
+            await reconnect.value
+            return
+        }
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await reconnect.value
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.needsYou))
+    }
+
+    func testFireThrottleStaleDedupSnapshotDoesNotConnectOverNewerAccept() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let setup = try await makeDisconnectedOrchestrator(coordinator: coordinator)
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await coordinator.accept(
+            makeEvent(session: "zzzz-dedup", state: .thinking, externalSequence: 2)
+        )
+        await coordinator.blockCurrentWinner(afterCalls: 1)
+        await setup.clock.advance(by: .seconds(1))
+        await coordinator.waitUntilCurrentWinnerIsBlocked()
+
+        await setup.orchestrator.accept(makeEvent(session: "newer", state: .needsYou))
+        await coordinator.releaseCurrentWinner()
+        await XCTAssertAsyncTrue(await eventually {
+            let completionCount = await completions.value()
+            let sleepCount = await setup.clock.sleepRequestCount()
+            return completionCount > 0 || sleepCount >= 5
+        })
+
+        guard await completions.value() == 0 else {
+            XCTFail("Stale throttle dedup snapshot connected reconnect")
+            await reconnect.value
+            return
+        }
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await reconnect.value
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.needsYou))
+    }
+
+    func testSupersessionResolverStaleNoWinnerSnapshotDoesNotDropNewerAccept() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let store = MemoryRecoveryStore()
+        await store.blockSaveCall(5)
+        let setup = try await makeDisconnectedOrchestrator(
+            matchResults: [.success(false)],
+            coordinator: coordinator,
+            store: store
+        )
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await setup.clock.advance(by: .seconds(1))
+        await store.waitUntilSaveCallIsBlocked(5)
+
+        await setup.orchestrator.accept(makeEvent(session: "superseding", state: .needsYou))
+        await coordinator.reset()
+        await coordinator.blockCurrentWinner(afterCalls: 1)
+        await store.releaseSaveCall(5)
+        await coordinator.waitUntilCurrentWinnerIsBlocked()
+        await setup.orchestrator.accept(makeEvent(session: "newer", state: .thinking))
+        await coordinator.releaseCurrentWinner()
+        await XCTAssertAsyncTrue(await eventually {
+            let completionCount = await completions.value()
+            let sleepCount = await setup.clock.sleepRequestCount()
+            return completionCount > 0 || sleepCount >= 5
+        })
+
+        guard await completions.value() == 0 else {
+            XCTFail("Stale supersession snapshot connected reconnect")
+            await reconnect.value
+            return
+        }
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await reconnect.value
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.thinking))
+    }
+
+    func testPostHealthSnapshotRejectsTwoOverlappingInFlightAccepts() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let setup = try await makeDisconnectedOrchestrator(coordinator: coordinator)
+        await setup.orchestrator.accept(makeEvent(session: "dedup", state: .thinking))
+        await coordinator.blockNextAccepts(2)
+        let firstAccept = Task {
+            await setup.orchestrator.accept(makeEvent(session: "first", state: .needsYou))
+        }
+        await coordinator.waitForBlockedAcceptCount(1)
+        let secondAccept = Task {
+            await setup.orchestrator.accept(makeEvent(session: "second", state: .working))
+        }
+        await coordinator.waitForBlockedAcceptCount(2)
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await XCTAssertAsyncTrue(await eventually {
+            let completionCount = await completions.value()
+            let sleepCount = await setup.clock.sleepRequestCount()
+            return completionCount > 0 || sleepCount >= 4
+        })
+
+        if await completions.value() > 0 {
+            XCTFail("Snapshot connected while accepts remained in flight")
+        }
+        await coordinator.releaseBlockedAccepts()
+        await firstAccept.value
+        await secondAccept.value
+        guard await completions.value() == 0 else {
+            await reconnect.value
+            return
+        }
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await reconnect.value
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.working))
+    }
+
     func testCancellingSoleStartCallerCancelsBlockedCaptureAndNeverActivates() async {
         let light = RecordingLightController()
         await light.setCaptureBlocked(true)
