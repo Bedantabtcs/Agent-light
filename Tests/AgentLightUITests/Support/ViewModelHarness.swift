@@ -33,10 +33,15 @@ final class HarnessCallRecorder: @unchecked Sendable {
 actor ControllableSetupOwnershipStore: SetupOwnershipStoring {
     private var stored: SetupOwnershipReceipt?
     private var saveCount = 0
+    private var resetCount = 0
     private var failingSaveNumbers: Set<Int> = []
     private var failAllWrites = false
+    private var loadError: SetupOwnershipStoreError?
 
-    func load() async throws -> SetupOwnershipReceipt? { stored }
+    func load() async throws -> SetupOwnershipReceipt? {
+        if let loadError { throw loadError }
+        return stored
+    }
     func save(_ receipt: SetupOwnershipReceipt) async throws {
         saveCount += 1
         if failAllWrites || failingSaveNumbers.contains(saveCount) {
@@ -53,8 +58,15 @@ actor ControllableSetupOwnershipStore: SetupOwnershipStoring {
     }
     func failSaves(_ numbers: Set<Int>) { failingSaveNumbers = numbers }
     func failEveryWrite() { failAllWrites = true }
+    func allowWrites() { failAllWrites = false; failingSaveNumbers = [] }
+    func failLoads(with error: SetupOwnershipStoreError) { loadError = error }
+    func resetInvalidReceipt() async throws {
+        resetCount += 1
+        throw SetupOwnershipStoreError.resetNotRequired
+    }
     func current() -> SetupOwnershipReceipt? { stored }
     func writes() -> Int { saveCount }
+    func resetAttempts() -> Int { resetCount }
 }
 
 actor ResettableCorruptSetupOwnershipStore: SetupOwnershipStoring {

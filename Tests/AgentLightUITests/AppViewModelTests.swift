@@ -698,6 +698,100 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
     }
 
+    func testHealthRepairPersistenceFailureRetainsRefreshedAuthorityAndDoesNotReportMonitoring() async {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        let durableBefore = await store.current()
+        let refreshed = IntegrationInstallReceipt(
+            sources: AgentSource.allCases.map {
+                IntegrationSourceReceipt(
+                    source: $0,
+                    ownership: .fresh,
+                    marker: AppIdentity.integrationIdentifier,
+                    installedContentFingerprint: String(repeating: "d", count: 64)
+                )
+            }
+        )
+        await harness.integrations.setRepairedReceipt(refreshed)
+        await store.failEveryWrite()
+
+        await harness.viewModel.repairIntegrations()
+
+        let durableAfterFailure = await store.current()
+        XCTAssertEqual(durableAfterFailure, durableBefore)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.presentedError, .operationFailed)
+        XCTAssertFalse(harness.viewModel.canResetOwnershipReceipt)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.integrationPersistenceRetry))
+        let failedSnapshot = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(failedSnapshot.emergencyIntegrationRecovery?.receipt, refreshed)
+
+        await store.allowWrites()
+        await harness.viewModel.repairIntegrations()
+
+        let recoveredSnapshot = await harness.ownershipLedger.snapshot()
+        XCTAssertNil(recoveredSnapshot.emergencyIntegrationRecovery)
+        let recoveredReceipt = await store.current()
+        XCTAssertEqual(recoveredReceipt?.integration, .uninstallable(refreshed))
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertFalse(harness.viewModel.outstandingObligations.contains(.integrationPersistenceRetry))
+    }
+
+    func testPermanentlyUnwritableCompensationRetainsEmergencyReceiptAndRetriesInProcess() async {
+        let store = ControllableSetupOwnershipStore()
+        await store.failEveryWrite()
+        let harness = ViewModelHarness(ownershipStore: store)
+        let installedReceipt = IntegrationInstallReceipt(
+            sources: AgentSource.allCases.map {
+                IntegrationSourceReceipt(
+                    source: $0,
+                    ownership: .fresh,
+                    marker: AppIdentity.integrationIdentifier,
+                    installedContentFingerprint: String(repeating: "a", count: 64)
+                )
+            }
+        )
+        await harness.integrations.setUninstallError(HarnessSensitiveError("CANARY_UNINSTALL"))
+
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.viewModel.approveIntegrations()
+
+        let durableAfterCompensation = await store.current()
+        XCTAssertNil(durableAfterCompensation)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertFalse(harness.viewModel.canResetOwnershipReceipt)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.integrationUninstallRetry))
+        let firstFailure = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(firstFailure.emergencyIntegrationRecovery?.receipt, installedReceipt)
+
+        await harness.viewModel.repairIntegrations()
+
+        let repeatedExternalFailure = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(repeatedExternalFailure.emergencyIntegrationRecovery?.receipt, installedReceipt)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.integrationUninstallRetry))
+
+        await harness.integrations.setUninstallError(nil)
+        await harness.viewModel.repairIntegrations()
+
+        let secondFailure = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(secondFailure.emergencyIntegrationRecovery?.receipt, installedReceipt)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.integrationPersistenceRetry))
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+
+        await store.allowWrites()
+        await harness.viewModel.repairIntegrations()
+
+        let recovered = await harness.ownershipLedger.snapshot()
+        XCTAssertNil(recovered.emergencyIntegrationRecovery)
+        let durableAfterRecovery = await store.current()
+        XCTAssertNil(durableAfterRecovery)
+        XCTAssertEqual(harness.viewModel.phase, .integrationReview)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.isEmpty)
+        let integrationCounts = await harness.integrations.counts()
+        XCTAssertEqual(integrationCounts.uninstall, 3)
+    }
+
     func testFailedLoginPersistenceAndUnregisterRetainsDurableCleanupObligation() async {
         let store = ControllableSetupOwnershipStore()
         await store.failSaves([3])
@@ -719,6 +813,7 @@ final class AppViewModelTests: XCTestCase {
         await harness.viewModel.synchronizeOwnership()
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
         XCTAssertEqual(harness.viewModel.outstandingObligations, [.ownershipReceiptRepair])
+        XCTAssertTrue(harness.viewModel.canResetOwnershipReceipt)
 
         await harness.viewModel.resetOwnershipReceipt()
 
@@ -731,6 +826,35 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(counts.install, 0)
         XCTAssertEqual(counts.repair, 0)
         XCTAssertEqual(counts.uninstall, 0)
+    }
+
+    func testGenericReceiptFailuresCannotInvokeDestructiveReset() async {
+        for error in [SetupOwnershipStoreError.readFailed, .unsafeReceipt] {
+            let store = ControllableSetupOwnershipStore()
+            await store.failLoads(with: error)
+            let harness = ViewModelHarness(ownershipStore: store)
+
+            await harness.viewModel.synchronizeOwnership()
+            await harness.viewModel.resetOwnershipReceipt()
+
+            XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+            XCTAssertFalse(harness.viewModel.canResetOwnershipReceipt)
+            let resetAttempts = await store.resetAttempts()
+            XCTAssertEqual(resetAttempts, 0)
+        }
+
+        let writeStore = ControllableSetupOwnershipStore()
+        await writeStore.failEveryWrite()
+        let writeHarness = ViewModelHarness(ownershipStore: writeStore)
+        await writeHarness.viewModel.connect(using: writeHarness.validDraft)
+        await writeHarness.viewModel.approveIntegrations()
+
+        await writeHarness.viewModel.resetOwnershipReceipt()
+
+        XCTAssertEqual(writeHarness.viewModel.phase, .repairRequired)
+        XCTAssertFalse(writeHarness.viewModel.canResetOwnershipReceipt)
+        let resetAttempts = await writeStore.resetAttempts()
+        XCTAssertEqual(resetAttempts, 0)
     }
 
     func testCredentialRestoreFailureCreatesTypedObligationAndRetryClearsIt() async {

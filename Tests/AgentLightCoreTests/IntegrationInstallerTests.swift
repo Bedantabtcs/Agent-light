@@ -308,10 +308,29 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertEqual(repairedReceipt.sources.map(\.ownership), receipt.sources.map(\.ownership))
         XCTAssertEqual(try paths.all.map { try Data(contentsOf: $0.url) }, installed)
 
-        try await installer.uninstall()
+        try await installer.uninstall(using: repairedReceipt)
         for url in paths.all.map(\.url) {
             XCTAssertEqual(try JSONValue.decode(Data(contentsOf: url)), .object([:]))
         }
+        XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testBlindUninstallRequiresPersistedReceiptAndDoesNotMutateHooks() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+        _ = try await installer.installWithReceipt()
+        let installed = try paths.all.map { try Data(contentsOf: $0.url) }
+
+        do {
+            try await installer.uninstall()
+            XCTFail("Expected verified persisted receipt requirement")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, .receiptRequired)
+        }
+
+        XCTAssertEqual(try paths.all.map { try Data(contentsOf: $0.url) }, installed)
         XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
     }
 

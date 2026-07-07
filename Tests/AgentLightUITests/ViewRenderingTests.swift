@@ -320,6 +320,25 @@ final class ViewRenderingTests: XCTestCase {
         XCTAssertTrue(harness.viewModel.outstandingObligations.isEmpty)
     }
 
+    func testRenderedGenericOwnershipFailureShowsManualGuidanceWithoutResetControl() async {
+        let store = ControllableSetupOwnershipStore()
+        await store.failLoads(with: .unsafeReceipt)
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.viewModel.synchronizeOwnership()
+        let hosting = host(SettingsView(viewModel: harness.viewModel))
+
+        let rendered = renderedText(in: hosting)
+        XCTAssertTrue(
+            rendered.contains("Ownership state could not be read or saved. Retry, then inspect Application Support permissions if the problem continues."),
+            "\(rendered)"
+        )
+        XCTAssertFalse(rendered.contains { $0.contains("setup-ownership-v1") }, "\(rendered)")
+        let reset = descendants(of: hosting)
+            .compactMap { $0 as? NSButton }
+            .first { $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsResetOwnershipReceipt }
+        XCTAssertNil(reset)
+    }
+
     func testRenderedPrimaryControlsHaveStableAccessibilityIdentifiers() async {
         let onboarding = host(OnboardingView(viewModel: PreviewViewModel.onboarding()))
         let review = host(MenuBarContentView(viewModel: await PreviewViewModel.integrationReview()))

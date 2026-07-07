@@ -138,6 +138,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         XCTAssertEqual(snapshot.integration, durable.integration)
         XCTAssertEqual(snapshot.credentials, durable.credential)
         XCTAssertTrue(snapshot.obligations.contains(.ownershipReceiptRepair))
+        XCTAssertFalse(snapshot.ownershipReceiptResetEligible)
         let stored = await store.current()
         XCTAssertEqual(stored, durable)
     }
@@ -160,6 +161,33 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         XCTAssertEqual(snapshot.credentials, .none)
         XCTAssertEqual(snapshot.login, .none)
         XCTAssertEqual(snapshot.obligations, [.ownershipReceiptRepair])
+        XCTAssertTrue(snapshot.ownershipReceiptResetEligible)
+    }
+
+    func testOnlyMalformedUnsupportedAndOversizedReceiptsAreResetEligible() async {
+        let eligible: [SetupOwnershipStoreError] = [
+            .malformedReceipt,
+            .unsupportedVersion,
+            .receiptTooLarge
+        ]
+        for error in eligible {
+            let ledger = AppOwnershipLedger(store: FailingSetupOwnershipStore(loadError: error))
+            do { try await ledger.hydrate() } catch {}
+            let snapshot = await ledger.snapshot()
+            XCTAssertTrue(snapshot.ownershipReceiptResetEligible, "\(error)")
+        }
+
+        let ineligible: [SetupOwnershipStoreError] = [
+            .readFailed,
+            .writeFailed,
+            .unsafeReceipt
+        ]
+        for error in ineligible {
+            let ledger = AppOwnershipLedger(store: FailingSetupOwnershipStore(loadError: error))
+            do { try await ledger.hydrate() } catch {}
+            let snapshot = await ledger.snapshot()
+            XCTAssertFalse(snapshot.ownershipReceiptResetEligible, "\(error)")
+        }
     }
 
     func testConcurrentDurableMutationsCannotLoseAnEarlierReceiptUpdate() async throws {

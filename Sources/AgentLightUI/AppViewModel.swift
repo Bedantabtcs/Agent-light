@@ -111,6 +111,7 @@ public enum OutstandingObligation: String, Codable, Hashable, Sendable {
     case integrationRollbackRepair
     case integrationMixedAdoption
     case integrationArtifactCleanup
+    case integrationPersistenceRetry
     case credentialRestore
     case credentialDelete
     case credentialBackupCleanup
@@ -135,6 +136,7 @@ public final class AppViewModel: AppViewModeling {
     public private(set) var integrationInstalled = false
     public private(set) var integrationStatus: IntegrationInstallationStatus = .notInstalled
     public private(set) var monitoringActive = false
+    public private(set) var canResetOwnershipReceipt = false
 
     @ObservationIgnored private let credentials: any CredentialStoring
     @ObservationIgnored private let integrations: any IntegrationInstalling
@@ -467,7 +469,11 @@ public final class AppViewModel: AppViewModeling {
         guard originalPhase == .monitoring || originalPhase == .paused || originalPhase == .repairRequired else {
             return
         }
-        let requestedPlan = Self.repairPlan(for: outstandingObligations, phase: originalPhase)
+        let requestedPlan = Self.repairPlan(
+            for: outstandingObligations,
+            phase: originalPhase,
+            resetEligible: canResetOwnershipReceipt
+        )
         let integrations = integrations
         let ledger = ownershipLedger
         let presentationHandle = presentationHandle
@@ -487,25 +493,21 @@ public final class AppViewModel: AppViewModeling {
                   Self.repairPlan(plan, isValidFor: current) else {
                 self?.applyRepair(
                     .reconciled,
-                    snapshot: current,
+                    recording: .recorded(current),
                     plan: requestedPlan ?? .health,
                     originalPhase: originalPhase
                 )
                 await ledger.releaseLease(lease)
                 return
             }
-            let result = await Self.performRepair(
-                plan,
-                integration: current.integration,
-                using: integrations
-            )
-            let snapshot = await Self.recordRepair(
+            let result = await Self.performRepair(plan, snapshot: current, using: integrations)
+            let recording = await Self.recordRepair(
                 result,
                 plan: plan,
-                priorIntegration: current.integration,
+                priorSnapshot: current,
                 ledger: ledger
             )
-            self?.applyRepair(result, snapshot: snapshot, plan: plan, originalPhase: originalPhase)
+            self?.applyRepair(result, recording: recording, plan: plan, originalPhase: originalPhase)
             await ledger.releaseLease(lease)
         }
         let operation = SharedOperation(task: task)
@@ -520,7 +522,7 @@ public final class AppViewModel: AppViewModeling {
 
     public func resetOwnershipReceipt() async {
         guard phase == .repairRequired,
-              Self.repairPlan(for: outstandingObligations, phase: phase) == .ownershipReceiptReset,
+              canResetOwnershipReceipt,
               let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
         do {
             try await ownershipLedger.resetInvalidReceipt()
@@ -1134,10 +1136,15 @@ public final class AppViewModel: AppViewModeling {
         do {
             try await integrations.uninstall(using: receipt)
         } catch {
-            _ = await persist([
+            let recorded = await persist([
                 .integration(Self.integrationOwnership(for: receipt)),
                 .insertObligation(.integrationUninstallRetry)
             ], to: ledger)
+            if !recorded {
+                await ledger.setEmergencyIntegrationRecovery(
+                    EmergencyIntegrationRecovery(receipt: receipt, action: .uninstall)
+                )
+            }
         }
         return await ledger.snapshot()
     }
@@ -1305,6 +1312,7 @@ public final class AppViewModel: AppViewModeling {
         credentialOwnership = snapshot.credentials
         loginRegistrationOwned = snapshot.loginRegistrationOwned
         outstandingObligations = snapshot.obligations
+        canResetOwnershipReceipt = snapshot.ownershipReceiptResetEligible
     }
 
     private func finishDisconnect(_ snapshot: OwnershipSnapshot) {
@@ -1349,7 +1357,8 @@ public final class AppViewModel: AppViewModeling {
             .integrationUninstallRetry,
             .integrationRollbackRepair,
             .integrationMixedAdoption,
-            .integrationArtifactCleanup
+            .integrationArtifactCleanup,
+            .integrationPersistenceRetry
         ]
         if !snapshot.obligations.isDisjoint(with: repairObligations) {
             return .needsRepair
@@ -1366,13 +1375,17 @@ public final class AppViewModel: AppViewModeling {
 
     private static func repairPlan(
         for obligations: Set<OutstandingObligation>,
-        phase: AppPhase
+        phase: AppPhase,
+        resetEligible: Bool
     ) -> RepairPlan? {
-        if obligations.contains(.ownershipReceiptRepair) { return .ownershipReceiptReset }
+        if obligations.contains(.integrationPersistenceRetry) { return .persistEmergency }
         if obligations.contains(.integrationUninstallRetry) { return .uninstall }
         if obligations.contains(.integrationRollbackRepair) { return .rollback }
         if obligations.contains(.integrationArtifactCleanup) { return .artifactOnly }
         if obligations.contains(.integrationMixedAdoption) { return .adoptMixed }
+        if obligations.contains(.ownershipReceiptRepair) {
+            return resetEligible ? .ownershipReceiptReset : nil
+        }
         return phase == .monitoring || phase == .paused ? .health : nil
     }
 
@@ -1382,7 +1395,11 @@ public final class AppViewModel: AppViewModeling {
     ) -> Bool {
         switch plan {
         case .ownershipReceiptReset:
-            snapshot.obligations.contains(.ownershipReceiptRepair)
+            snapshot.ownershipReceiptResetEligible
+                && snapshot.obligations.contains(.ownershipReceiptRepair)
+        case .persistEmergency:
+            snapshot.emergencyIntegrationRecovery != nil
+                && snapshot.obligations.contains(.integrationPersistenceRetry)
         case .uninstall: snapshot.obligations.contains(.integrationUninstallRetry)
         case .rollback: snapshot.obligations.contains(.integrationRollbackRepair)
         case .adoptMixed: snapshot.obligations.contains(.integrationMixedAdoption)
@@ -1400,7 +1417,7 @@ public final class AppViewModel: AppViewModeling {
 
     private static func performRepair(
         _ plan: RepairPlan,
-        integration: PersistentIntegrationOwnership,
+        snapshot: OwnershipSnapshot,
         using integrations: any IntegrationInstalling
     ) async -> RepairResult {
         do {
@@ -1408,13 +1425,25 @@ public final class AppViewModel: AppViewModeling {
             switch plan {
             case .ownershipReceiptReset:
                 return .invalidAdoptionReceipt
-            case .uninstall:
-                guard case let .uninstallable(receipt) = integration else {
+            case .persistEmergency:
+                guard let recovery = snapshot.emergencyIntegrationRecovery else {
                     return .invalidAdoptionReceipt
+                }
+                return .emergencyPersistence(recovery)
+            case .uninstall:
+                let receipt: IntegrationInstallReceipt
+                if let emergency = snapshot.emergencyIntegrationRecovery,
+                   emergency.action == .uninstall {
+                    receipt = emergency.receipt
+                } else {
+                    guard case let .uninstallable(ownedReceipt) = snapshot.integration else {
+                        return .invalidAdoptionReceipt
+                    }
+                    receipt = ownedReceipt
                 }
                 try await integrations.uninstall(using: receipt)
             case .rollback, .health, .adoptMixed:
-                guard let receipt = integration.receipt else {
+                guard let receipt = snapshot.integration.receipt else {
                     return .invalidAdoptionReceipt
                 }
                 let updated = try await integrations.repair(using: receipt)
@@ -1444,14 +1473,16 @@ public final class AppViewModel: AppViewModeling {
     private static func recordRepair(
         _ result: RepairResult,
         plan: RepairPlan,
-        priorIntegration: PersistentIntegrationOwnership,
+        priorSnapshot: OwnershipSnapshot,
         ledger: AppOwnershipLedger
-    ) async -> OwnershipSnapshot {
-        let mutations: [OwnershipMutation]
+    ) async -> RepairRecordingResult {
+        var mutations: [OwnershipMutation]
         switch result {
         case let .success(updatedReceipt):
             switch plan {
             case .ownershipReceiptReset:
+                mutations = []
+            case .persistEmergency:
                 mutations = []
             case .uninstall:
                 mutations = [
@@ -1470,21 +1501,31 @@ public final class AppViewModel: AppViewModeling {
                 ]
             case .health:
                 mutations = updatedReceipt.map {
-                    [.integration(Self.replacingReceipt(in: priorIntegration, with: $0))]
+                    [.integration(Self.replacingReceipt(in: priorSnapshot.integration, with: $0))]
                 } ?? []
             case .artifactOnly: mutations = []
             }
+        case let .emergencyPersistence(recovery):
+            guard case let .persist(target) = recovery.action else {
+                return .persistenceFailed(await ledger.snapshot())
+            }
+            mutations = [
+                .integration(target),
+                .removeObligation(.ownershipReceiptRepair),
+                .removeObligation(.integrationPersistenceRetry),
+                .removeObligation(.integrationUninstallRetry)
+            ]
         case .artifactCleanupRequired:
             var artifactMutations: [OwnershipMutation] = []
             switch plan {
-            case .ownershipReceiptReset: break
+            case .ownershipReceiptReset, .persistEmergency: break
             case .uninstall, .rollback, .adoptMixed:
                 artifactMutations.append(.integration(.none))
             case .health, .artifactOnly:
-                artifactMutations.append(.integration(priorIntegration))
+                artifactMutations.append(.integration(priorSnapshot.integration))
             }
             switch plan {
-            case .ownershipReceiptReset: break
+            case .ownershipReceiptReset, .persistEmergency: break
             case .uninstall: artifactMutations.append(.removeObligation(.integrationUninstallRetry))
             case .rollback: artifactMutations.append(.removeObligation(.integrationRollbackRepair))
             case .adoptMixed: artifactMutations.append(.removeObligation(.integrationMixedAdoption))
@@ -1505,21 +1546,84 @@ public final class AppViewModel: AppViewModeling {
                 ? [.insertObligation(.integrationRollbackRepair)]
                 : []
         }
-        _ = await persist(mutations, to: ledger)
-        return await ledger.snapshot()
+        let resolvesEmergency: Bool
+        switch result {
+        case .success, .emergencyPersistence, .artifactCleanupRequired:
+            resolvesEmergency = true
+        default:
+            resolvesEmergency = false
+        }
+        if priorSnapshot.emergencyIntegrationRecovery != nil, resolvesEmergency {
+            mutations.append(contentsOf: [
+                .removeObligation(.ownershipReceiptRepair),
+                .removeObligation(.integrationPersistenceRetry)
+            ])
+        }
+        guard await persist(mutations, to: ledger) else {
+            if let recovery = emergencyRecovery(
+                after: result,
+                plan: plan,
+                priorSnapshot: priorSnapshot
+            ) {
+                await ledger.setEmergencyIntegrationRecovery(recovery)
+            }
+            return .persistenceFailed(await ledger.snapshot())
+        }
+        if (priorSnapshot.emergencyIntegrationRecovery != nil && resolvesEmergency)
+            || plan == .persistEmergency {
+            await ledger.clearEmergencyIntegrationRecovery()
+        }
+        return .recorded(await ledger.snapshot())
+    }
+
+    private static func emergencyRecovery(
+        after result: RepairResult,
+        plan: RepairPlan,
+        priorSnapshot: OwnershipSnapshot
+    ) -> EmergencyIntegrationRecovery? {
+        if case let .emergencyPersistence(recovery) = result { return recovery }
+        guard case let .success(updatedReceipt) = result else { return nil }
+        let receipt = updatedReceipt
+            ?? priorSnapshot.emergencyIntegrationRecovery?.receipt
+            ?? priorSnapshot.integration.receipt
+        guard let receipt else { return nil }
+        let target: PersistentIntegrationOwnership
+        switch plan {
+        case .health:
+            guard let updatedReceipt else { return nil }
+            target = replacingReceipt(in: priorSnapshot.integration, with: updatedReceipt)
+        case .uninstall, .rollback, .adoptMixed:
+            target = .none
+        case .ownershipReceiptReset, .persistEmergency, .artifactOnly:
+            return nil
+        }
+        return EmergencyIntegrationRecovery(receipt: receipt, action: .persist(target))
     }
 
     private func applyRepair(
         _ result: RepairResult,
-        snapshot: OwnershipSnapshot,
+        recording: RepairRecordingResult,
         plan: RepairPlan,
         originalPhase: AppPhase
     ) {
+        let snapshot = recording.snapshot
         syncOwnership(snapshot)
+        guard recording.wasPersisted else {
+            phase = .repairRequired
+            presentedError = .operationFailed
+            return
+        }
         switch result {
         case .success:
             if originalPhase == .repairRequired, outstandingObligations.isEmpty {
                 presentedError = nil
+                phase = pendingCredentials == nil ? .onboarding : .integrationReview
+            }
+        case .emergencyPersistence:
+            presentedError = nil
+            if snapshot.monitoringOwned {
+                phase = .monitoring
+            } else if outstandingObligations.isEmpty {
                 phase = pendingCredentials == nil ? .onboarding : .integrationReview
             }
         case .artifactCleanupRequired:
@@ -1561,6 +1665,7 @@ public final class AppViewModel: AppViewModeling {
     private var hasIntegrationObligation: Bool {
         hasActionableIntegrationObligation
             || outstandingObligations.contains(.integrationArtifactCleanup)
+            || outstandingObligations.contains(.integrationPersistenceRetry)
     }
 
     private static func presentationError(for snapshot: OwnershipSnapshot) -> PresentationError {
@@ -1568,7 +1673,8 @@ public final class AppViewModel: AppViewModeling {
             .integrationUninstallRetry,
             .integrationRollbackRepair,
             .integrationMixedAdoption,
-            .integrationArtifactCleanup
+            .integrationArtifactCleanup,
+            .integrationPersistenceRetry
         ]
         return snapshot.obligations.isDisjoint(with: integrationObligations)
             ? .operationFailed
@@ -1765,19 +1871,25 @@ public struct OwnershipSnapshot: Equatable, Sendable {
     public var login: PersistentLoginOwnership
     public var monitoringOwned: Bool
     public var obligations: Set<OutstandingObligation>
+    public var ownershipReceiptResetEligible: Bool
+    public var emergencyIntegrationRecovery: EmergencyIntegrationRecovery?
 
     public init(
         integration: PersistentIntegrationOwnership = .none,
         credentials: PersistentCredentialOwnership = .none,
         login: PersistentLoginOwnership = .none,
         monitoringOwned: Bool = false,
-        obligations: Set<OutstandingObligation> = []
+        obligations: Set<OutstandingObligation> = [],
+        ownershipReceiptResetEligible: Bool = false,
+        emergencyIntegrationRecovery: EmergencyIntegrationRecovery? = nil
     ) {
         self.integration = integration
         self.credentials = credentials
         self.login = login
         self.monitoringOwned = monitoringOwned
         self.obligations = obligations
+        self.ownershipReceiptResetEligible = ownershipReceiptResetEligible
+        self.emergencyIntegrationRecovery = emergencyIntegrationRecovery
     }
 
     var loginRegistrationOwned: Bool { login != .none }
@@ -1787,6 +1899,7 @@ public struct OwnershipSnapshot: Equatable, Sendable {
             || credentials != .none
             || login != .none
             || monitoringOwned
+            || emergencyIntegrationRecovery != nil
             || !obligations.isEmpty
     }
 }
@@ -1799,6 +1912,28 @@ public enum OwnershipMutation: Sendable {
     case removeObligation(OutstandingObligation)
 }
 
+fileprivate enum EmergencyIntegrationAction: Equatable, Sendable {
+    case uninstall
+    case persist(PersistentIntegrationOwnership)
+}
+
+public struct EmergencyIntegrationRecovery: Equatable, Sendable {
+    public let receipt: IntegrationInstallReceipt
+    fileprivate let action: EmergencyIntegrationAction
+
+    fileprivate var obligation: OutstandingObligation {
+        switch action {
+        case .uninstall: .integrationUninstallRetry
+        case .persist: .integrationPersistenceRetry
+        }
+    }
+
+    fileprivate init(receipt: IntegrationInstallReceipt, action: EmergencyIntegrationAction) {
+        self.receipt = receipt
+        self.action = action
+    }
+}
+
 public actor AppOwnershipLedger {
     private struct LeaseWaiter {
         let id: UUID
@@ -1809,6 +1944,8 @@ public actor AppOwnershipLedger {
     private var value = OwnershipSnapshot()
     private var hydrated = false
     private var hydrationFailure: SetupOwnershipStoreError?
+    private var ownershipReceiptResetEligible = false
+    private var emergencyIntegrationRecovery: EmergencyIntegrationRecovery?
     private var persistenceBusy = false
     private var persistenceWaiters: [CheckedContinuation<Void, Never>] = []
     private var presentationHandlesByID: [UUID: AppPresentationHandle] = [:]
@@ -1855,20 +1992,31 @@ public actor AppOwnershipLedger {
             }
             hydrated = true
             hydrationFailure = nil
+            ownershipReceiptResetEligible = false
         } catch let error as SetupOwnershipStoreError {
             value = OwnershipSnapshot(obligations: [.ownershipReceiptRepair])
             hydrated = true
             hydrationFailure = error
+            ownershipReceiptResetEligible = Self.isResetEligible(error)
             throw error
         } catch {
             value = OwnershipSnapshot(obligations: [.ownershipReceiptRepair])
             hydrated = true
             hydrationFailure = .readFailed
+            ownershipReceiptResetEligible = false
             throw SetupOwnershipStoreError.readFailed
         }
     }
 
-    public func snapshot() -> OwnershipSnapshot { value }
+    public func snapshot() -> OwnershipSnapshot {
+        var snapshot = value
+        snapshot.ownershipReceiptResetEligible = ownershipReceiptResetEligible
+        snapshot.emergencyIntegrationRecovery = emergencyIntegrationRecovery
+        if let emergencyIntegrationRecovery {
+            snapshot.obligations.insert(emergencyIntegrationRecovery.obligation)
+        }
+        return snapshot
+    }
 
     public func update(_ mutation: OwnershipMutation) async throws {
         try await update([mutation])
@@ -1902,11 +2050,14 @@ public actor AppOwnershipLedger {
             }
             value = proposed
             hydrationFailure = nil
+            ownershipReceiptResetEligible = false
         } catch let error as SetupOwnershipStoreError {
             value.obligations.insert(.ownershipReceiptRepair)
+            ownershipReceiptResetEligible = false
             throw error
         } catch {
             value.obligations.insert(.ownershipReceiptRepair)
+            ownershipReceiptResetEligible = false
             throw SetupOwnershipStoreError.writeFailed
         }
     }
@@ -1914,9 +2065,7 @@ public actor AppOwnershipLedger {
     public func resetInvalidReceipt() async throws {
         await acquirePersistenceAccess()
         defer { releasePersistenceAccess() }
-        guard hydrationFailure == .malformedReceipt
-                || hydrationFailure == .unsupportedVersion
-                || hydrationFailure == .receiptTooLarge,
+        guard ownershipReceiptResetEligible,
               value.obligations.contains(.ownershipReceiptRepair) else {
             throw SetupOwnershipStoreError.resetNotRequired
         }
@@ -1924,6 +2073,19 @@ public actor AppOwnershipLedger {
         value = OwnershipSnapshot()
         hydrated = true
         hydrationFailure = nil
+        ownershipReceiptResetEligible = false
+    }
+
+    fileprivate func setEmergencyIntegrationRecovery(_ recovery: EmergencyIntegrationRecovery) {
+        emergencyIntegrationRecovery = recovery
+    }
+
+    fileprivate func clearEmergencyIntegrationRecovery() {
+        emergencyIntegrationRecovery = nil
+    }
+
+    private static func isResetEligible(_ error: SetupOwnershipStoreError) -> Bool {
+        error == .malformedReceipt || error == .unsupportedVersion || error == .receiptTooLarge
     }
 
     private func acquirePersistenceAccess() async {
@@ -2149,6 +2311,7 @@ private struct PreparedObservation {
 
 private enum RepairPlan: Equatable {
     case ownershipReceiptReset
+    case persistEmergency
     case uninstall
     case rollback
     case adoptMixed
@@ -2158,6 +2321,7 @@ private enum RepairPlan: Equatable {
 
 private enum RepairResult {
     case success(updatedReceipt: IntegrationInstallReceipt?)
+    case emergencyPersistence(EmergencyIntegrationRecovery)
     case artifactCleanupRequired
     case legacyArtifactCleanupRequired
     case artifactVerifiedClean
@@ -2166,6 +2330,22 @@ private enum RepairResult {
     case failure(PresentationError)
     case cancelled
     case reconciled
+}
+
+private enum RepairRecordingResult {
+    case recorded(OwnershipSnapshot)
+    case persistenceFailed(OwnershipSnapshot)
+
+    var snapshot: OwnershipSnapshot {
+        switch self {
+        case let .recorded(snapshot), let .persistenceFailed(snapshot): snapshot
+        }
+    }
+
+    var wasPersisted: Bool {
+        if case .recorded = self { return true }
+        return false
+    }
 }
 
 private enum PauseResult {

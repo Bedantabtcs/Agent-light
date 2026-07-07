@@ -153,6 +153,7 @@ public enum IntegrationError: Error, Equatable {
     case artifactCleanupFailure([String])
     case rollbackFailed([String])
     case ownershipVerificationFailed
+    case receiptRequired
 }
 
 public struct IntegrationConfigEditor: Sendable {
@@ -810,7 +811,7 @@ public struct IntegrationInstaller: IntegrationInstalling {
     }
 
     public func uninstall() async throws {
-        try apply(includeMissing: false) { editor, data in try editor.uninstall(from: data) }
+        throw IntegrationError.receiptRequired
     }
 
     public func uninstall(using receipt: IntegrationInstallReceipt) async throws {
@@ -872,25 +873,6 @@ public struct IntegrationInstaller: IntegrationInstalling {
         return true
     }
 
-    private func apply(
-        includeMissing: Bool,
-        transform: (IntegrationConfigEditor, Data) throws -> Data
-    ) throws {
-        let changes = try paths.all.compactMap { configuration -> AtomicConfigurationChange? in
-            let before = try fileOperations.snapshot(at: configuration.url)
-            if !includeMissing, before == .missing { return nil }
-            let editor = IntegrationConfigEditor(source: configuration.source, relayPath: relayPath)
-            return AtomicConfigurationChange(
-                destination: configuration.url,
-                before: before,
-                after: try transform(editor, before.data)
-            )
-        }
-        let cleanupFailures = try AtomicConfigurationWriter(fileOperations: fileOperations).apply(changes)
-        if !cleanupFailures.isEmpty {
-            throw IntegrationError.artifactCleanupFailure(cleanupFailures)
-        }
-    }
 }
 
 private struct AtomicConfigurationChange {
