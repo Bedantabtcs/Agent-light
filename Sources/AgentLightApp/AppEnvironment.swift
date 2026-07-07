@@ -67,10 +67,10 @@ final class AppEnvironment {
     @ObservationIgnored private let viewModel: any AppViewModeling
     @ObservationIgnored private let credentials: any CredentialStoring
     @ObservationIgnored private let monitor: any MonitoringOrchestrating
-    @ObservationIgnored private let relay: any RelayServing
     @ObservationIgnored private let coordinator: any RelayEventCoordinating
     @ObservationIgnored private let prepareStorage: @Sendable () async throws -> Void
     @ObservationIgnored private let beforeApproval: @Sendable () async -> Void
+    @ObservationIgnored private let beforeRelayStart: @Sendable () async -> Void
     @ObservationIgnored private let terminateApplication: @MainActor @Sendable () -> Void
     @ObservationIgnored private let shutdownController: EnvironmentShutdownController
     @ObservationIgnored private var lifecycle: Lifecycle = .idle
@@ -86,6 +86,7 @@ final class AppEnvironment {
         coordinator: any RelayEventCoordinating,
         prepareStorage: @escaping @Sendable () async throws -> Void,
         beforeApproval: @escaping @Sendable () async -> Void = {},
+        beforeRelayStart: @escaping @Sendable () async -> Void = {},
         terminateApplication: @escaping @MainActor @Sendable () -> Void = {
             NSApplication.shared.terminate(nil)
         }
@@ -93,10 +94,10 @@ final class AppEnvironment {
         self.viewModel = viewModel
         self.credentials = credentials
         self.monitor = monitor
-        self.relay = relay
         self.coordinator = coordinator
         self.prepareStorage = prepareStorage
         self.beforeApproval = beforeApproval
+        self.beforeRelayStart = beforeRelayStart
         self.terminateApplication = terminateApplication
         shutdownController = EnvironmentShutdownController(relay: relay, viewModel: viewModel)
     }
@@ -132,28 +133,33 @@ final class AppEnvironment {
         let viewModel = viewModel
         let credentials = credentials
         let monitor = monitor
-        let relay = relay
         let coordinator = coordinator
         let prepareStorage = prepareStorage
         let beforeApproval = beforeApproval
+        let beforeRelayStart = beforeRelayStart
         let shutdownController = shutdownController
         let canContinue: @MainActor @Sendable () -> Bool = { [weak self] in
             self?.lifecycle == .starting
         }
         let task = Task { [weak self] in
-            await shutdownController.arm()
+            guard let relayGeneration = await shutdownController.arm() else {
+                self?.finishStart(.cancelled, id: id)
+                return
+            }
             let outcome = await Self.performStart(
                 viewModel: viewModel,
                 credentials: credentials,
                 monitor: monitor,
-                relay: relay,
                 coordinator: coordinator,
                 prepareStorage: prepareStorage,
                 beforeApproval: beforeApproval,
+                beforeRelayStart: beforeRelayStart,
+                shutdownController: shutdownController,
+                relayGeneration: relayGeneration,
                 canContinue: canContinue
             )
             if outcome != .ready {
-                await shutdownController.shutdown()
+                await shutdownController.shutdown(generation: relayGeneration)
             }
             self?.finishStart(outcome, id: id)
         }
@@ -173,10 +179,12 @@ final class AppEnvironment {
         viewModel: any AppViewModeling,
         credentials: any CredentialStoring,
         monitor: any MonitoringOrchestrating,
-        relay: any RelayServing,
         coordinator: any RelayEventCoordinating,
         prepareStorage: @Sendable () async throws -> Void,
         beforeApproval: @Sendable () async -> Void,
+        beforeRelayStart: @Sendable () async -> Void,
+        shutdownController: EnvironmentShutdownController,
+        relayGeneration: UInt64,
         canContinue: @MainActor @Sendable () -> Bool
     ) async -> StartOutcome {
         do {
@@ -211,10 +219,14 @@ final class AppEnvironment {
             }
             try Task.checkCancellation()
             guard await canContinue() else { throw CancellationError() }
+            await beforeRelayStart()
             let coordinator = coordinator
-            try await relay.start { data in
+            let didStart = try await shutdownController.start(
+                generation: relayGeneration
+            ) { data in
                 await coordinator.accept(data)
             }
+            guard didStart else { throw CancellationError() }
             try Task.checkCancellation()
             return .ready
         } catch is CancellationError {
@@ -258,9 +270,7 @@ final class AppEnvironment {
         prior?.cancel()
         let shutdownController = shutdownController
         let task = Task { [weak self] in
-            let shutdown = Task { await shutdownController.shutdown() }
-            await prior?.value
-            await shutdown.value
+            await shutdownController.shutdown()
             self?.finishStop(id: id)
         }
         operationTail = task
@@ -302,9 +312,16 @@ final class AppEnvironment {
 }
 
 private actor EnvironmentShutdownController {
+    private struct RegisteredStart {
+        let id: UUID
+        let task: Task<Void, Error>
+    }
+
     private let relay: any RelayServing
     private let viewModel: any AppViewModeling
     private var isArmed = true
+    private var generation: UInt64 = 0
+    private var registeredStart: RegisteredStart?
     private var shutdownTask: Task<Void, Never>?
 
     init(relay: any RelayServing, viewModel: any AppViewModeling) {
@@ -312,27 +329,65 @@ private actor EnvironmentShutdownController {
         self.viewModel = viewModel
     }
 
-    func arm() async {
+    func arm() async -> UInt64? {
+        guard !Task.isCancelled else { return nil }
         await shutdownTask?.value
+        guard !Task.isCancelled else { return nil }
+        generation &+= 1
         isArmed = true
+        return generation
     }
 
-    func shutdown() async {
+    func start(
+        generation expectedGeneration: UInt64,
+        handler: @escaping @Sendable (Data) async -> Void
+    ) async throws -> Bool {
+        guard isArmed, expectedGeneration == generation else { return false }
+        let id = UUID()
+        let relay = relay
+        let task = Task {
+            try await relay.start(handler: handler)
+        }
+        registeredStart = RegisteredStart(id: id, task: task)
+        do {
+            try await task.value
+            clearRegisteredStart(id: id)
+            return true
+        } catch {
+            clearRegisteredStart(id: id)
+            throw error
+        }
+    }
+
+    func shutdown(generation expectedGeneration: UInt64? = nil) async {
+        if let expectedGeneration, expectedGeneration != generation { return }
         if let shutdownTask {
             await shutdownTask.value
             return
         }
         guard isArmed else { return }
         isArmed = false
+        let pendingStart = registeredStart
         let relay = relay
         let viewModel = viewModel
         let task = Task {
+            if let pendingStart {
+                _ = try? await pendingStart.task.value
+            }
             await relay.stop()
             await viewModel.shutdownMonitoring()
         }
         shutdownTask = task
         await task.value
+        if let pendingStart {
+            clearRegisteredStart(id: pendingStart.id)
+        }
         shutdownTask = nil
+    }
+
+    private func clearRegisteredStart(id: UUID) {
+        guard registeredStart?.id == id else { return }
+        registeredStart = nil
     }
 }
 

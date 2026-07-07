@@ -324,6 +324,88 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertFalse(recorder.values.contains(.relayStart))
     }
 
+    func testStopDisarmsRelayBeforeStartOwnershipRegistration() async {
+        let recorder = EnvironmentRecorder()
+        let relayStartEntryGate = EnvironmentGate()
+        await relayStartEntryGate.block()
+        let relay = EnvironmentRelay(recorder: recorder)
+        let environment = AppEnvironment(
+            viewModel: EnvironmentViewModel(recorder: recorder),
+            credentials: EnvironmentCredentials(recorder: recorder, stored: nil),
+            monitor: EnvironmentMonitor(recorder: recorder),
+            relay: relay,
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {},
+            beforeRelayStart: { await relayStartEntryGate.enter() }
+        )
+        environment.requestStart()
+        await relayStartEntryGate.waitForEntry()
+
+        let stopping = Task {
+            await environment.stop()
+            recorder.append(.environmentStopComplete)
+        }
+        await spinMainActor(until: { recorder.values.contains(.environmentStopComplete) })
+
+        let startsBeforeRelease = await relay.count()
+        let activeBeforeRelease = await relay.active()
+        XCTAssertTrue(recorder.values.contains(.environmentStopComplete))
+        XCTAssertEqual(startsBeforeRelease, 0)
+        XCTAssertFalse(activeBeforeRelease)
+
+        await relayStartEntryGate.release()
+        await stopping.value
+        await spinMainActor()
+
+        let finalStartCount = await relay.count()
+        let isFinallyActive = await relay.active()
+        XCTAssertEqual(finalStartCount, 0)
+        XCTAssertFalse(isFinallyActive)
+    }
+
+    func testStopWaitsForRegisteredRelayStartThenStopsIt() async {
+        let recorder = EnvironmentRecorder()
+        let relay = EnvironmentRelay(recorder: recorder)
+        await relay.blockStart()
+        let environment = AppEnvironment(
+            viewModel: EnvironmentViewModel(recorder: recorder),
+            credentials: EnvironmentCredentials(recorder: recorder, stored: nil),
+            monitor: EnvironmentMonitor(recorder: recorder),
+            relay: relay,
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {}
+        )
+        environment.requestStart()
+        await relay.waitForStart()
+
+        let stopping = Task {
+            await environment.stop()
+            recorder.append(.environmentStopComplete)
+        }
+        await spinMainActor()
+
+        XCTAssertFalse(recorder.values.contains(.relayStop))
+        XCTAssertFalse(recorder.values.contains(.environmentStopComplete))
+
+        await relay.releaseStart()
+        await stopping.value
+
+        let calls = recorder.values
+        let startIndex = calls.firstIndex(of: .relayStart)
+        let stopIndex = calls.firstIndex(of: .relayStop)
+        XCTAssertNotNil(startIndex)
+        XCTAssertNotNil(stopIndex)
+        if let startIndex, let stopIndex {
+            XCTAssertLessThan(startIndex, stopIndex)
+        }
+        let startCount = await relay.count()
+        let stopCount = await relay.stopCount()
+        let isActive = await relay.active()
+        XCTAssertEqual(startCount, 1)
+        XCTAssertEqual(stopCount, 1)
+        XCTAssertFalse(isActive)
+    }
+
     func testConcurrentRetryRequestsShareOneOwnedRecoveryAndRelayStart() async {
         let recorder = EnvironmentRecorder()
         let monitor = EnvironmentMonitor(recorder: recorder)
@@ -818,6 +900,7 @@ private actor VerifierService: TuyaDeviceServicing {
 private enum EnvironmentCall: Equatable, Sendable {
     case prepare, recover, loadCredentials, deleteCredentials, synchronize, connect, approve
     case relayStart, relayAccept, relayStop, shutdownMonitoring, disconnect, terminate
+    case environmentStopComplete
 }
 
 private final class EnvironmentRecorder: @unchecked Sendable {
@@ -925,26 +1008,39 @@ private actor EnvironmentRelay: RelayServing {
     private let recorder: EnvironmentRecorder
     private var handler: (@Sendable (Data) async -> Void)?
     private(set) var startCount = 0
+    private(set) var relayStopCount = 0
+    private var isActive = false
     private var remainingStartFailures = 0
+    private let startGate = EnvironmentGate()
     private let stopGate = EnvironmentGate()
     init(recorder: EnvironmentRecorder) { self.recorder = recorder }
     func start(handler: @escaping @Sendable (Data) async -> Void) async throws {
         startCount += 1
-        self.handler = handler
         recorder.append(.relayStart)
+        await startGate.enter()
         if remainingStartFailures > 0 {
             remainingStartFailures -= 1
             throw EnvironmentRelayError.startFailed
         }
+        self.handler = handler
+        isActive = true
     }
     func stop() async {
+        relayStopCount += 1
         recorder.append(.relayStop)
         await stopGate.enter()
+        handler = nil
+        isActive = false
     }
     func deliver(_ data: Data) async { await handler?(data) }
     func count() -> Int { startCount }
+    func stopCount() -> Int { relayStopCount }
+    func active() -> Bool { isActive }
     func failStart() { remainingStartFailures = .max }
     func failNextStart() { remainingStartFailures += 1 }
+    func blockStart() async { await startGate.block() }
+    func waitForStart() async { await startGate.waitForEntry() }
+    func releaseStart() async { await startGate.release() }
     func blockStop() async { await stopGate.block() }
     func waitForStop() async { await stopGate.waitForEntry() }
     func releaseStop() async { await stopGate.release() }

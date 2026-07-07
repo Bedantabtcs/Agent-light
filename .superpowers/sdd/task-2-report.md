@@ -71,6 +71,37 @@ The Task 2 review identified two registration-window races and missing path-leve
 
 The correction did not access or mutate HOME configuration, live credentials, login registration, hook files, a physical bulb, an installed app, browser state, or GitHub.
 
+## Final correction: relay start/stop ownership
+
+The final Task 2 review found an authorization-to-relay-start window where shutdown could stop the relay before startup registered ownership, allowing the late start to reactivate relay delivery. The correction adds:
+
+- Exclusive relay lifecycle ownership in `EnvironmentShutdownController`; `performStart` no longer calls the relay directly.
+- A synchronous, generation-checked start registration before awaiting `relay.start`.
+- Synchronous shutdown disarm before suspension. Shutdown awaits a registered start attempt, then stops the relay and invokes the exact-once view-model shutdown.
+- Generation-scoped startup cleanup, so a stale canceled startup cannot disarm a newer queued restart.
+- Stop completion without waiting for unrelated pre-registration startup suspension; a late start for the disarmed generation is rejected without calling the relay.
+- Deterministic fake-relay start blocking and active-state assertions while preserving handler delivery through the existing coordinator.
+
+### Final correction RED evidence
+
+- In the pre-registration window test, stop did not complete while the test gate was held. After release, `relay.start` ran once and left the relay active.
+- In the registered-start test, `relay.stop` ran before the blocked `relay.start` was released. The late start then left the relay active.
+
+### Final correction verification
+
+- Focused relay-window tests: 2 passed, 0 failures.
+- `swift test --filter AppEnvironmentTests`: 31 passed, 0 failures.
+- `swift test --filter AppViewModelTests`: 143 passed, 0 failures.
+- Relay-window stress: 20/20 repeated focused runs passed.
+- `swift test`: 491 tests passed, 0 failures.
+- `swift build -c release`: exit 0.
+- `git diff --check`: clean.
+- Production security scan: no added debug logging, dynamic evaluation, private-key material, canary credentials, or hardcoded access secrets.
+- Relay ownership scan: production `relay.start` and `relay.stop` calls exist only in `EnvironmentShutdownController`.
+- Process scan: no orphaned AgentLight XCTest process.
+
+The final correction did not access or mutate HOME configuration, live credentials, login registration, hook files, a physical bulb, an installed app, browser state, or GitHub.
+
 ## Concerns
 
 - None blocking Task 2. Live launch-at-login relaunch and physical bulb restore remain manual acceptance checks outside automated implementation.
