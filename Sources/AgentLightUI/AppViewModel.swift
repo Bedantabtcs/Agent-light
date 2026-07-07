@@ -15,6 +15,7 @@ public protocol AppViewModeling: AnyObject {
     var integrationPreviews: [IntegrationPreview] { get }
     var presentedError: PresentationError? { get }
     var outstandingObligations: Set<OutstandingObligation> { get }
+    var loginItemStatus: LoginItemStatus { get }
     func connect(using draft: ConnectionDraft) async
     func approveIntegrations() async
     func pause() async
@@ -23,10 +24,13 @@ public protocol AppViewModeling: AnyObject {
     func disconnect() async
     func observeMonitoring() async
     func synchronizeOwnership() async
+    func requestLaunchAtLogin() async
 }
 
 public extension AppViewModeling {
     func synchronizeOwnership() async {}
+    var loginItemStatus: LoginItemStatus { .unknown }
+    func requestLaunchAtLogin() async {}
 }
 
 public enum AppPhase: Equatable, Sendable {
@@ -84,6 +88,7 @@ public final class AppViewModel: AppViewModeling {
     public private(set) var integrationPreviews: [IntegrationPreview] = []
     public private(set) var presentedError: PresentationError?
     public private(set) var outstandingObligations: Set<OutstandingObligation> = []
+    public private(set) var loginItemStatus: LoginItemStatus
 
     @ObservationIgnored private let credentials: any CredentialStoring
     @ObservationIgnored private let integrations: any IntegrationInstalling
@@ -128,6 +133,7 @@ public final class AppViewModel: AppViewModeling {
         self.loginItem = loginItem
         self.verifier = verifier
         self.ownershipLedger = ownershipLedger
+        loginItemStatus = loginItem.status()
         let presentationHandle = AppPresentationHandle()
         self.presentationHandle = presentationHandle
         presentationHandle.attach(self)
@@ -512,6 +518,24 @@ public final class AppViewModel: AppViewModeling {
         await operation.wait()
     }
 
+    public func requestLaunchAtLogin() async {
+        guard phase == .monitoring || phase == .paused || phase == .repairRequired,
+              let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        do {
+            let transition = try loginItem.setEnabled(true)
+            loginItemStatus = transition.current
+            if transition.didRegister {
+                loginRegistrationOwned = true
+                await ownershipLedger.setLoginOwned(true)
+            }
+            presentedError = transition.current == .requiresApproval ? .loginApprovalRequired : nil
+        } catch {
+            loginItemStatus = loginItem.status()
+            presentedError = .operationFailed
+        }
+        await ownershipLedger.releaseLease(lease)
+    }
+
     public func observeMonitoring() async {
         guard await hydrateOwnership() else { return }
         guard ownsMonitoring, phase == .monitoring || phase == .approving else { return }
@@ -826,12 +850,14 @@ public final class AppViewModel: AppViewModeling {
         switch result {
         case let .success(observation, snapshot):
             syncOwnership(snapshot)
+            loginItemStatus = loginItem.status()
             ownsMonitoring = snapshot.monitoringOwned
             installObservation(observation)
             phase = .monitoring
             presentedError = nil
         case let .failure(error, snapshot):
             syncOwnership(snapshot)
+            loginItemStatus = loginItem.status()
             ownsMonitoring = snapshot.monitoringOwned
             cancelObservation(resetState: true)
             phase = snapshot.obligations.isEmpty ? .integrationReview : .repairRequired
@@ -859,6 +885,7 @@ public final class AppViewModel: AppViewModeling {
         currentState = .idle
         sessions = []
         connectionStatus = .disconnected
+        loginItemStatus = loginItem.status()
         phase = outstandingObligations.isEmpty ? .onboarding : .repairRequired
         if outstandingObligations.isEmpty {
             presentedError = nil

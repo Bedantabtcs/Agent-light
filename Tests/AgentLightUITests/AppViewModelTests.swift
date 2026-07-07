@@ -5,6 +5,18 @@ import Observation
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testLaunchAtLoginStatusAndRetryUseViewModelBoundary() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        XCTAssertEqual(harness.viewModel.loginItemStatus, .enabled)
+
+        harness.loginItem.currentStatus = .notRegistered
+        await harness.viewModel.requestLaunchAtLogin()
+
+        XCTAssertEqual(harness.viewModel.loginItemStatus, .enabled)
+        XCTAssertEqual(harness.loginItem.enableCount, 2)
+    }
+
     func testLegacyViewModelConformerGetsDefaultSynchronization() async {
         let model = LegacyAppViewModelConformer()
 

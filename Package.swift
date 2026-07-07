@@ -29,6 +29,10 @@ let package = Package(
         .testTarget(
             name: "AgentLightUITests",
             dependencies: ["AgentLightUI", "AgentLightCore", "AgentLightProtocol"]
+        ),
+        .testTarget(
+            name: "AgentLightAppTests",
+            dependencies: ["AgentLightApp", "AgentLightUI", "AgentLightCore"]
         )
     ],
     swiftLanguageModes: [.v6]

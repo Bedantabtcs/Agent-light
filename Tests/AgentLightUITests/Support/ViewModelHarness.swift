@@ -606,6 +606,51 @@ final class ViewModelHarness {
     }
 }
 
+@MainActor
+enum PreviewViewModel {
+    static func onboarding() -> AppViewModel {
+        ViewModelHarness().viewModel
+    }
+
+    static func integrationReview() async -> AppViewModel {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        return harness.viewModel
+    }
+
+    static func monitoring(
+        state: AgentState,
+        sessions: [AgentEvent] = [.canaryThinking]
+    ) async -> AppViewModel {
+        let harness = ViewModelHarness(
+            initialSnapshot: MonitoringSnapshot(
+                state: state,
+                sessions: sessions,
+                connection: .connected
+            )
+        )
+        await harness.connectAndApprove()
+        return harness.viewModel
+    }
+
+    static func paused() async -> AppViewModel {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.viewModel.pause()
+        return harness.viewModel
+    }
+
+    static func repairRequired() async -> AppViewModel {
+        let harness = ViewModelHarness()
+        await harness.integrations.setInstallError(
+            IntegrationError.rollbackFailed(["CANARY_CONFLICT"])
+        )
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.viewModel.approveIntegrations()
+        return harness.viewModel
+    }
+}
+
 private func canaryURL(_ value: String) -> URL {
     guard let url = URL(string: value) else {
         preconditionFailure("Static canary URL must be valid")
