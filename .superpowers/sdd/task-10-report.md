@@ -324,6 +324,47 @@ Starting commit: `acb1ac7a2adab2bc414fed685476d7ffce146b13`
 
 ---
 
+## Ownership Finalization Correction
+
+Date: 2026-07-07
+Starting commit: `d0ad043a973a56efc3e54fc29d882a0869c32bc3`
+
+### Repair ownership semantics
+
+- Repair recording now receives the authoritative integration cleanup ownership from the leased snapshot.
+- Health repair and artifact-only verification preserve existing cleanup ownership. A committed cleanup error can add an artifact obligation without losing the ability to uninstall Agent Light-owned hooks during disconnect.
+- Successful rollback repair and explicit mixed adoption clear integration cleanup ownership to `none`. Harmless adopted or repaired presence no longer blocks a subsequent approval attempt.
+- Owner view models with retained pending credentials return to integration review and can approve again. Stale replacement view models synchronize to onboarding after the final obligation and cleanup ownership are cleared.
+
+### Presentation-handle lifecycle
+
+- Presentation handles expose only weak-owner liveness.
+- The ledger prunes dead handles during registration, broadcast/read, and live-count inspection. Repeated replacement construction and deallocation no longer grows retained handle history.
+- Cleanup broadcasts iterate only live handles; dead view models are skipped without retaining or reviving them.
+
+### RED/GREEN evidence
+
+- RED: all three health-repair committed-cleanup error forms replaced uninstallable ownership, so disconnect made zero uninstall calls. GREEN: disconnect uninstalls once and retains the artifact obligation.
+- RED: successful rollback and mixed-adoption repair stored `preexisting`, causing approval retry to make no new install and remain in integration review. GREEN: cleanup ownership clears, approval installs, and monitoring starts.
+- RED: a stale replacement remained repair-required after rollback repair because harmless presence kept the ledger non-empty. GREEN: rollback and mixed-adoption replacements synchronize to onboarding with no error.
+- RED: the ledger exposed no bounded live-handle registry. GREEN: 25 deallocated replacements prune to one live handle before cleanup broadcast.
+
+### Verification
+
+- `swift test --filter AppViewModelTests`: 102 passed, 0 failures.
+- `swift test --filter IntegrationInstallerTests`: 33 passed, 0 failures.
+- Ownership and presentation-handle subset: 20 consecutive runs; 7 tests per run, 0 failures.
+- `swift test`: 372 passed, 0 failures.
+- `swift build -c release`: exit 0.
+- `git diff --check`: exit 0 with no output.
+- Security/orphan scan: no polling/sleeps, debug output, dynamic evaluation, TODO/FIXME markers, force tries/casts, private-key markers, non-canary test credentials, stale preexisting repair writes, or removed lifecycle flags.
+
+### Remaining concern
+
+- The live presentation registry is process-memory-only. Dead handles are pruned on the next registry operation rather than by a deinitializer task, avoiding lifecycle work that could outlive the ledger owner.
+
+---
+
 ## Second Re-review Correction Batch
 
 Date: 2026-07-07

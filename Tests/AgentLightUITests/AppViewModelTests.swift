@@ -820,6 +820,151 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.phase, .integrationReview)
     }
 
+    func testHealthRepairCommittedCleanupPreservesOwnedHooksForDisconnect() async {
+        for errorKind in 0..<3 {
+            let harness = ViewModelHarness()
+            await harness.connectAndApprove()
+            let error: any Error & Sendable
+            switch errorKind {
+            case 0:
+                error = IntegrationError.artifactCleanupFailure(["CANARY_ARTIFACT"])
+            case 1:
+                error = IntegrationError.committedWithCleanupFailure(["CANARY_LEGACY"])
+            default:
+                error = IntegrationError.committedWithReceiptCleanupFailure(
+                    receipt: harness.freshInstallReceipt,
+                    failures: ["CANARY_RECEIPT"]
+                )
+            }
+            await harness.integrations.setRepairError(error)
+
+            await harness.viewModel.repairIntegrations()
+            await harness.integrations.setRepairError(nil)
+            await harness.viewModel.disconnect()
+
+            let counts = await harness.integrations.counts()
+            XCTAssertEqual(counts.uninstall, 1, "error kind \(errorKind)")
+            XCTAssertEqual(
+                harness.viewModel.outstandingObligations,
+                [.integrationArtifactCleanup],
+                "error kind \(errorKind)"
+            )
+        }
+    }
+
+    func testArtifactOnlyVerificationPreservesOwnedHooksAfterHealthCleanupFailure() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.integrations.setRepairError(
+            IntegrationError.committedWithCleanupFailure(["CANARY_ARTIFACT"])
+        )
+        await harness.viewModel.repairIntegrations()
+        await harness.integrations.setRepairError(nil)
+        await harness.integrations.setArtifactVerification(clean: true)
+
+        await harness.viewModel.repairIntegrations()
+        await harness.viewModel.disconnect()
+
+        let counts = await harness.integrations.counts()
+        XCTAssertEqual(counts.uninstall, 1)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+    }
+
+    func testRollbackRepairClearsCleanupOwnershipAndAllowsApprovalRetry() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.integrations.setInstallError(
+            IntegrationError.rollbackFailed(["CANARY_PRIVATE_PATH"])
+        )
+        await harness.viewModel.approveIntegrations()
+
+        await harness.viewModel.repairIntegrations()
+        await harness.integrations.setInstallError(nil)
+        await harness.viewModel.approveIntegrations()
+
+        let counts = await harness.integrations.counts()
+        XCTAssertEqual(counts.install, 2)
+        XCTAssertEqual(counts.repair, 1)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+    }
+
+    func testMixedAdoptionRepairClearsCleanupOwnershipAndAllowsApprovalRetry() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.integrations.setInstallOwnership([.fresh])
+        await harness.viewModel.approveIntegrations()
+        await harness.integrations.setInstallOwnership([.fresh, .fresh, .fresh])
+
+        await harness.viewModel.repairIntegrations()
+        await harness.viewModel.approveIntegrations()
+
+        let counts = await harness.integrations.counts()
+        XCTAssertEqual(counts.install, 3)
+        XCTAssertEqual(counts.repair, 0)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+    }
+
+    func testReplacementReconcilesAfterRollbackRepairClearsCleanupOwnership() async {
+        let harness = ViewModelHarness()
+        let owner = makeViewModel(using: harness)
+        await owner.connect(using: harness.validDraft)
+        await harness.integrations.setInstallError(
+            IntegrationError.rollbackFailed(["CANARY_PRIVATE_PATH"])
+        )
+        await owner.approveIntegrations()
+        let replacement = makeViewModel(using: harness)
+        await replacement.synchronizeOwnership()
+        XCTAssertEqual(replacement.phase, .repairRequired)
+
+        await owner.repairIntegrations()
+        await replacement.synchronizeOwnership()
+
+        XCTAssertEqual(replacement.outstandingObligations, [])
+        XCTAssertEqual(replacement.phase, .onboarding)
+        XCTAssertNil(replacement.presentedError)
+    }
+
+    func testReplacementReconcilesAfterMixedAdoptionClearsCleanupOwnership() async {
+        let harness = ViewModelHarness()
+        let owner = makeViewModel(using: harness)
+        await owner.connect(using: harness.validDraft)
+        await harness.integrations.setInstallOwnership([.fresh])
+        await owner.approveIntegrations()
+        let replacement = makeViewModel(using: harness)
+        await replacement.synchronizeOwnership()
+        XCTAssertEqual(replacement.phase, .repairRequired)
+        await harness.integrations.setInstallOwnership([.fresh, .fresh, .fresh])
+
+        await owner.repairIntegrations()
+        await replacement.synchronizeOwnership()
+
+        XCTAssertEqual(replacement.outstandingObligations, [])
+        XCTAssertEqual(replacement.phase, .onboarding)
+        XCTAssertNil(replacement.presentedError)
+    }
+
+    func testPresentationHandleRegistryPrunesDeallocatedReplacements() async {
+        let harness = ViewModelHarness()
+        for _ in 0..<25 {
+            var replacement: AppViewModel? = makeViewModel(using: harness)
+            await replacement?.synchronizeOwnership()
+            weak var weakReplacement = replacement
+            replacement = nil
+            XCTAssertNil(weakReplacement)
+        }
+        let live = makeViewModel(using: harness)
+        await live.synchronizeOwnership()
+
+        let liveHandleCount = await harness.ownershipLedger.livePresentationHandleCountForTesting()
+        await live.disconnect()
+
+        XCTAssertEqual(liveHandleCount, 1)
+        XCTAssertEqual(live.phase, .onboarding)
+    }
+
     func testPreviewConflictRemainsOnboardingAndNeverPersists() async {
         let harness = ViewModelHarness()
         await harness.integrations.setPreviewError(IntegrationError.destinationChanged("CANARY_PRIVATE_PATH"))

@@ -439,7 +439,12 @@ public final class AppViewModel: AppViewModeling {
                 return
             }
             let result = await Self.performRepair(plan, using: integrations)
-            let snapshot = await Self.recordRepair(result, plan: plan, ledger: ledger)
+            let snapshot = await Self.recordRepair(
+                result,
+                plan: plan,
+                priorIntegration: current.integration,
+                ledger: ledger
+            )
             self?.applyRepair(result, snapshot: snapshot, plan: plan, originalPhase: originalPhase)
             await ledger.releaseLease(lease)
         }
@@ -942,6 +947,7 @@ public final class AppViewModel: AppViewModeling {
     private static func recordRepair(
         _ result: RepairResult,
         plan: RepairPlan,
+        priorIntegration: IntegrationOwnership,
         ledger: AppOwnershipLedger
     ) async -> OwnershipSnapshot {
         switch result {
@@ -952,10 +958,10 @@ public final class AppViewModel: AppViewModeling {
                 await ledger.setIntegration(.none)
             case .rollback:
                 await ledger.remove(.integrationRollbackRepair)
-                await ledger.setIntegration(.preexisting)
+                await ledger.setIntegration(.none)
             case .adoptMixed:
                 await ledger.remove(.integrationMixedAdoption)
-                await ledger.setIntegration(.preexisting)
+                await ledger.setIntegration(.none)
             case .health, .artifactOnly: break
             }
         case .artifactCleanupRequired:
@@ -966,7 +972,12 @@ public final class AppViewModel: AppViewModeling {
             case .health, .artifactOnly: break
             }
             await ledger.insert(.integrationArtifactCleanup)
-            await ledger.setIntegration(plan == .uninstall ? .none : .preexisting)
+            switch plan {
+            case .uninstall, .rollback, .adoptMixed:
+                await ledger.setIntegration(.none)
+            case .health, .artifactOnly:
+                await ledger.setIntegration(priorIntegration)
+            }
         case .legacyArtifactCleanupRequired:
             await ledger.insert(.integrationArtifactCleanup)
         case .artifactVerifiedClean:
@@ -996,10 +1007,10 @@ public final class AppViewModel: AppViewModeling {
                 integrationOwnership = .none
             case .rollback:
                 outstandingObligations.remove(.integrationRollbackRepair)
-                integrationOwnership = .preexisting
+                integrationOwnership = .none
             case .adoptMixed:
                 outstandingObligations.remove(.integrationMixedAdoption)
-                integrationOwnership = .preexisting
+                integrationOwnership = .none
             case .health, .artifactOnly:
                 break
             }
@@ -1015,7 +1026,12 @@ public final class AppViewModel: AppViewModeling {
             case .health, .artifactOnly: break
             }
             outstandingObligations.insert(.integrationArtifactCleanup)
-            integrationOwnership = plan == .uninstall ? .none : .preexisting
+            switch plan {
+            case .uninstall, .rollback, .adoptMixed:
+                integrationOwnership = .none
+            case .health, .artifactOnly:
+                break
+            }
         case .legacyArtifactCleanupRequired:
             outstandingObligations.insert(.integrationArtifactCleanup)
             phase = .repairRequired
@@ -1230,6 +1246,8 @@ fileprivate final class AppPresentationHandle: @unchecked Sendable {
         self.owner = owner
     }
 
+    var isAlive: Bool { owner != nil }
+
     func commitSharedCleanup(_ snapshot: OwnershipSnapshot) {
         owner?.commitSharedCleanup(snapshot)
     }
@@ -1298,12 +1316,22 @@ public actor AppOwnershipLedger {
 
     public init() {}
 
-    fileprivate func registerPresentationHandle(_ handle: AppPresentationHandle) {
+    fileprivate func registerPresentationHandle(_ handle: AppPresentationHandle) async {
+        await pruneDeadPresentationHandles()
         presentationHandlesByID[handle.id] = handle
     }
 
-    fileprivate func presentationHandles() -> [AppPresentationHandle] {
-        Array(presentationHandlesByID.values)
+    fileprivate func presentationHandles() async -> [AppPresentationHandle] {
+        await pruneDeadPresentationHandles()
+        return Array(presentationHandlesByID.values)
+    }
+
+    private func pruneDeadPresentationHandles() async {
+        var deadIDs: [UUID] = []
+        for (id, handle) in presentationHandlesByID {
+            if !(await handle.isAlive) { deadIDs.append(id) }
+        }
+        for id in deadIDs { presentationHandlesByID.removeValue(forKey: id) }
     }
 
     fileprivate func acquireLease() async -> UUID {
@@ -1376,6 +1404,11 @@ public actor AppOwnershipLedger {
     }
 
 #if DEBUG
+    func livePresentationHandleCountForTesting() async -> Int {
+        await pruneDeadPresentationHandles()
+        return presentationHandlesByID.count
+    }
+
     func acquireDurableLeaseForTesting() async -> UUID { await acquireLease() }
 
     func releaseLeaseForTesting(_ token: UUID) async { await releaseLease(token) }
