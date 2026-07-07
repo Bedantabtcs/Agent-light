@@ -672,19 +672,26 @@ public final class AppViewModel: AppViewModeling {
         case let .uninstallable(receipt):
             do {
                 try await integrations.uninstall(using: receipt)
-                let persisted = await Self.persist([
-                    .integration(.none),
-                    .removeObligation(.integrationUninstallRetry)
-                ], to: ownershipLedger)
+                let persisted = await Self.persistCommittedIntegrationState(
+                    receipt: receipt,
+                    priorSnapshot: snapshot,
+                    integration: .none,
+                    removing: [.integrationUninstallRetry],
+                    inserting: [],
+                    ledger: ownershipLedger
+                )
                 phase = persisted ? phase : .repairRequired
                 presentedError = persisted ? nil : .operationFailed
-            } catch IntegrationError.artifactCleanupFailure,
-                    IntegrationError.committedWithCleanupFailure,
-                    IntegrationError.committedWithReceiptCleanupFailure {
-                _ = await Self.persist([
-                    .integration(.none),
-                    .insertObligation(.integrationArtifactCleanup)
-                ], to: ownershipLedger)
+            } catch let error as IntegrationError where Self.isCommittedCleanup(error) {
+                let committedReceipt = Self.committedReceipt(from: error) ?? receipt
+                _ = await Self.persistCommittedIntegrationState(
+                    receipt: committedReceipt,
+                    priorSnapshot: snapshot,
+                    integration: .none,
+                    removing: [.integrationUninstallRetry],
+                    inserting: [.integrationArtifactCleanup],
+                    ledger: ownershipLedger
+                )
                 phase = .repairRequired
                 presentedError = .operationFailed
             } catch IntegrationError.ownershipVerificationFailed,
@@ -1162,6 +1169,32 @@ public final class AppViewModel: AppViewModeling {
         }
     }
 
+    private static func persistCommittedIntegrationState(
+        receipt: IntegrationInstallReceipt,
+        priorSnapshot: OwnershipSnapshot,
+        integration: PersistentIntegrationOwnership,
+        removing removedObligations: Set<OutstandingObligation>,
+        inserting insertedObligations: Set<OutstandingObligation>,
+        ledger: AppOwnershipLedger
+    ) async -> Bool {
+        let target = emergencyPersistenceTarget(
+            priorSnapshot: priorSnapshot,
+            integration: integration,
+            removing: removedObligations,
+            inserting: insertedObligations
+        )
+        let persisted = await persist([
+            .integration(target.integration),
+            .obligations(target.obligations)
+        ], to: ledger)
+        if !persisted {
+            await ledger.setEmergencyIntegrationRecovery(
+                EmergencyIntegrationRecovery(receipt: receipt, action: .persist(target))
+            )
+        }
+        return persisted
+    }
+
     private static func cleanupOwnedState(
         integrations: any IntegrationInstalling,
         credentials: any CredentialStoring,
@@ -1252,16 +1285,23 @@ public final class AppViewModel: AppViewModeling {
         case let .uninstallable(receipt):
             do {
                 try await integrations.uninstall(using: receipt)
-                _ = await persist([
-                    .integration(.none),
-                    .removeObligation(.integrationUninstallRetry)
-                ], to: ledger)
+                _ = await persistCommittedIntegrationState(
+                    receipt: receipt,
+                    priorSnapshot: snapshot,
+                    integration: .none,
+                    removing: [.integrationUninstallRetry],
+                    inserting: [],
+                    ledger: ledger
+                )
             } catch let error as IntegrationError where Self.isCommittedCleanup(error) {
-                _ = await persist([
-                    .integration(.none),
-                    .removeObligation(.integrationUninstallRetry),
-                    .insertObligation(.integrationArtifactCleanup)
-                ], to: ledger)
+                _ = await persistCommittedIntegrationState(
+                    receipt: committedReceipt(from: error) ?? receipt,
+                    priorSnapshot: snapshot,
+                    integration: .none,
+                    removing: [.integrationUninstallRetry],
+                    inserting: [.integrationArtifactCleanup],
+                    ledger: ledger
+                )
             } catch IntegrationError.ownershipVerificationFailed,
                     IntegrationError.destinationChanged {
                 _ = await persist([
@@ -1458,11 +1498,15 @@ public final class AppViewModel: AppViewModeling {
             }
             return .success(updatedReceipt: nil)
         } catch IntegrationError.artifactCleanupFailure {
-            return .artifactCleanupRequired
+            return .artifactCleanupRequired(updatedReceipt: nil)
         } catch let IntegrationError.committedWithReceiptCleanupFailure(receipt, _) {
-            return receipt.isValid ? .artifactCleanupRequired : .legacyArtifactCleanupRequired
+            return receipt.isValid && receipt.hasVerifiableFingerprints
+                ? .artifactCleanupRequired(updatedReceipt: receipt)
+                : .legacyArtifactCleanupRequired
         } catch IntegrationError.committedWithCleanupFailure {
-            return plan == .adoptMixed ? .legacyArtifactCleanupRequired : .artifactCleanupRequired
+            return plan == .adoptMixed
+                ? .legacyArtifactCleanupRequired
+                : .artifactCleanupRequired(updatedReceipt: nil)
         } catch is CancellationError {
             return .cancelled
         } catch {
@@ -1510,19 +1554,20 @@ public final class AppViewModel: AppViewModeling {
                 return .persistenceFailed(await ledger.snapshot())
             }
             mutations = [
-                .integration(target),
-                .removeObligation(.ownershipReceiptRepair),
-                .removeObligation(.integrationPersistenceRetry),
-                .removeObligation(.integrationUninstallRetry)
+                .integration(target.integration),
+                .obligations(target.obligations)
             ]
-        case .artifactCleanupRequired:
+        case let .artifactCleanupRequired(updatedReceipt):
             var artifactMutations: [OwnershipMutation] = []
             switch plan {
             case .ownershipReceiptReset, .persistEmergency: break
             case .uninstall, .rollback, .adoptMixed:
                 artifactMutations.append(.integration(.none))
             case .health, .artifactOnly:
-                artifactMutations.append(.integration(priorSnapshot.integration))
+                let ownership = updatedReceipt.map {
+                    replacingReceipt(in: priorSnapshot.integration, with: $0)
+                } ?? priorSnapshot.integration
+                artifactMutations.append(.integration(ownership))
             }
             switch plan {
             case .ownershipReceiptReset, .persistEmergency: break
@@ -1582,22 +1627,68 @@ public final class AppViewModel: AppViewModeling {
         priorSnapshot: OwnershipSnapshot
     ) -> EmergencyIntegrationRecovery? {
         if case let .emergencyPersistence(recovery) = result { return recovery }
-        guard case let .success(updatedReceipt) = result else { return nil }
+        let updatedReceipt: IntegrationInstallReceipt?
+        let insertsArtifactCleanup: Bool
+        switch result {
+        case let .success(receipt):
+            updatedReceipt = receipt
+            insertsArtifactCleanup = false
+        case let .artifactCleanupRequired(receipt):
+            updatedReceipt = receipt
+            insertsArtifactCleanup = true
+        case .legacyArtifactCleanupRequired:
+            updatedReceipt = nil
+            insertsArtifactCleanup = true
+        default:
+            return nil
+        }
         let receipt = updatedReceipt
             ?? priorSnapshot.emergencyIntegrationRecovery?.receipt
             ?? priorSnapshot.integration.receipt
         guard let receipt else { return nil }
-        let target: PersistentIntegrationOwnership
+        let integration: PersistentIntegrationOwnership
+        var removedObligations: Set<OutstandingObligation> = []
         switch plan {
         case .health:
-            guard let updatedReceipt else { return nil }
-            target = replacingReceipt(in: priorSnapshot.integration, with: updatedReceipt)
-        case .uninstall, .rollback, .adoptMixed:
-            target = .none
+            integration = updatedReceipt.map {
+                replacingReceipt(in: priorSnapshot.integration, with: $0)
+            } ?? priorSnapshot.integration
+        case .uninstall:
+            integration = .none
+            removedObligations.insert(.integrationUninstallRetry)
+        case .rollback:
+            integration = .none
+            removedObligations.insert(.integrationRollbackRepair)
+        case .adoptMixed:
+            integration = .none
+            removedObligations.insert(.integrationMixedAdoption)
         case .ownershipReceiptReset, .persistEmergency, .artifactOnly:
-            return nil
+            integration = priorSnapshot.integration
         }
+        let target = emergencyPersistenceTarget(
+            priorSnapshot: priorSnapshot,
+            integration: integration,
+            removing: removedObligations,
+            inserting: insertsArtifactCleanup ? [.integrationArtifactCleanup] : []
+        )
         return EmergencyIntegrationRecovery(receipt: receipt, action: .persist(target))
+    }
+
+    private static func emergencyPersistenceTarget(
+        priorSnapshot: OwnershipSnapshot,
+        integration: PersistentIntegrationOwnership,
+        removing removedObligations: Set<OutstandingObligation>,
+        inserting insertedObligations: Set<OutstandingObligation>
+    ) -> EmergencyPersistenceTarget {
+        var obligations = priorSnapshot.obligations
+        obligations.remove(.ownershipReceiptRepair)
+        obligations.remove(.integrationPersistenceRetry)
+        if let emergency = priorSnapshot.emergencyIntegrationRecovery {
+            obligations.remove(emergency.obligation)
+        }
+        obligations.subtract(removedObligations)
+        obligations.formUnion(insertedObligations)
+        return EmergencyPersistenceTarget(integration: integration, obligations: obligations)
     }
 
     private func applyRepair(
@@ -1620,11 +1711,15 @@ public final class AppViewModel: AppViewModeling {
                 phase = pendingCredentials == nil ? .onboarding : .integrationReview
             }
         case .emergencyPersistence:
-            presentedError = nil
-            if snapshot.monitoringOwned {
+            if !outstandingObligations.isEmpty {
+                phase = .repairRequired
+                presentedError = Self.presentationError(for: snapshot)
+            } else if snapshot.monitoringOwned {
                 phase = .monitoring
+                presentedError = nil
             } else if outstandingObligations.isEmpty {
                 phase = pendingCredentials == nil ? .onboarding : .integrationReview
+                presentedError = nil
             }
         case .artifactCleanupRequired:
             phase = .repairRequired
@@ -1803,6 +1898,13 @@ public final class AppViewModel: AppViewModeling {
         }
     }
 
+    private static func committedReceipt(from error: IntegrationError) -> IntegrationInstallReceipt? {
+        guard case let .committedWithReceiptCleanupFailure(receipt, _) = error,
+              receipt.isValid,
+              receipt.hasVerifiableFingerprints else { return nil }
+        return receipt
+    }
+
     private static func presentationError(for error: any Error) -> PresentationError {
         if let validation = error as? ValidationError {
             switch validation {
@@ -1908,18 +2010,34 @@ public enum OwnershipMutation: Sendable {
     case integration(PersistentIntegrationOwnership)
     case credentials(PersistentCredentialOwnership)
     case login(PersistentLoginOwnership)
+    case obligations(Set<OutstandingObligation>)
     case insertObligation(OutstandingObligation)
     case removeObligation(OutstandingObligation)
 }
 
 fileprivate enum EmergencyIntegrationAction: Equatable, Sendable {
     case uninstall
-    case persist(PersistentIntegrationOwnership)
+    case persist(EmergencyPersistenceTarget)
+}
+
+fileprivate struct EmergencyPersistenceTarget: Equatable, Sendable {
+    let integration: PersistentIntegrationOwnership
+    let obligations: Set<OutstandingObligation>
 }
 
 public struct EmergencyIntegrationRecovery: Equatable, Sendable {
     public let receipt: IntegrationInstallReceipt
     fileprivate let action: EmergencyIntegrationAction
+
+    public var pendingIntegrationOwnership: PersistentIntegrationOwnership? {
+        guard case let .persist(target) = action else { return nil }
+        return target.integration
+    }
+
+    public var pendingObligations: Set<OutstandingObligation>? {
+        guard case let .persist(target) = action else { return nil }
+        return target.obligations
+    }
 
     fileprivate var obligation: OutstandingObligation {
         switch action {
@@ -2032,6 +2150,7 @@ public actor AppOwnershipLedger {
             case let .integration(ownership): proposed.integration = ownership
             case let .credentials(ownership): proposed.credentials = ownership
             case let .login(ownership): proposed.login = ownership
+            case let .obligations(obligations): proposed.obligations = obligations
             case let .insertObligation(obligation): proposed.obligations.insert(obligation)
             case let .removeObligation(obligation): proposed.obligations.remove(obligation)
             }
@@ -2322,7 +2441,7 @@ private enum RepairPlan: Equatable {
 private enum RepairResult {
     case success(updatedReceipt: IntegrationInstallReceipt?)
     case emergencyPersistence(EmergencyIntegrationRecovery)
-    case artifactCleanupRequired
+    case artifactCleanupRequired(updatedReceipt: IntegrationInstallReceipt?)
     case legacyArtifactCleanupRequired
     case artifactVerifiedClean
     case artifactRetained

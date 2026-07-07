@@ -792,6 +792,162 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(integrationCounts.uninstall, 3)
     }
 
+    func testRepairCommittedUninstallCleanupFailureTransitionsToPersistenceOnlyEmergency() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        try await harness.ownershipLedger.update([
+            .insertObligation(.integrationUninstallRetry),
+            .insertObligation(.credentialBackupCleanup)
+        ])
+        await harness.viewModel.synchronizeOwnership()
+        await store.failEveryWrite()
+        await harness.integrations.setUninstallError(
+            IntegrationError.artifactCleanupFailure(["CANARY_COMMITTED_CLEANUP"])
+        )
+
+        await harness.viewModel.repairIntegrations()
+
+        let failed = await harness.ownershipLedger.snapshot()
+        let expectedOwnership: PersistentIntegrationOwnership? = .some(.none)
+        let expectedObligations: Set<OutstandingObligation>? = .some([
+            .credentialBackupCleanup,
+            .integrationArtifactCleanup
+        ])
+        XCTAssertEqual(failed.emergencyIntegrationRecovery?.receipt, harness.fakeInstalledReceipt)
+        XCTAssertEqual(
+            failed.emergencyIntegrationRecovery?.pendingIntegrationOwnership,
+            expectedOwnership
+        )
+        XCTAssertEqual(
+            failed.emergencyIntegrationRecovery?.pendingObligations,
+            expectedObligations
+        )
+        let committedCounts = await harness.integrations.counts()
+        XCTAssertEqual(committedCounts.uninstall, 1)
+
+        await harness.viewModel.repairIntegrations()
+        let unwritableRetryCounts = await harness.integrations.counts()
+        XCTAssertEqual(unwritableRetryCounts.uninstall, 1)
+
+        await store.allowWrites()
+        await harness.viewModel.repairIntegrations()
+
+        let durable = await store.current()
+        XCTAssertEqual(durable?.integration, .some(.none))
+        XCTAssertEqual(
+            durable?.obligations,
+            [.credentialBackupCleanup, .integrationArtifactCleanup]
+        )
+        let recovered = await harness.ownershipLedger.snapshot()
+        XCTAssertNil(recovered.emergencyIntegrationRecovery)
+        let recoveredCounts = await harness.integrations.counts()
+        XCTAssertEqual(recoveredCounts.uninstall, 1)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
+    func testDirectCommittedUninstallCleanupFailureTransitionsToPersistenceOnlyEmergency() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        try await harness.ownershipLedger.update(.insertObligation(.credentialBackupCleanup))
+        await harness.viewModel.synchronizeOwnership()
+        await store.failEveryWrite()
+        await harness.integrations.setUninstallError(
+            IntegrationError.artifactCleanupFailure(["CANARY_COMMITTED_CLEANUP"])
+        )
+
+        await harness.viewModel.uninstallIntegrations()
+
+        let failed = await harness.ownershipLedger.snapshot()
+        let expectedOwnership: PersistentIntegrationOwnership? = .some(.none)
+        let expectedObligations: Set<OutstandingObligation>? = .some([
+            .credentialBackupCleanup,
+            .integrationArtifactCleanup
+        ])
+        XCTAssertEqual(failed.emergencyIntegrationRecovery?.receipt, harness.fakeInstalledReceipt)
+        XCTAssertEqual(
+            failed.emergencyIntegrationRecovery?.pendingIntegrationOwnership,
+            expectedOwnership
+        )
+        XCTAssertEqual(
+            failed.emergencyIntegrationRecovery?.pendingObligations,
+            expectedObligations
+        )
+        let committedCounts = await harness.integrations.counts()
+        XCTAssertEqual(committedCounts.uninstall, 1)
+
+        await harness.viewModel.repairIntegrations()
+        let unwritableRetryCounts = await harness.integrations.counts()
+        XCTAssertEqual(unwritableRetryCounts.uninstall, 1)
+
+        await store.allowWrites()
+        await harness.viewModel.repairIntegrations()
+
+        let durable = await store.current()
+        XCTAssertEqual(durable?.integration, .some(.none))
+        XCTAssertEqual(
+            durable?.obligations,
+            [.credentialBackupCleanup, .integrationArtifactCleanup]
+        )
+        let recovered = await harness.ownershipLedger.snapshot()
+        XCTAssertNil(recovered.emergencyIntegrationRecovery)
+        let recoveredCounts = await harness.integrations.counts()
+        XCTAssertEqual(recoveredCounts.uninstall, 1)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
+    func testDisconnectCommittedUninstallCleanupFailureTransitionsToPersistenceOnlyEmergency() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        await harness.ownershipLedger.setMonitoringOwned(false)
+        try await harness.ownershipLedger.update([
+            .login(.none),
+            .credentials(.none),
+            .insertObligation(.integrationMixedAdoption)
+        ])
+        await harness.viewModel.synchronizeOwnership()
+        await store.failEveryWrite()
+        await harness.integrations.setUninstallError(
+            IntegrationError.artifactCleanupFailure(["CANARY_COMMITTED_CLEANUP"])
+        )
+
+        await harness.viewModel.disconnect()
+
+        let failed = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(failed.emergencyIntegrationRecovery?.receipt, harness.fakeInstalledReceipt)
+        XCTAssertEqual(
+            failed.emergencyIntegrationRecovery?.pendingIntegrationOwnership,
+            .some(.none)
+        )
+        XCTAssertEqual(
+            failed.emergencyIntegrationRecovery?.pendingObligations,
+            .some([.integrationMixedAdoption, .integrationArtifactCleanup])
+        )
+        let committedCounts = await harness.integrations.counts()
+        XCTAssertEqual(committedCounts.uninstall, 1)
+
+        await harness.viewModel.repairIntegrations()
+        let unwritableRetryCounts = await harness.integrations.counts()
+        XCTAssertEqual(unwritableRetryCounts.uninstall, 1)
+
+        await store.allowWrites()
+        await harness.viewModel.repairIntegrations()
+
+        let durable = await store.current()
+        XCTAssertEqual(durable?.integration, .some(.none))
+        XCTAssertEqual(
+            durable?.obligations,
+            [.integrationMixedAdoption, .integrationArtifactCleanup]
+        )
+        let recovered = await harness.ownershipLedger.snapshot()
+        XCTAssertNil(recovered.emergencyIntegrationRecovery)
+        let recoveredCounts = await harness.integrations.counts()
+        XCTAssertEqual(recoveredCounts.uninstall, 1)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
     func testFailedLoginPersistenceAndUnregisterRetainsDurableCleanupObligation() async {
         let store = ControllableSetupOwnershipStore()
         await store.failSaves([3])

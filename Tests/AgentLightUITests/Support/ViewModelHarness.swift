@@ -719,6 +719,18 @@ final class ViewModelHarness {
             }
         )
     }
+    var fakeInstalledReceipt: IntegrationInstallReceipt {
+        IntegrationInstallReceipt(
+            sources: AgentSource.allCases.map {
+                IntegrationSourceReceipt(
+                    source: $0,
+                    ownership: .fresh,
+                    marker: AppIdentity.integrationIdentifier,
+                    installedContentFingerprint: String(repeating: "a", count: 64)
+                )
+            }
+        )
+    }
     let viewModel: AppViewModel
 
     init(
