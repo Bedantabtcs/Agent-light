@@ -175,7 +175,7 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertEqual(viewModel.lastDraft?.accessSecret, "CANARY_ACCESS_SECRET")
     }
 
-    func testStopClosesRelayBeforeDisconnectCleanup() async {
+    func testStopClosesRelayBeforeNonDestructiveMonitoringShutdown() async {
         let recorder = EnvironmentRecorder()
         let environment = AppEnvironment(
             viewModel: EnvironmentViewModel(recorder: recorder),
@@ -188,7 +188,25 @@ final class AppEnvironmentTests: XCTestCase {
 
         await environment.stop()
 
-        XCTAssertEqual(recorder.values, [.relayStop, .disconnect])
+        XCTAssertEqual(recorder.values, [.relayStop, .shutdownMonitoring])
+    }
+
+    func testQuitStopsNonDestructivelyBeforeInjectedApplicationTermination() async {
+        let recorder = EnvironmentRecorder()
+        let environment = AppEnvironment(
+            viewModel: EnvironmentViewModel(recorder: recorder),
+            credentials: EnvironmentCredentials(recorder: recorder, stored: nil),
+            monitor: EnvironmentMonitor(recorder: recorder),
+            relay: EnvironmentRelay(recorder: recorder),
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {},
+            terminateApplication: { recorder.append(.terminate) }
+        )
+
+        environment.requestQuit()
+        await spinMainActor(until: { recorder.values.contains(.terminate) })
+
+        XCTAssertEqual(recorder.values, [.relayStop, .shutdownMonitoring, .terminate])
     }
 
     func testRelayStartupFailureCleansHydratedMonitoringOwnership() async throws {
@@ -213,7 +231,7 @@ final class AppEnvironmentTests: XCTestCase {
         await environment.start()
 
         XCTAssertEqual(environment.status, .failed)
-        XCTAssertEqual(Array(recorder.values.suffix(2)), [.relayStop, .disconnect])
+        XCTAssertEqual(Array(recorder.values.suffix(2)), [.relayStop, .shutdownMonitoring])
     }
 
     func testStopCancelsOwnedStartupBeforeRelayCanAcceptEvents() async {
@@ -238,6 +256,38 @@ final class AppEnvironmentTests: XCTestCase {
         let relayStarts = await relay.count()
 
         XCTAssertEqual(relayStarts, 0)
+        XCTAssertFalse(recorder.values.contains(.relayStart))
+    }
+
+    func testStopClaimsShutdownBeforeCancelingBlockedApproval() async throws {
+        let recorder = EnvironmentRecorder()
+        let viewModel = EnvironmentViewModel(recorder: recorder)
+        await viewModel.blockApproval()
+        let stored = TuyaCredentials(
+            endpoint: try XCTUnwrap(URL(string: "https://openapi.tuyain.com")),
+            accessID: "CANARY_ACCESS_ID",
+            accessSecret: "CANARY_ACCESS_SECRET",
+            deviceID: "CANARY_DEVICE_ID"
+        )
+        let environment = AppEnvironment(
+            viewModel: viewModel,
+            credentials: EnvironmentCredentials(recorder: recorder, stored: stored),
+            monitor: EnvironmentMonitor(recorder: recorder),
+            relay: EnvironmentRelay(recorder: recorder),
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {}
+        )
+        environment.requestStart()
+        await viewModel.waitForApproval()
+
+        let stopping = Task { await environment.stop() }
+        await spinMainActor(until: { recorder.values.contains(.shutdownMonitoring) })
+
+        XCTAssertTrue(recorder.values.contains(.relayStop))
+        XCTAssertTrue(recorder.values.contains(.shutdownMonitoring))
+        await viewModel.releaseApproval()
+        await stopping.value
+        XCTAssertFalse(recorder.values.contains(.disconnect))
         XCTAssertFalse(recorder.values.contains(.relayStart))
     }
 
@@ -390,12 +440,51 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertEqual(finalRelayCount, 2)
     }
 
+    func testQueuedRestartWaitsForShutdownThenReusesExistingSetup() async throws {
+        let recorder = EnvironmentRecorder()
+        let relay = EnvironmentRelay(recorder: recorder)
+        let stored = TuyaCredentials(
+            endpoint: try XCTUnwrap(URL(string: "https://openapi.tuyain.com")),
+            accessID: "CANARY_ACCESS_ID",
+            accessSecret: "CANARY_ACCESS_SECRET",
+            deviceID: "CANARY_DEVICE_ID"
+        )
+        let environment = AppEnvironment(
+            viewModel: EnvironmentViewModel(recorder: recorder),
+            credentials: EnvironmentCredentials(recorder: recorder, stored: stored),
+            monitor: EnvironmentMonitor(recorder: recorder),
+            relay: relay,
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {}
+        )
+        await environment.start()
+        recorder.removeAll()
+        await relay.blockStop()
+
+        let stopping = Task { await environment.stop() }
+        await relay.waitForStop()
+        environment.requestStart()
+        await Task.yield()
+        XCTAssertEqual(recorder.values, [.relayStop])
+
+        await relay.releaseStop()
+        await stopping.value
+        await spinMainActor(until: { environment.status == .ready })
+
+        XCTAssertEqual(
+            recorder.values,
+            [.relayStop, .shutdownMonitoring, .recover, .synchronize, .loadCredentials, .relayStart]
+        )
+        XCTAssertFalse(recorder.values.contains(.connect))
+        XCTAssertFalse(recorder.values.contains(.approve))
+    }
+
     func testReadyEnvironmentDeinitRunsDependencyOwnedShutdownExactlyOnce() async throws {
         let recorder = EnvironmentRecorder()
         let relay = EnvironmentRelay(recorder: recorder)
         await relay.blockStop()
         let viewModel = EnvironmentViewModel(recorder: recorder)
-        await viewModel.blockDisconnect()
+        await viewModel.blockShutdownMonitoring()
         let stored = TuyaCredentials(
             endpoint: try XCTUnwrap(URL(string: "https://openapi.tuyain.com")),
             accessID: "CANARY_ACCESS_ID",
@@ -419,18 +508,19 @@ final class AppEnvironmentTests: XCTestCase {
         await spinMainActor(until: { recorder.values.contains(.relayStop) })
         let relayStopCount = recorder.values.filter { $0 == .relayStop }.count
         XCTAssertEqual(relayStopCount, 1)
-        XCTAssertFalse(recorder.values.contains(.disconnect))
+        XCTAssertFalse(recorder.values.contains(.shutdownMonitoring))
         guard relayStopCount == 1 else { return }
 
         await relay.releaseStop()
-        await spinMainActor(until: { recorder.values.contains(.disconnect) })
-        let disconnectCount = recorder.values.filter { $0 == .disconnect }.count
-        XCTAssertEqual(disconnectCount, 1)
-        guard disconnectCount == 1 else { return }
-        await viewModel.releaseDisconnect()
+        await spinMainActor(until: { recorder.values.contains(.shutdownMonitoring) })
+        let shutdownCount = recorder.values.filter { $0 == .shutdownMonitoring }.count
+        XCTAssertEqual(shutdownCount, 1)
+        guard shutdownCount == 1 else { return }
+        await viewModel.releaseShutdownMonitoring()
         await spinMainActor()
         XCTAssertEqual(recorder.values.filter { $0 == .relayStop }.count, 1)
-        XCTAssertEqual(recorder.values.filter { $0 == .disconnect }.count, 1)
+        XCTAssertEqual(recorder.values.filter { $0 == .shutdownMonitoring }.count, 1)
+        XCTAssertFalse(recorder.values.contains(.disconnect))
     }
 
     func testMalformedAndLegacyCredentialsAreDeletedBeforeRelayStarts() async {
@@ -546,7 +636,7 @@ private actor VerifierService: TuyaDeviceServicing {
 
 private enum EnvironmentCall: Equatable, Sendable {
     case prepare, recover, loadCredentials, deleteCredentials, synchronize, connect, approve
-    case relayStart, relayAccept, relayStop, disconnect
+    case relayStart, relayAccept, relayStop, shutdownMonitoring, disconnect, terminate
 }
 
 private final class EnvironmentRecorder: @unchecked Sendable {
@@ -554,6 +644,7 @@ private final class EnvironmentRecorder: @unchecked Sendable {
     private var storage: [EnvironmentCall] = []
     var values: [EnvironmentCall] { lock.withLock { storage } }
     func append(_ value: EnvironmentCall) { lock.withLock { storage.append(value) } }
+    func removeAll() { lock.withLock { storage.removeAll() } }
 }
 
 private final class EnvironmentCredentials: CredentialStoring, @unchecked Sendable {
@@ -695,6 +786,10 @@ private actor EnvironmentCoordinator: RelayEventCoordinating {
 private final class EnvironmentViewModel: AppViewModeling {
     private let recorder: EnvironmentRecorder
     private let disconnectGate = EnvironmentGate()
+    private let shutdownGate = EnvironmentGate()
+    private let approvalGate = EnvironmentGate()
+    private var approvalInProgress = false
+    private var approvalCompletionWaiters: [CheckedContinuation<Void, Never>] = []
     var phase: AppPhase = .onboarding
     var connectionStatus: LightConnectionStatus = .disconnected
     var currentState: AgentState = .idle
@@ -709,10 +804,27 @@ private final class EnvironmentViewModel: AppViewModeling {
         recorder.append(.connect)
         phase = .integrationReview
     }
-    func approveIntegrations() async { recorder.append(.approve); phase = .monitoring }
+    func approveIntegrations() async {
+        recorder.append(.approve)
+        phase = .approving
+        approvalInProgress = true
+        await approvalGate.enter()
+        approvalInProgress = false
+        let waiters = approvalCompletionWaiters
+        approvalCompletionWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        phase = .monitoring
+    }
     func pause() async {}
     func resume() async {}
     func repairIntegrations() async {}
+    func shutdownMonitoring() async {
+        recorder.append(.shutdownMonitoring)
+        if approvalInProgress {
+            await withCheckedContinuation { approvalCompletionWaiters.append($0) }
+        }
+        await shutdownGate.enter()
+    }
     func disconnect() async {
         recorder.append(.disconnect)
         await disconnectGate.enter()
@@ -722,6 +834,12 @@ private final class EnvironmentViewModel: AppViewModeling {
     func blockDisconnect() async { await disconnectGate.block() }
     func waitForDisconnect() async { await disconnectGate.waitForEntry() }
     func releaseDisconnect() async { await disconnectGate.release() }
+    func blockShutdownMonitoring() async { await shutdownGate.block() }
+    func waitForShutdownMonitoring() async { await shutdownGate.waitForEntry() }
+    func releaseShutdownMonitoring() async { await shutdownGate.release() }
+    func blockApproval() async { await approvalGate.block() }
+    func waitForApproval() async { await approvalGate.waitForEntry() }
+    func releaseApproval() async { await approvalGate.release() }
 }
 
 private actor EnvironmentGate {

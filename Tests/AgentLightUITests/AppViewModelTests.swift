@@ -2699,6 +2699,211 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(uninstallCount, 1)
     }
 
+    func testShutdownMonitoringStopsOnceWithoutMutatingDurableSetup() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        let storedReceipt = await store.current()
+        let seededReceipt = try XCTUnwrap(storedReceipt)
+        harness.calls.removeAll()
+
+        await harness.viewModel.shutdownMonitoring()
+
+        let lifecycleMetrics = await harness.lifecycleMetrics()
+        let retainedReceipt = await store.current()
+
+        XCTAssertEqual(harness.calls.values, [.stopMonitoring])
+        XCTAssertEqual(
+            lifecycleMetrics,
+            HarnessLifecycleMetrics(
+                credentialDeletes: 0,
+                integrationUninstalls: 0,
+                loginUnregisters: 0,
+                monitorStops: 1
+            )
+        )
+        XCTAssertEqual(retainedReceipt, seededReceipt)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertFalse(harness.viewModel.monitoringActive)
+    }
+
+    func testRelaunchHydratesReceiptAndResumesWithoutReinstallingOrRewritingSetup() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let original = ViewModelHarness(ownershipStore: store)
+        await original.connectAndApprove()
+        let storedReceipt = await store.current()
+        let seededReceipt = try XCTUnwrap(storedReceipt)
+        let storedCredentials = try XCTUnwrap(original.credentials.storedCredentials())
+        await original.viewModel.shutdownMonitoring()
+
+        let relaunched = ViewModelHarness(ownershipStore: store)
+        relaunched.credentials.seed(storedCredentials)
+        relaunched.loginItem.currentStatus = .enabled
+        await relaunched.viewModel.synchronizeOwnership()
+
+        let monitorMetrics = await relaunched.monitor.metrics()
+        let integrationCounts = await relaunched.integrations.counts()
+        let retainedReceipt = await store.current()
+
+        XCTAssertEqual(relaunched.viewModel.phase, .monitoring)
+        XCTAssertTrue(relaunched.viewModel.monitoringActive)
+        XCTAssertEqual(monitorMetrics.start, 1)
+        XCTAssertEqual(integrationCounts.install, 0)
+        XCTAssertEqual(relaunched.credentials.saveCount, 0)
+        XCTAssertEqual(retainedReceipt, seededReceipt)
+    }
+
+    func testShutdownWaitsForPauseAndPreservesPausedSetup() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        let currentReceipt = await store.current()
+        let seededReceipt = try XCTUnwrap(currentReceipt)
+        await harness.monitor.blockPause()
+        let pause = Task { await harness.viewModel.pause() }
+        await harness.monitor.waitForPauseCount(1)
+
+        let shutdown = Task { await harness.viewModel.shutdownMonitoring() }
+        await Task.yield()
+        let blockedMetrics = await harness.monitor.metrics()
+        XCTAssertEqual(blockedMetrics.stop, 0)
+
+        await harness.monitor.releasePause()
+        await pause.value
+        await shutdown.value
+
+        let finalMetrics = await harness.monitor.metrics()
+        let integrationCounts = await harness.integrations.counts()
+        XCTAssertEqual(finalMetrics.stop, 1)
+        XCTAssertEqual(harness.viewModel.phase, .paused)
+        let retainedReceipt = await store.current()
+        XCTAssertEqual(retainedReceipt, seededReceipt)
+        XCTAssertEqual(harness.credentials.deleteCount, 0)
+        XCTAssertEqual(integrationCounts.uninstall, 0)
+        XCTAssertEqual(harness.loginItem.disableCount, 0)
+    }
+
+    func testShutdownWaitsForApprovalAndDoesNotConvertItIntoRollback() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.monitor.blockStart()
+        let approval = Task { await harness.viewModel.approveIntegrations() }
+        await harness.monitor.waitForStartCount(1)
+
+        let shutdown = Task { await harness.viewModel.shutdownMonitoring() }
+        await Task.yield()
+        let blockedMetrics = await harness.monitor.metrics()
+        let blockedIntegrationCounts = await harness.integrations.counts()
+        XCTAssertEqual(blockedMetrics.stop, 0)
+        XCTAssertEqual(harness.credentials.deleteCount, 0)
+        XCTAssertEqual(blockedIntegrationCounts.uninstall, 0)
+        XCTAssertEqual(harness.loginItem.disableCount, 0)
+
+        await harness.monitor.releaseStart()
+        await approval.value
+        await shutdown.value
+
+        let receipt = await store.current()
+        let finalMetrics = await harness.monitor.metrics()
+        let integrationCounts = await harness.integrations.counts()
+        XCTAssertNotNil(receipt)
+        XCTAssertEqual(finalMetrics.stop, 1)
+        XCTAssertEqual(harness.credentials.deleteCount, 0)
+        XCTAssertEqual(integrationCounts.uninstall, 0)
+        XCTAssertEqual(harness.loginItem.disableCount, 0)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+    }
+
+    func testShutdownWaitsForResumeAndPreservesMonitoringSetupPhase() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        await harness.viewModel.pause()
+        let currentReceipt = await store.current()
+        let seededReceipt = try XCTUnwrap(currentReceipt)
+        await harness.monitor.blockResume()
+        let resume = Task { await harness.viewModel.resume() }
+        await harness.monitor.waitForResumeCount(1)
+
+        let shutdown = Task { await harness.viewModel.shutdownMonitoring() }
+        await Task.yield()
+        let blockedMetrics = await harness.monitor.metrics()
+        XCTAssertEqual(blockedMetrics.stop, 0)
+
+        await harness.monitor.releaseResume()
+        await resume.value
+        await shutdown.value
+
+        let finalMetrics = await harness.monitor.metrics()
+        let integrationCounts = await harness.integrations.counts()
+        XCTAssertEqual(finalMetrics.stop, 1)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        let retainedReceipt = await store.current()
+        XCTAssertEqual(retainedReceipt, seededReceipt)
+        XCTAssertEqual(harness.credentials.deleteCount, 0)
+        XCTAssertEqual(integrationCounts.uninstall, 0)
+        XCTAssertEqual(harness.loginItem.disableCount, 0)
+    }
+
+    func testConcurrentShutdownCallsRestoreExactlyOnceAndRetainSetup() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        let currentReceipt = await store.current()
+        let seededReceipt = try XCTUnwrap(currentReceipt)
+        await harness.monitor.blockStop()
+
+        let first = Task { await harness.viewModel.shutdownMonitoring() }
+        await harness.monitor.waitForStopCount(1)
+        let second = Task { await harness.viewModel.shutdownMonitoring() }
+        await Task.yield()
+        let blockedMetrics = await harness.monitor.metrics()
+        XCTAssertEqual(blockedMetrics.stop, 1)
+
+        await harness.monitor.releaseStop()
+        await first.value
+        await second.value
+
+        let finalMetrics = await harness.monitor.metrics()
+        let integrationCounts = await harness.integrations.counts()
+        XCTAssertEqual(finalMetrics.stop, 1)
+        let retainedReceipt = await store.current()
+        XCTAssertEqual(retainedReceipt, seededReceipt)
+        XCTAssertEqual(harness.credentials.deleteCount, 0)
+        XCTAssertEqual(integrationCounts.uninstall, 0)
+        XCTAssertEqual(harness.loginItem.disableCount, 0)
+    }
+
+    func testConcurrentExplicitDisconnectOwnsCleanupAfterShutdownRestore() async {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        await harness.monitor.blockStop()
+
+        let shutdown = Task { await harness.viewModel.shutdownMonitoring() }
+        await harness.monitor.waitForStopCount(1)
+        let disconnect = Task { await harness.viewModel.disconnect() }
+        await Task.yield()
+        let blockedMetrics = await harness.monitor.metrics()
+        XCTAssertEqual(blockedMetrics.stop, 1)
+        XCTAssertEqual(harness.credentials.deleteCount, 0)
+
+        await harness.monitor.releaseStop()
+        await shutdown.value
+        await disconnect.value
+
+        let finalMetrics = await harness.monitor.metrics()
+        let integrationCounts = await harness.integrations.counts()
+        XCTAssertEqual(finalMetrics.stop, 1)
+        XCTAssertEqual(harness.credentials.deleteCount, 1)
+        XCTAssertEqual(integrationCounts.uninstall, 1)
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
+        let retainedReceipt = await store.current()
+        XCTAssertNil(retainedReceipt)
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+    }
+
     func testTypedErrorsMapToAllowlistedPresentationErrorsWithoutDescriptions() async {
         let cases: [(any Error & Sendable, PresentationError)] = [
             (TuyaClientError.invalidEndpoint, .invalidEndpoint),
@@ -2794,6 +2999,7 @@ private final class LegacyAppViewModelConformer: AppViewModeling {
     func pause() async {}
     func resume() async {}
     func repairIntegrations() async {}
+    func shutdownMonitoring() async {}
     func disconnect() async {}
     func observeMonitoring() async {}
 }

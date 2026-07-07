@@ -70,11 +70,13 @@ final class AppEnvironment {
     @ObservationIgnored private let relay: any RelayServing
     @ObservationIgnored private let coordinator: any RelayEventCoordinating
     @ObservationIgnored private let prepareStorage: @Sendable () async throws -> Void
+    @ObservationIgnored private let terminateApplication: @MainActor @Sendable () -> Void
     @ObservationIgnored private let shutdownController: EnvironmentShutdownController
     @ObservationIgnored private var lifecycle: Lifecycle = .idle
     @ObservationIgnored private var operationID: UUID?
     @ObservationIgnored private var operationTail: Task<Void, Never>?
     @ObservationIgnored private var restartAfterStop = false
+    @ObservationIgnored private var startupApprovalInProgress = false
 
     init(
         viewModel: any AppViewModeling,
@@ -82,7 +84,10 @@ final class AppEnvironment {
         monitor: any MonitoringOrchestrating,
         relay: any RelayServing,
         coordinator: any RelayEventCoordinating,
-        prepareStorage: @escaping @Sendable () async throws -> Void
+        prepareStorage: @escaping @Sendable () async throws -> Void,
+        terminateApplication: @escaping @MainActor @Sendable () -> Void = {
+            NSApplication.shared.terminate(nil)
+        }
     ) {
         self.viewModel = viewModel
         self.credentials = credentials
@@ -90,16 +95,24 @@ final class AppEnvironment {
         self.relay = relay
         self.coordinator = coordinator
         self.prepareStorage = prepareStorage
+        self.terminateApplication = terminateApplication
         shutdownController = EnvironmentShutdownController(relay: relay, viewModel: viewModel)
     }
 
     deinit {
         let tail = operationTail
-        tail?.cancel()
+        let approvalInProgress = startupApprovalInProgress
+        if !approvalInProgress { tail?.cancel() }
         let shutdownController = shutdownController
         Task {
-            await tail?.value
-            await shutdownController.shutdown()
+            if approvalInProgress {
+                await shutdownController.shutdown()
+                tail?.cancel()
+                await tail?.value
+            } else {
+                await tail?.value
+                await shutdownController.shutdown()
+            }
         }
     }
 
@@ -127,6 +140,12 @@ final class AppEnvironment {
         let coordinator = coordinator
         let prepareStorage = prepareStorage
         let shutdownController = shutdownController
+        let approvalState: @MainActor @Sendable (Bool) -> Void = { [weak self] in
+            self?.startupApprovalInProgress = $0
+        }
+        let canContinue: @MainActor @Sendable () -> Bool = { [weak self] in
+            self?.lifecycle == .starting
+        }
         let task = Task { [weak self] in
             await shutdownController.arm()
             let outcome = await Self.performStart(
@@ -135,7 +154,9 @@ final class AppEnvironment {
                 monitor: monitor,
                 relay: relay,
                 coordinator: coordinator,
-                prepareStorage: prepareStorage
+                prepareStorage: prepareStorage,
+                approvalState: approvalState,
+                canContinue: canContinue
             )
             if outcome != .ready {
                 await shutdownController.shutdown()
@@ -160,7 +181,9 @@ final class AppEnvironment {
         monitor: any MonitoringOrchestrating,
         relay: any RelayServing,
         coordinator: any RelayEventCoordinating,
-        prepareStorage: @Sendable () async throws -> Void
+        prepareStorage: @Sendable () async throws -> Void,
+        approvalState: @MainActor @Sendable (Bool) -> Void,
+        canContinue: @MainActor @Sendable () -> Bool
     ) async -> StartOutcome {
         do {
             try await prepareStorage()
@@ -188,10 +211,13 @@ final class AppEnvironment {
                     deviceID: storedCredentials.deviceID
                 ))
                 if await viewModel.phase == .integrationReview {
+                    await approvalState(true)
                     await viewModel.approveIntegrations()
+                    await approvalState(false)
                 }
             }
             try Task.checkCancellation()
+            guard await canContinue() else { throw CancellationError() }
             let coordinator = coordinator
             try await relay.start { data in
                 await coordinator.accept(data)
@@ -236,11 +262,18 @@ final class AppEnvironment {
         lifecycle = .stopping
         operationID = id
         restartAfterStop = false
-        prior?.cancel()
+        let approvalInProgress = startupApprovalInProgress
+        if !approvalInProgress { prior?.cancel() }
         let shutdownController = shutdownController
         let task = Task { [weak self] in
-            await prior?.value
-            await shutdownController.shutdown()
+            if approvalInProgress {
+                await shutdownController.shutdown()
+                prior?.cancel()
+                await prior?.value
+            } else {
+                await prior?.value
+                await shutdownController.shutdown()
+            }
             self?.finishStop(id: id)
         }
         operationTail = task
@@ -260,8 +293,9 @@ final class AppEnvironment {
 
     func requestQuit() {
         Task { [weak self] in
-            await self?.stop()
-            NSApplication.shared.terminate(nil)
+            guard let self else { return }
+            await self.stop()
+            self.terminateApplication()
         }
     }
 
@@ -307,7 +341,7 @@ private actor EnvironmentShutdownController {
         let viewModel = viewModel
         let task = Task {
             await relay.stop()
-            await viewModel.disconnect()
+            await viewModel.shutdownMonitoring()
         }
         shutdownTask = task
         await task.value

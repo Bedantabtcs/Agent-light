@@ -27,6 +27,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     func pause() async
     func resume() async
     func repairIntegrations() async
+    func shutdownMonitoring() async
     func disconnect() async
     func observeMonitoring() async
     func synchronizeOwnership() async
@@ -157,6 +158,7 @@ public final class AppViewModel: AppViewModeling {
     @ObservationIgnored private var pauseTask: SharedOperation?
     @ObservationIgnored private var resumeTask: SharedOperation?
     @ObservationIgnored private var repairTask: SharedOperation?
+    @ObservationIgnored private var shutdownTask: SharedOperation?
     @ObservationIgnored private var disconnectTask: SharedOperation?
     @ObservationIgnored private var integrationOwnership: PersistentIntegrationOwnership = .none
     @ObservationIgnored private var credentialOwnership: PersistentCredentialOwnership = .none
@@ -259,6 +261,10 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
         recordActionEntry(.approval)
 #endif
+        if let shutdownTask {
+            await shutdownTask.wait()
+            return
+        }
         if let approvalTask {
             await approvalTask.wait()
             return
@@ -340,6 +346,10 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
         recordActionEntry(.pause)
 #endif
+        if let shutdownTask {
+            await shutdownTask.wait()
+            return
+        }
         guard await hydrateOwnership() else { return }
         if let disconnectTask {
             await disconnectTask.wait()
@@ -399,6 +409,10 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
         recordActionEntry(.resume)
 #endif
+        if let shutdownTask {
+            await shutdownTask.wait()
+            return
+        }
         guard await hydrateOwnership() else { return }
         if let disconnectTask {
             await disconnectTask.wait()
@@ -455,6 +469,10 @@ public final class AppViewModel: AppViewModeling {
 #if DEBUG
         recordActionEntry(.repair)
 #endif
+        if let shutdownTask {
+            await shutdownTask.wait()
+            return
+        }
         if let disconnectTask {
             await disconnectTask.wait()
             return
@@ -549,6 +567,11 @@ public final class AppViewModel: AppViewModeling {
             await disconnectTask.wait()
             return
         }
+        if let shutdownTask { await shutdownTask.wait() }
+        if let disconnectTask {
+            await disconnectTask.wait()
+            return
+        }
         connectGeneration &+= 1
         connectTask?.cancel()
         let pendingApproval = approvalTask
@@ -598,6 +621,54 @@ public final class AppViewModel: AppViewModeling {
         operation.onFinish { [weak self, weak operation] in
             guard let self, self.disconnectTask === operation else { return }
             self.disconnectTask = nil
+        }
+        await operation.wait()
+    }
+
+    public func shutdownMonitoring() async {
+#if DEBUG
+        recordActionEntry(.shutdown)
+#endif
+        if let disconnectTask {
+            await disconnectTask.wait()
+            return
+        }
+        if let shutdownTask {
+            await shutdownTask.wait()
+            return
+        }
+        let pendingApproval = approvalTask
+        let pendingPause = pauseTask
+        let pendingResume = resumeTask
+        let pendingRepair = repairTask
+        let monitor = monitor
+        let ledger = ownershipLedger
+        let task = Task { [weak self, monitor, ledger] in
+            await pendingApproval?.wait()
+            await pendingPause?.wait()
+            await pendingResume?.wait()
+            await pendingRepair?.wait()
+            do {
+                try await ledger.hydrate()
+            } catch {
+                self?.finishMonitoringShutdown(await ledger.snapshot())
+                return
+            }
+            let lease = await ledger.acquireLease()
+            let snapshot = await ledger.snapshot()
+            if snapshot.monitoringOwned {
+                await monitor.stop()
+                await ledger.setMonitoringOwned(false)
+            }
+            let finalSnapshot = await ledger.snapshot()
+            await ledger.releaseLease(lease)
+            self?.finishMonitoringShutdown(finalSnapshot)
+        }
+        let operation = SharedOperation(task: task)
+        shutdownTask = operation
+        operation.onFinish { [weak self, weak operation] in
+            guard let self, self.shutdownTask === operation else { return }
+            self.shutdownTask = nil
         }
         await operation.wait()
     }
@@ -840,6 +911,40 @@ public final class AppViewModel: AppViewModeling {
         let snapshot = await ownershipLedger.snapshot()
         syncOwnership(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
+        if snapshot.canResumeMonitoringAfterRelaunch {
+            do {
+                try await monitor.start()
+                if Task.isCancelled {
+                    await monitor.stop()
+                    await ownershipLedger.setMonitoringOwned(false)
+                    await ownershipLedger.releaseLease(lease)
+                    return
+                }
+                await ownershipLedger.setMonitoringOwned(true)
+                let observation = await Self.preparedObservation(from: monitor)
+                if Task.isCancelled {
+                    await monitor.stop()
+                    await ownershipLedger.setMonitoringOwned(false)
+                    await ownershipLedger.releaseLease(lease)
+                    return
+                }
+                let resumed = await ownershipLedger.snapshot()
+                syncOwnership(resumed)
+                ownsMonitoring = true
+                monitoringActive = true
+                installObservation(observation)
+                phase = .monitoring
+                presentedError = nil
+            } catch {
+                ownsMonitoring = false
+                monitoringActive = false
+                cancelObservation(resetState: true)
+                phase = .paused
+                presentedError = Self.presentationError(for: error)
+            }
+            await ownershipLedger.releaseLease(lease)
+            return
+        }
         if snapshot.obligations.isEmpty {
             if pendingConnect != nil, phase == .verifying {
                 pendingCredentials = nil
@@ -912,6 +1017,7 @@ public final class AppViewModel: AppViewModeling {
         case .pause: operation = pauseTask
         case .resume: operation = resumeTask
         case .repair: operation = repairTask
+        case .shutdown: operation = shutdownTask
         case .disconnect: operation = disconnectTask
         case .connect: operation = connectTask
         }
@@ -1377,6 +1483,14 @@ public final class AppViewModel: AppViewModeling {
                 ? .integrationConflict
                 : .operationFailed
         }
+    }
+
+    private func finishMonitoringShutdown(_ snapshot: OwnershipSnapshot) {
+        syncOwnership(snapshot)
+        ownsMonitoring = snapshot.monitoringOwned
+        monitoringActive = false
+        cancelObservation(resetState: true)
+        connectionStatus = .disconnected
     }
 
     fileprivate func commitSharedCleanup(_ snapshot: OwnershipSnapshot) {
@@ -2004,6 +2118,19 @@ public struct OwnershipSnapshot: Equatable, Sendable {
             || emergencyIntegrationRecovery != nil
             || !obligations.isEmpty
     }
+
+    var canResumeMonitoringAfterRelaunch: Bool {
+        guard !monitoringOwned,
+              credentials != .none,
+              obligations.isEmpty,
+              emergencyIntegrationRecovery == nil else { return false }
+        switch integration {
+        case .uninstallable, .preexisting:
+            return true
+        case .none, .mixed, .uncertain:
+            return false
+        }
+    }
 }
 
 public enum OwnershipMutation: Sendable {
@@ -2414,7 +2541,7 @@ private enum ConnectResult {
 
 #if DEBUG
 enum OperationKind: Hashable {
-    case connect, approval, pause, resume, repair, disconnect
+    case connect, approval, pause, resume, repair, shutdown, disconnect
 }
 #endif
 

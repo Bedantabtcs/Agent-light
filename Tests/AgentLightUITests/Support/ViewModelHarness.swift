@@ -15,6 +15,13 @@ enum HarnessFailurePoint: Sendable {
     case install, saveCredentials, enableLogin, startMonitoring
 }
 
+struct HarnessLifecycleMetrics: Equatable, Sendable {
+    let credentialDeletes: Int
+    let integrationUninstalls: Int
+    let loginUnregisters: Int
+    let monitorStops: Int
+}
+
 struct HarnessSensitiveError: Error, Sendable, CustomStringConvertible {
     let value: String
     init(_ value: String) { self.value = value }
@@ -764,6 +771,17 @@ final class ViewModelHarness {
     func connectAndApprove() async {
         await viewModel.connect(using: validDraft)
         await viewModel.approveIntegrations()
+    }
+
+    func lifecycleMetrics() async -> HarnessLifecycleMetrics {
+        let integrationCounts = await integrations.counts()
+        let monitorMetrics = await monitor.metrics()
+        return HarnessLifecycleMetrics(
+            credentialDeletes: credentials.deleteCount,
+            integrationUninstalls: integrationCounts.uninstall,
+            loginUnregisters: loginItem.disableCount,
+            monitorStops: monitorMetrics.stop
+        )
     }
 
     func configureFailure(_ point: HarnessFailurePoint, error: any Error & Sendable) async {
