@@ -123,8 +123,13 @@ public struct SettingsView: View {
                             Task { await viewModel.requestLaunchAtLogin() }
                         }
                     }
-                    Text(viewModel.phase == .paused ? "Monitoring is paused" : "Monitoring is enabled")
-                        .accessibilityIdentifier("settings.general.monitoringStatus")
+                    NativeWrappingText(
+                        text: viewModel.monitoringActive
+                            ? "Monitoring is enabled"
+                            : "Monitoring is disabled",
+                        accessibilityIdentifier: "settings.general.monitoringStatus",
+                        isSelectable: false
+                    )
                     LabeledContent("Monitoring") {
                         NativeMonitoringToggle(
                             isOn: monitoringBinding.wrappedValue,

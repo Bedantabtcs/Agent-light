@@ -144,3 +144,15 @@ Correction base: `87ab1cb1ae83f0609ff93f809eed7e271899a8f6`
 
 - With VoiceOver enabled in the packaged app, traverse the data-center picker and each primary action and confirm the programmed labels and roles are announced once.
 - Set the packaged app to the largest supported text size and verify every Settings action and full integration preview remains reachable by scrolling.
+
+## Monitoring status copy correction
+
+Correction base: `ab54cf450e32f1d76643a6916a35b586e476090c`
+
+- RED: the hosted repair-mode switch regression could not find a rendered monitoring-status element, and the phase-derived copy remained enabled while the explicit switch state was Off.
+- GREEN: Settings renders the stable `settings.general.monitoringStatus` through `NativeWrappingText` and derives `Monitoring is enabled` or `Monitoring is disabled` solely from `viewModel.monitoringActive`.
+- GREEN: the hosted regression verifies Enabled → Disabled → Enabled across repair-mode pause/resume while `phase == .repairRequired` and the original sanitized repair error is preserved.
+- Focused hosted regression: 1 passed, 0 failures.
+- `swift test`: 423 passed, 0 failures.
+- `swift build`: exit 0.
+- `swift build -c release`: exit 0.

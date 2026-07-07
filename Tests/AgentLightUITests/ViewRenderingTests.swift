@@ -200,6 +200,7 @@ final class ViewRenderingTests: XCTestCase {
         await harness.connectAndApprove()
         await harness.integrations.setRepairError(TuyaClientError.transport)
         await harness.viewModel.repairIntegrations()
+        let repairError = harness.viewModel.presentedError
         let hosting = host(SettingsView(viewModel: harness.viewModel))
         let monitoringSwitch = try XCTUnwrap(
             descendants(of: hosting)
@@ -207,16 +208,40 @@ final class ViewRenderingTests: XCTestCase {
                 .first { $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsMonitoring }
         )
         XCTAssertEqual(monitoringSwitch.state, .on)
+        XCTAssertTrue(
+            renderedText(in: hosting).contains("Monitoring is enabled"),
+            "\(renderedText(in: hosting))"
+        )
 
         monitoringSwitch.state = .off
         XCTAssertTrue(monitoringSwitch.sendAction(monitoringSwitch.action, to: monitoringSwitch.target))
         await harness.monitor.waitForPauseCount(1)
+        for _ in 0..<100 where harness.viewModel.monitoringActive {
+            await nextMainTurn()
+        }
+        await nextMainTurn()
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertTrue(
+            renderedText(in: hosting).contains("Monitoring is disabled"),
+            "\(renderedText(in: hosting))"
+        )
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.presentedError, repairError)
 
         monitoringSwitch.state = .on
         XCTAssertTrue(monitoringSwitch.sendAction(monitoringSwitch.action, to: monitoringSwitch.target))
         await harness.monitor.waitForResumeCount(1)
+        for _ in 0..<100 where !harness.viewModel.monitoringActive {
+            await nextMainTurn()
+        }
+        await nextMainTurn()
+        hosting.layoutSubtreeIfNeeded()
+        XCTAssertTrue(
+            renderedText(in: hosting).contains("Monitoring is enabled"),
+            "\(renderedText(in: hosting))"
+        )
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.presentedError, repairError)
     }
 
     func testRenderedSettingsActionsInvokeOnceAndRepairRequiresPreviewConfirmation() async throws {
@@ -420,6 +445,10 @@ final class ViewRenderingTests: XCTestCase {
 
     private func descendants(of view: NSView) -> [NSView] {
         view.subviews.flatMap { [$0] + descendants(of: $0) }
+    }
+
+    private func renderedText(in view: NSView) -> [String] {
+        descendants(of: view).compactMap { ($0 as? NSTextField)?.stringValue }
     }
 
     private func renderedButton(_ identifier: String, in view: NSView) throws -> NSButton {
