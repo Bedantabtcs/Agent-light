@@ -1,13 +1,21 @@
+import AgentLightCore
 import SwiftUI
 
 public struct OnboardingView: View {
     private let viewModel: AppViewModel
 
-    @State private var endpoint = "https://openapi.tuyaus.com"
+    @State private var dataCenter: TuyaDataCenter = .india
     @State private var accessID = ""
     @State private var accessSecret = ""
     @State private var deviceID = ""
     @State private var attemptedSubmit = false
+    @FocusState private var focusedField: Field?
+
+    private enum Field: Hashable {
+        case accessID
+        case accessSecret
+        case deviceID
+    }
 
     public init(viewModel: AppViewModel) {
         self.viewModel = viewModel
@@ -22,23 +30,14 @@ public struct OnboardingView: View {
                 if let error = viewModel.presentedError {
                     statusMessage(for: error)
                 }
-                Button {
-                    attemptedSubmit = true
-                    guard validationMessage == nil else { return }
-                    let draft = ConnectionDraft(
-                        endpoint: endpoint,
-                        accessID: accessID,
-                        accessSecret: accessSecret,
-                        deviceID: deviceID
-                    )
-                    Task { await viewModel.connect(using: draft) }
-                } label: {
-                    Label("Verify & Connect", systemImage: "checkmark.shield")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .accessibilityIdentifier(AmbientAccessibilityID.onboardingVerify)
+                NativeActionButton(
+                    title: "Verify & Connect",
+                    accessibilityIdentifier: AmbientAccessibilityID.onboardingVerify,
+                    keyEquivalent: "\r",
+                    isProminent: true,
+                    action: verifyAndConnect
+                )
+                .frame(maxWidth: .infinity)
             }
             .padding(AmbientTheme.Spacing.window)
         }
@@ -60,16 +59,32 @@ public struct OnboardingView: View {
 
     private var credentialFields: some View {
         VStack(alignment: .leading, spacing: AmbientTheme.Spacing.standard) {
-            TextField("Tuya endpoint", text: $endpoint)
-                .textContentType(.URL)
-                .accessibilityIdentifier(AmbientAccessibilityID.onboardingEndpoint)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Tuya data center")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                NativeDataCenterPicker(
+                    selection: $dataCenter,
+                    accessibilityIdentifier: AmbientAccessibilityID.onboardingEndpoint,
+                    onSelection: { focusedField = .accessID }
+                )
+            }
             TextField("Access ID", text: $accessID)
                 .accessibilityIdentifier(AmbientAccessibilityID.onboardingAccessID)
+                .focused($focusedField, equals: .accessID)
+                .submitLabel(.next)
+                .onSubmit { focusedField = .accessSecret }
             SecureField("Access Secret", text: $accessSecret)
                 .accessibilityIdentifier(AmbientAccessibilityID.onboardingAccessSecret)
+                .focused($focusedField, equals: .accessSecret)
+                .submitLabel(.next)
+                .onSubmit { focusedField = .deviceID }
             TextField("Device ID", text: $deviceID)
                 .accessibilityIdentifier(AmbientAccessibilityID.onboardingDeviceID)
-            if let validationMessage, attemptedSubmit || !endpoint.isEmpty {
+                .focused($focusedField, equals: .deviceID)
+                .submitLabel(.done)
+                .onSubmit { verifyAndConnect() }
+            if let validationMessage, attemptedSubmit {
                 Label(validationMessage, systemImage: "exclamationmark.circle")
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -102,23 +117,25 @@ public struct OnboardingView: View {
     }
 
     private var validationMessage: String? {
-        let trimmedEndpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let components = URLComponents(string: trimmedEndpoint),
-              components.scheme?.lowercased() == "https",
-              components.host?.isEmpty == false,
-              components.user == nil,
-              components.password == nil,
-              components.query == nil,
-              components.fragment == nil,
-              components.path.isEmpty || components.path == "/" else {
-            return "Enter a Tuya HTTPS origin without a path, query, or credentials."
-        }
         guard !accessID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !accessSecret.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               !deviceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return attemptedSubmit ? "Access ID, Access Secret, and Device ID are required." : nil
         }
         return nil
+    }
+
+    private func verifyAndConnect() {
+        attemptedSubmit = true
+        guard validationMessage == nil else { return }
+        focusedField = nil
+        let draft = ConnectionDraft(
+            endpoint: dataCenter.endpoint.absoluteString,
+            accessID: accessID,
+            accessSecret: accessSecret,
+            deviceID: deviceID
+        )
+        Task { await viewModel.connect(using: draft) }
     }
 }
 

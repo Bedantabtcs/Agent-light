@@ -252,14 +252,11 @@ public actor TuyaClient {
         body: Data,
         token: String?
     ) async throws -> URLRequest {
-        guard var components = URLComponents(url: credentials.endpoint, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "https",
-              components.host != nil,
-              components.user == nil,
-              components.password == nil,
-              components.query == nil,
-              components.fragment == nil,
-              components.path.isEmpty || components.path == "/" else {
+        guard let dataCenter = TuyaDataCenter(endpoint: credentials.endpoint),
+              var components = URLComponents(
+                  url: dataCenter.endpoint,
+                  resolvingAgainstBaseURL: false
+              ) else {
             throw TuyaClientError.invalidEndpoint
         }
 

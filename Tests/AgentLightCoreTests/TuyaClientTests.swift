@@ -4,6 +4,40 @@ import XCTest
 @testable import AgentLightCore
 
 final class TuyaClientTests: XCTestCase {
+    func testRejectsEveryNonAllowlistedEndpointBeforeTransportOrSigning() async throws {
+        let invalidEndpoints = [
+            "https://evil.example",
+            "https://openapi.tuyaus.com.evil.example",
+            "https://user@openapi.tuyaus.com",
+            "https://openapi.tuyaus.com:8443",
+            "https://openapi.tuyaus.com/path",
+            "https://openapi.tuyaus.com?query=private",
+            "https://openapi.tuyaus.com#fragment"
+        ]
+
+        for endpoint in invalidEndpoints {
+            let transport = ScriptedTuyaTransport(steps: [])
+            let client = TuyaClient(
+                credentials: TuyaCredentials(
+                    endpoint: try XCTUnwrap(URL(string: endpoint)),
+                    accessID: "CANARY_ACCESS_ID",
+                    accessSecret: "CANARY_ACCESS_SECRET",
+                    deviceID: "CANARY_DEVICE_ID"
+                ),
+                transport: transport
+            )
+
+            do {
+                _ = try await client.status()
+                XCTFail("Expected invalid endpoint for \(endpoint)")
+            } catch let error as TuyaClientError {
+                XCTAssertEqual(error, .invalidEndpoint)
+            }
+            let requestCount = await transport.recordedRequests().count
+            XCTAssertEqual(requestCount, 0)
+        }
+    }
+
     func testBusinessAuthenticationFailureRefreshesOnceAndSignsEveryRequest() async throws {
         let transport = ScriptedTuyaTransport(steps: [
             .json(200, tokenJSON("old-token", expiresIn: 7_200)),

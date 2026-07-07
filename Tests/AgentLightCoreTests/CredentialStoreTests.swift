@@ -273,7 +273,10 @@ final class CredentialStoreTests: XCTestCase {
             "https://user:password@openapi.tuyaus.com",
             "https://openapi.tuyaus.com/path",
             "https://openapi.tuyaus.com?private=query",
-            "https://openapi.tuyaus.com#fragment"
+            "https://openapi.tuyaus.com#fragment",
+            "https://evil.example",
+            "https://openapi.tuyaus.com.evil.example",
+            "https://openapi.tuyaus.com:8443"
         ]
     }
 

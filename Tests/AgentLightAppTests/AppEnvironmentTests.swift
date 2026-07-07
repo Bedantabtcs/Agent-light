@@ -1,11 +1,33 @@
 import Foundation
 import XCTest
+import AppKit
+import SwiftUI
 import AgentLightCore
 import AgentLightUI
 @testable import AgentLightApp
 
 @MainActor
 final class AppEnvironmentTests: XCTestCase {
+    func testStartupLoadingAndFailureRenderAtIntrinsicMenuWidthAndInvokeButtons() throws {
+        let loading = NSHostingView(rootView: StartupStatusView(status: .loading, retry: {}, quit: {}))
+        loading.layoutSubtreeIfNeeded()
+        XCTAssertEqual(loading.fittingSize.width, 380, accuracy: 1)
+        XCTAssertGreaterThan(loading.fittingSize.height, 200)
+
+        var retryCount = 0
+        var quitCount = 0
+        let failure = NSHostingView(rootView: StartupStatusView(
+            status: .failed,
+            retry: { retryCount += 1 },
+            quit: { quitCount += 1 }
+        ))
+        failure.layoutSubtreeIfNeeded()
+        try appButton("app.startup.retry", in: failure).performClick(nil)
+        try appButton("app.startup.quit", in: failure).performClick(nil)
+        XCTAssertEqual(retryCount, 1)
+        XCTAssertEqual(quitCount, 1)
+    }
+
     func testProductionVerifierResolvesCapabilityWithoutSendingCommands() async throws {
         let service = VerifierService()
         let verifier = ProductionTuyaConnectionVerifier { credentials in
@@ -148,7 +170,7 @@ final class AppEnvironmentTests: XCTestCase {
             coordinator: EnvironmentCoordinator(recorder: recorder),
             prepareStorage: {}
         )
-        environment.launch()
+        environment.requestStart()
         await monitor.waitForRecovery()
 
         let stopping = Task { await environment.stop() }
@@ -159,6 +181,100 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertEqual(relayStarts, 0)
         XCTAssertFalse(recorder.values.contains(.relayStart))
     }
+
+    func testConcurrentRetryRequestsShareOneOwnedRecoveryAndRelayStart() async {
+        let recorder = EnvironmentRecorder()
+        let monitor = EnvironmentMonitor(recorder: recorder)
+        await monitor.blockRecovery()
+        let relay = EnvironmentRelay(recorder: recorder)
+        let environment = AppEnvironment(
+            viewModel: EnvironmentViewModel(recorder: recorder),
+            credentials: EnvironmentCredentials(recorder: recorder, stored: nil),
+            monitor: monitor,
+            relay: relay,
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {}
+        )
+
+        environment.requestStart()
+        environment.requestStart()
+        await monitor.waitForRecovery()
+        let recoveriesWhileBlocked = await monitor.recoveryCount()
+        XCTAssertEqual(recoveriesWhileBlocked, 1)
+
+        await monitor.releaseRecovery()
+        await environment.start()
+        let finalRecoveries = await monitor.recoveryCount()
+        let finalRelayStarts = await relay.count()
+        XCTAssertEqual(finalRecoveries, 1)
+        XCTAssertEqual(finalRelayStarts, 1)
+    }
+
+    func testEnvironmentDeinitCancelsBlockedRecoveryWithoutLaterRelayStart() async {
+        let recorder = EnvironmentRecorder()
+        let monitor = EnvironmentMonitor(recorder: recorder)
+        await monitor.blockRecovery()
+        let relay = EnvironmentRelay(recorder: recorder)
+        weak var weakEnvironment: AppEnvironment?
+        var environment: AppEnvironment? = AppEnvironment(
+            viewModel: EnvironmentViewModel(recorder: recorder),
+            credentials: EnvironmentCredentials(recorder: recorder, stored: nil),
+            monitor: monitor,
+            relay: relay,
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {}
+        )
+        weakEnvironment = environment
+        environment?.requestStart()
+        await monitor.waitForRecovery()
+
+        environment = nil
+        XCTAssertNil(weakEnvironment)
+        await monitor.releaseRecovery()
+        await monitor.waitForRecoveryCancellation()
+        let relayStarts = await relay.count()
+
+        XCTAssertEqual(relayStarts, 0)
+    }
+
+    func testStartCanRetryAfterOneShotFailure() async {
+        let recorder = EnvironmentRecorder()
+        let monitor = EnvironmentMonitor(recorder: recorder)
+        let relay = EnvironmentRelay(recorder: recorder)
+        await relay.failNextStart()
+        let environment = AppEnvironment(
+            viewModel: EnvironmentViewModel(recorder: recorder),
+            credentials: EnvironmentCredentials(recorder: recorder, stored: nil),
+            monitor: monitor,
+            relay: relay,
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: {}
+        )
+
+        await environment.start()
+        XCTAssertEqual(environment.status, .failed)
+        await environment.start()
+
+        let recoveryCount = await monitor.recoveryCount()
+        let relayCount = await relay.count()
+        XCTAssertEqual(environment.status, .ready)
+        XCTAssertEqual(recoveryCount, 2)
+        XCTAssertEqual(relayCount, 2)
+    }
+}
+
+@MainActor
+private func appButton(_ identifier: String, in view: NSView) throws -> NSButton {
+    try XCTUnwrap(
+        appDescendants(of: view)
+            .compactMap { $0 as? NSButton }
+            .first { $0.accessibilityIdentifier() == identifier }
+    )
+}
+
+@MainActor
+private func appDescendants(of view: NSView) -> [NSView] {
+    view.subviews.flatMap { [$0] + appDescendants(of: $0) }
 }
 
 private actor VerifierService: TuyaDeviceServicing {
@@ -218,8 +334,11 @@ private actor EnvironmentMonitor: MonitoringOrchestrating {
     private let recorder: EnvironmentRecorder
     private var recoveryBlocked = false
     private var recoveryEntered = false
+    private var recoveries = 0
+    private var cancellationCount = 0
     private var recoveryRelease: CheckedContinuation<Void, Never>?
     private var recoveryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
     init(recorder: EnvironmentRecorder) { self.recorder = recorder }
     func blockRecovery() { recoveryBlocked = true }
     func waitForRecovery() async {
@@ -229,11 +348,30 @@ private actor EnvironmentMonitor: MonitoringOrchestrating {
     func releaseRecovery() { recoveryBlocked = false; recoveryRelease?.resume(); recoveryRelease = nil }
     func recoverIfNeeded() async throws {
         recorder.append(.recover)
+        recoveries += 1
         recoveryEntered = true
         let waiters = recoveryWaiters
         recoveryWaiters.removeAll()
         waiters.forEach { $0.resume() }
-        if recoveryBlocked { await withCheckedContinuation { recoveryRelease = $0 } }
+        if recoveryBlocked {
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { recoveryRelease = $0 }
+            } onCancel: {
+                Task { await self.recordRecoveryCancellation() }
+            }
+        }
+        try Task.checkCancellation()
+    }
+    func recoveryCount() -> Int { recoveries }
+    func waitForRecoveryCancellation() async {
+        if cancellationCount > 0 { return }
+        await withCheckedContinuation { cancellationWaiters.append($0) }
+    }
+    private func recordRecoveryCancellation() {
+        cancellationCount += 1
+        let waiters = cancellationWaiters
+        cancellationWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
     func start() async throws {}
     func accept(_ event: AgentEvent) async {}
@@ -251,18 +389,22 @@ private actor EnvironmentRelay: RelayServing {
     private let recorder: EnvironmentRecorder
     private var handler: (@Sendable (Data) async -> Void)?
     private(set) var startCount = 0
-    private var shouldFailStart = false
+    private var remainingStartFailures = 0
     init(recorder: EnvironmentRecorder) { self.recorder = recorder }
     func start(handler: @escaping @Sendable (Data) async -> Void) async throws {
         startCount += 1
         self.handler = handler
         recorder.append(.relayStart)
-        if shouldFailStart { throw EnvironmentRelayError.startFailed }
+        if remainingStartFailures > 0 {
+            remainingStartFailures -= 1
+            throw EnvironmentRelayError.startFailed
+        }
     }
     func stop() async { recorder.append(.relayStop) }
     func deliver(_ data: Data) async { await handler?(data) }
     func count() -> Int { startCount }
-    func failStart() { shouldFailStart = true }
+    func failStart() { remainingStartFailures = .max }
+    func failNextStart() { remainingStartFailures += 1 }
 }
 
 private enum EnvironmentRelayError: Error { case startFailed }

@@ -56,3 +56,46 @@ Base HEAD: `b011a1a70a72773fea04a1c10b5a045b9771f175`
 
 - The integration installer points at the bundled relay when packaged and falls back to the Application Support relay path during SwiftPM development. Task 12 must place the signed relay at the packaged/fallback path before manual integration approval.
 - Automated rendering verifies the static Reduce Motion and increased-contrast paths through deterministic overrides because macOS exposes the corresponding SwiftUI environment values as read-only system settings. Manual acceptance should also toggle both system accessibility settings.
+
+## Review-correction batch
+
+Correction base: `a4331119eaa833eaf989d43a135bbf835a6a2144`
+
+### Security boundary RED/GREEN
+
+- RED: focused credential-store, client, and view-model tests demonstrated that arbitrary HTTPS origins, malicious subdomains, and non-default ports could cross the credential or request boundary.
+- GREEN: `TuyaDataCenter` is the single exact allowlist for China, Western America, Eastern America, Central Europe, Western Europe, India, and Singapore. Keychain save/load validation, view-model draft validation, and request construction all reject non-allowlisted origins before signing or transport. Onboarding now exposes only the allowlisted data-center picker.
+
+### Startup ownership RED/GREEN
+
+- RED: retry could create unowned startup work, and lifecycle tests had no proof for concurrent retry coalescing, stop during retry, environment deinitialization during blocked recovery, or retry after a one-shot failure.
+- GREEN: `AppEnvironment` owns one synchronously registered startup task, coalesces callers, cancels and awaits startup before stop cleanup, weakly finishes into the environment, clears task ownership for retry, and cancels blocked recovery on deinitialization. Retry invokes that owned entry point directly.
+- Stress verification repeated the four critical lifecycle tests 20 times with all 80 executions passing and no orphaned test process.
+
+### Settings and accessibility RED/GREEN
+
+- RED: focused tests failed because masked identifiers, reconnect, replace-device, repair preview/confirmation, safe uninstall, and a native monitoring toggle were absent.
+- GREEN: Settings now contains the approved Light, Integrations, and General controls. Credentials are masked to the last four identifier characters; the access secret is never rendered. Repair requires a complete path/before/after preview before confirmation. Uninstall preserves preexisting or uncertain ownership and records the corresponding repair obligation.
+- RED: SwiftUI's virtual accessibility tree was empty in the SwiftPM-hosted XCTest process, so identifier-only constants and direct closure calls could not prove rendered controls were reachable or actionable.
+- GREEN: critical controls use hosted AppKit buttons, picker, switch, and wrapping text fields. Tests traverse the actual `NSView` hierarchy, invoke rendered controls with `performClick`, verify action counts, verify default Return/Escape keys and initial picker focus, and confirm long sessions and complete integration summaries remain reachable.
+- RED: the hosted monitoring-control test could not find an `NSSwitch` because the first native wrapper rendered an AppKit checkbox.
+- GREEN: Settings now renders a labeled `NSSwitch`; the hosted test changes its state, sends its real target/action, and observes exactly one monitor pause.
+
+### Correction verification
+
+- `swift test --filter ViewRenderingTests`: 14 passed, 0 failures.
+- `swift test --filter AppViewModelTests`: 113 passed, 0 failures.
+- Endpoint/security focused suites: 45 passed, 0 failures.
+- `AppEnvironmentTests`: 11 passed, 0 failures.
+- Critical lifecycle subset repeated 20 times: 80 test executions passed, 0 failures.
+- `swift test`: 414 passed, 0 failures.
+- `swift build`: exit 0.
+- `swift build -c release`: exit 0.
+- `git diff --check`: exit 0.
+- Static scan: no added TODO/FIXME markers, debug logging, forced casts/tries, fatal traps, private-key material, source credential literals, dynamic evaluation, custom color/timing controls, or direct UI light commands.
+- Process scan: no orphaned `xctest` or `AgentLightPackageTests` process.
+
+### Remaining manual checks
+
+- Exercise picker-to-field focus progression and Return/Escape behavior in the packaged menu-bar window with VoiceOver enabled.
+- Toggle macOS Reduce Motion and Increase Contrast in System Settings and verify the packaged app follows both settings.

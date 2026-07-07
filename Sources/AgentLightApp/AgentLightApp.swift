@@ -14,47 +14,60 @@ struct AgentLightApp: App {
 
     var body: some Scene {
         MenuBarExtra("Agent Light", systemImage: "lightbulb.led.fill") {
-            switch environment.status {
-            case .loading:
-                VStack(spacing: 12) {
-                    ProgressView()
-                    Text("Preparing Agent Light")
-                        .font(.headline)
-                    Text("Checking recovery state before accepting agent events.")
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-                .padding(24)
-                .frame(minWidth: 380, maxWidth: 380, minHeight: 240)
-                .accessibilityIdentifier("app.startup.loading")
-            case .ready:
-                MenuBarContentView(viewModel: viewModel) {
-                    environment.requestQuit()
-                }
-            case .failed:
-                VStack(spacing: 12) {
-                    Label("Agent Light could not start", systemImage: "exclamationmark.triangle")
-                        .font(.headline)
-                    Text("Recovery or local relay setup failed. No agent events are being accepted.")
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                    Button("Retry Startup") {
-                        Task { await environment.start() }
-                    }
-                    .accessibilityIdentifier("app.startup.retry")
-                    Button("Quit") {
+            Group {
+                switch environment.status {
+                case .ready:
+                    MenuBarContentView(viewModel: viewModel) {
                         environment.requestQuit()
                     }
-                    .accessibilityIdentifier("app.startup.quit")
+                case .loading, .failed:
+                    StartupStatusView(
+                        status: environment.status,
+                        retry: environment.requestStart,
+                        quit: environment.requestQuit
+                    )
                 }
-                .padding(24)
-                .frame(minWidth: 380, maxWidth: 380, minHeight: 240)
-                .accessibilityIdentifier("app.startup.failed")
             }
+            .onAppear { environment.requestStart() }
         }
         .menuBarExtraStyle(.window)
-        .onChange(of: environment.status, initial: true) { _, _ in
-            environment.launch()
+    }
+}
+
+struct StartupStatusView: View {
+    let status: AppEnvironmentStatus
+    let retry: () -> Void
+    let quit: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            if status == .loading {
+                ProgressView()
+                Text("Preparing Agent Light")
+                    .font(.headline)
+                Text("Checking recovery state before accepting agent events.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            } else {
+                Label("Agent Light could not start", systemImage: "exclamationmark.triangle")
+                    .font(.headline)
+                Text("Recovery or local relay setup failed. No agent events are being accepted.")
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                NativeActionButton(
+                    title: "Retry Startup",
+                    accessibilityIdentifier: "app.startup.retry",
+                    action: retry
+                )
+                NativeActionButton(
+                    title: "Quit",
+                    accessibilityIdentifier: "app.startup.quit",
+                    action: quit
+                )
+            }
         }
+        .padding(24)
+        .frame(minWidth: 380, maxWidth: 380, minHeight: 240)
+        .accessibilityIdentifier(status == .loading ? "app.startup.loading" : "app.startup.failed")
     }
 }

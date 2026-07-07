@@ -8,6 +8,8 @@ public struct AmbientBulbView: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.ambientReduceMotionOverride) private var environmentReduceMotionOverride
+    @Environment(\.ambientHighContrastOverride) private var environmentHighContrastOverride
     @State private var isPulsing = false
 
     public init(state: AgentState) {
@@ -23,8 +25,12 @@ public struct AmbientBulbView: View {
     }
 
     public var body: some View {
-        let isHighContrast = highContrastOverride ?? (contrast == .increased)
-        let shouldReduceMotion = reduceMotionOverride ?? reduceMotion
+        let isHighContrast = highContrastOverride
+            ?? environmentHighContrastOverride
+            ?? (contrast == .increased)
+        let shouldReduceMotion = reduceMotionOverride
+            ?? environmentReduceMotionOverride
+            ?? reduceMotion
         let color = AmbientTheme.stateColor(state, highContrast: isHighContrast)
         ZStack {
             Circle()

@@ -5,6 +5,75 @@ import Observation
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testSettingsExposeOnlyMaskedIdentifiersAfterApproval() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+
+        XCTAssertEqual(harness.viewModel.maskedAccessID, "••••S_ID")
+        XCTAssertEqual(harness.viewModel.maskedDeviceID, "••••E_ID")
+        XCTAssertFalse(harness.viewModel.maskedAccessID?.contains("CANARY_ACCESS_ID") == true)
+        XCTAssertFalse(harness.viewModel.maskedDeviceID?.contains("CANARY_DEVICE_ID") == true)
+    }
+
+    func testReconnectUsesMonitorOnceAndRefreshesSnapshot() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.monitor.setSnapshot(
+            MonitoringSnapshot(state: .working, sessions: [.canaryThinking], connection: .connected)
+        )
+
+        await harness.viewModel.reconnect()
+
+        let metrics = await harness.monitor.metrics()
+        XCTAssertEqual(metrics.reconnect, 1)
+        XCTAssertEqual(harness.viewModel.currentState, .working)
+    }
+
+    func testRepairPreviewIsReadOnlyUntilExplicitConfirmation() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        harness.calls.removeAll()
+
+        await harness.viewModel.previewIntegrationRepair()
+
+        XCTAssertEqual(harness.viewModel.repairPreviews.count, 3)
+        XCTAssertEqual(harness.calls.values, [.preview])
+        await harness.viewModel.repairIntegrations()
+        XCTAssertEqual(harness.calls.values, [.preview, .repair])
+    }
+
+    func testUninstallIntegrationsRemovesOnlyAuthoritativelyOwnedHooks() async {
+        let owned = ViewModelHarness()
+        await owned.connectAndApprove()
+        await owned.viewModel.uninstallIntegrations()
+        let firstOwnedUninstall = await owned.integrations.counts().uninstall
+        XCTAssertEqual(firstOwnedUninstall, 1)
+        await owned.viewModel.disconnect()
+        let finalOwnedUninstall = await owned.integrations.counts().uninstall
+        XCTAssertEqual(finalOwnedUninstall, 1)
+
+        let preexisting = ViewModelHarness()
+        await preexisting.integrations.setPreviewOwnership([true, true, true])
+        await preexisting.connectAndApprove()
+        await preexisting.viewModel.uninstallIntegrations()
+        let protectedUninstall = await preexisting.integrations.counts().uninstall
+        XCTAssertEqual(protectedUninstall, 0)
+        XCTAssertEqual(preexisting.viewModel.phase, .repairRequired)
+        XCTAssertTrue(preexisting.viewModel.outstandingObligations.contains(.integrationMixedAdoption))
+    }
+
+    func testReplaceDevicePerformsOwnedCleanupThenReturnsToOnboarding() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+
+        await harness.viewModel.replaceDevice()
+
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+        XCTAssertNil(harness.credentials.storedCredentials())
+        let uninstallCount = await harness.integrations.counts().uninstall
+        XCTAssertEqual(uninstallCount, 1)
+    }
+
     func testLaunchAtLoginStatusAndRetryUseViewModelBoundary() async {
         let harness = ViewModelHarness()
         await harness.connectAndApprove()
@@ -38,7 +107,7 @@ final class AppViewModelTests: XCTestCase {
     func testConnectTrimsEveryFieldBeforeVerificationAndDoesNotSaveCredentials() async throws {
         let harness = ViewModelHarness()
         let draft = ConnectionDraft(
-            endpoint: "  https://openapi.tuyaus.com/  ",
+            endpoint: "  https://openapi.tuyain.com/  ",
             accessID: "  CANARY_ACCESS_ID  ",
             accessSecret: "  CANARY_ACCESS_SECRET  ",
             deviceID: "  CANARY_DEVICE_ID  "
@@ -50,7 +119,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.credentials.saveCount, 0)
         let captured = await harness.verifier.capturedCredentials()
         let verified = try XCTUnwrap(captured)
-        XCTAssertEqual(verified.endpoint.absoluteString, "https://openapi.tuyaus.com/")
+        XCTAssertEqual(verified.endpoint.absoluteString, "https://openapi.tuyain.com")
         XCTAssertEqual(verified.accessID, "CANARY_ACCESS_ID")
         XCTAssertEqual(verified.accessSecret, "CANARY_ACCESS_SECRET")
         XCTAssertEqual(verified.deviceID, "CANARY_DEVICE_ID")
@@ -80,6 +149,33 @@ final class AppViewModelTests: XCTestCase {
             )
             let verifyCount = await harness.verifier.count()
             let previewCount = await harness.integrations.counts().preview
+            XCTAssertEqual(verifyCount, 0)
+            XCTAssertEqual(previewCount, 0)
+        }
+    }
+
+    func testConnectRejectsNonAllowlistedOriginsBeforeVerifierOrPreview() async {
+        let endpoints = [
+            "https://evil.example",
+            "https://openapi.tuyain.com.evil.example",
+            "https://user@openapi.tuyain.com",
+            "https://openapi.tuyain.com:8443",
+            "https://openapi.tuyain.com/path",
+            "https://openapi.tuyain.com?query=private",
+            "https://openapi.tuyain.com#fragment"
+        ]
+        for endpoint in endpoints {
+            let harness = ViewModelHarness()
+            await harness.viewModel.connect(using: ConnectionDraft(
+                endpoint: endpoint,
+                accessID: "CANARY_ACCESS_ID",
+                accessSecret: "CANARY_ACCESS_SECRET",
+                deviceID: "CANARY_DEVICE_ID"
+            ))
+
+            let verifyCount = await harness.verifier.count()
+            let previewCount = await harness.integrations.counts().preview
+            XCTAssertEqual(harness.viewModel.presentedError, .invalidEndpoint)
             XCTAssertEqual(verifyCount, 0)
             XCTAssertEqual(previewCount, 0)
         }

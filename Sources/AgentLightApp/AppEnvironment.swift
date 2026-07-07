@@ -68,7 +68,8 @@ final class AppEnvironment {
     @ObservationIgnored private let relay: any RelayServing
     @ObservationIgnored private let coordinator: any RelayEventCoordinating
     @ObservationIgnored private let prepareStorage: @Sendable () async throws -> Void
-    @ObservationIgnored private var lifecycleTask: Task<Void, Never>?
+    @ObservationIgnored private var startTask: Task<Void, Never>?
+    @ObservationIgnored private var startID: UUID?
     @ObservationIgnored private var started = false
 
     init(
@@ -87,16 +88,49 @@ final class AppEnvironment {
         self.prepareStorage = prepareStorage
     }
 
-    func launch() {
-        guard lifecycleTask == nil else { return }
-        lifecycleTask = Task { [weak self] in
-            await self?.start()
+    deinit {
+        startTask?.cancel()
+    }
+
+    func requestStart() {
+        guard !started, startTask == nil else { return }
+        status = .loading
+        let id = UUID()
+        startID = id
+        let viewModel = viewModel
+        let credentials = credentials
+        let monitor = monitor
+        let relay = relay
+        let coordinator = coordinator
+        let prepareStorage = prepareStorage
+        let task = Task { [weak self] in
+            let outcome = await Self.performStart(
+                viewModel: viewModel,
+                credentials: credentials,
+                monitor: monitor,
+                relay: relay,
+                coordinator: coordinator,
+                prepareStorage: prepareStorage
+            )
+            self?.finishStart(outcome, id: id)
         }
+        startTask = task
     }
 
     func start() async {
-        guard !started else { return }
-        status = .loading
+        if started { return }
+        requestStart()
+        await startTask?.value
+    }
+
+    private nonisolated static func performStart(
+        viewModel: any AppViewModeling,
+        credentials: any CredentialStoring,
+        monitor: any MonitoringOrchestrating,
+        relay: any RelayServing,
+        coordinator: any RelayEventCoordinating,
+        prepareStorage: @Sendable () async throws -> Void
+    ) async -> StartOutcome {
         do {
             try await prepareStorage()
             try Task.checkCancellation()
@@ -105,14 +139,14 @@ final class AppEnvironment {
             let storedCredentials = try credentials.load()
             await viewModel.synchronizeOwnership()
             try Task.checkCancellation()
-            if let storedCredentials, viewModel.phase == .onboarding {
+            if let storedCredentials, await viewModel.phase == .onboarding {
                 await viewModel.connect(using: ConnectionDraft(
                     endpoint: storedCredentials.endpoint.absoluteString,
                     accessID: storedCredentials.accessID,
                     accessSecret: storedCredentials.accessSecret,
                     deviceID: storedCredentials.deviceID
                 ))
-                if viewModel.phase == .integrationReview {
+                if await viewModel.phase == .integrationReview {
                     await viewModel.approveIntegrations()
                 }
             }
@@ -122,21 +156,38 @@ final class AppEnvironment {
                 await coordinator.accept(data)
             }
             try Task.checkCancellation()
-            started = true
-            status = .ready
+            return .ready
         } catch is CancellationError {
-            started = false
+            await relay.stop()
+            await viewModel.disconnect()
+            return .cancelled
         } catch {
             await relay.stop()
             await viewModel.disconnect()
+            return .failed
+        }
+    }
+
+    private func finishStart(_ outcome: StartOutcome, id: UUID) {
+        guard startID == id else { return }
+        startTask = nil
+        startID = nil
+        switch outcome {
+        case .ready:
+            started = true
+            status = .ready
+        case .failed:
             started = false
             status = .failed
+        case .cancelled:
+            started = false
         }
     }
 
     func stop() async {
-        let startup = lifecycleTask
-        lifecycleTask = nil
+        let startup = startTask
+        startTask = nil
+        startID = nil
         startup?.cancel()
         await startup?.value
         await relay.stop()
@@ -149,6 +200,12 @@ final class AppEnvironment {
             await self?.stop()
             NSApplication.shared.terminate(nil)
         }
+    }
+
+    private enum StartOutcome: Sendable {
+        case ready
+        case failed
+        case cancelled
     }
 }
 

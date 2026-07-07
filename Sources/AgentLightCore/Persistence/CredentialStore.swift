@@ -66,20 +66,10 @@ enum TuyaCredentialValidator {
         guard !credentials.accessID.isEmpty,
               !credentials.accessSecret.isEmpty,
               !credentials.deviceID.isEmpty,
-              let components = URLComponents(
-                  url: credentials.endpoint,
-                  resolvingAgainstBaseURL: false
-              ),
-              components.scheme?.lowercased() == "https",
-              let host = components.host,
-              !host.isEmpty,
-              components.user == nil,
-              components.password == nil,
-              components.query == nil,
-              components.fragment == nil else {
+              TuyaDataCenter(endpoint: credentials.endpoint) != nil else {
             return false
         }
-        return components.path.isEmpty || components.path == "/"
+        return true
     }
 }
 

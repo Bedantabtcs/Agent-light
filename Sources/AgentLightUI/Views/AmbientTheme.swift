@@ -1,6 +1,33 @@
 import AgentLightCore
 import SwiftUI
 
+private struct AmbientReduceMotionOverrideKey: EnvironmentKey {
+    static let defaultValue: Bool? = nil
+}
+
+private struct AmbientHighContrastOverrideKey: EnvironmentKey {
+    static let defaultValue: Bool? = nil
+}
+
+extension EnvironmentValues {
+    var ambientReduceMotionOverride: Bool? {
+        get { self[AmbientReduceMotionOverrideKey.self] }
+        set { self[AmbientReduceMotionOverrideKey.self] = newValue }
+    }
+
+    var ambientHighContrastOverride: Bool? {
+        get { self[AmbientHighContrastOverrideKey.self] }
+        set { self[AmbientHighContrastOverrideKey.self] = newValue }
+    }
+}
+
+extension View {
+    func ambientAccessibilityOverrides(reduceMotion: Bool, highContrast: Bool) -> some View {
+        environment(\.ambientReduceMotionOverride, reduceMotion)
+            .environment(\.ambientHighContrastOverride, highContrast)
+    }
+}
+
 enum AmbientTheme {
     enum Spacing {
         static let compact: CGFloat = 6
@@ -35,6 +62,7 @@ enum AmbientTheme {
 
 struct AmbientCardModifier: ViewModifier {
     @Environment(\.colorSchemeContrast) private var contrast
+    @Environment(\.ambientHighContrastOverride) private var highContrastOverride
 
     func body(content: Content) -> some View {
         content
@@ -43,10 +71,14 @@ struct AmbientCardModifier: ViewModifier {
             .overlay {
                 RoundedRectangle(cornerRadius: AmbientTheme.Radius.card)
                     .stroke(
-                        contrast == .increased ? Color.white.opacity(0.55) : AmbientTheme.separator,
-                        lineWidth: contrast == .increased ? 1.5 : 1
+                        isHighContrast ? Color.white.opacity(0.55) : AmbientTheme.separator,
+                        lineWidth: isHighContrast ? 1.5 : 1
                     )
             }
+    }
+
+    private var isHighContrast: Bool {
+        highContrastOverride ?? (contrast == .increased)
     }
 }
 

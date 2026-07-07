@@ -1,5 +1,49 @@
 import Foundation
 
+public enum TuyaDataCenter: String, CaseIterable, Codable, Sendable {
+    case china = "https://openapi.tuyacn.com"
+    case westernAmerica = "https://openapi.tuyaus.com"
+    case easternAmerica = "https://openapi-ueaz.tuyaus.com"
+    case centralEurope = "https://openapi.tuyaeu.com"
+    case westernEurope = "https://openapi-weaz.tuyaeu.com"
+    case india = "https://openapi.tuyain.com"
+    case singapore = "https://openapi-sg.iotbing.com"
+
+    public var displayName: String {
+        switch self {
+        case .china: "China"
+        case .westernAmerica: "Western America"
+        case .easternAmerica: "Eastern America"
+        case .centralEurope: "Central Europe"
+        case .westernEurope: "Western Europe"
+        case .india: "India"
+        case .singapore: "Singapore"
+        }
+    }
+
+    public var endpoint: URL {
+        URL(string: rawValue) ?? URL(fileURLWithPath: "/invalid-tuya-data-center")
+    }
+
+    public init?(endpoint: URL) {
+        guard let components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "https",
+              let host = components.host?.lowercased(),
+              components.port ?? 443 == 443,
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.path.isEmpty || components.path == "/",
+              let match = Self.allCases.first(where: {
+                  $0.endpoint.host?.lowercased() == host
+              }) else {
+            return nil
+        }
+        self = match
+    }
+}
+
 public struct TuyaCredentials: Codable, Equatable, Sendable {
     public let endpoint: URL
     public let accessID: String

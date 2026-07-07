@@ -7,7 +7,7 @@ enum HarnessCall: Equatable, Sendable {
     case verify, preview, install, repair, uninstall, verifyArtifacts
     case loadCredentials, saveCredentials, deleteCredentials
     case enableLogin, disableLogin
-    case startMonitoring, pauseMonitoring, resumeMonitoring, stopMonitoring
+    case startMonitoring, pauseMonitoring, resumeMonitoring, reconnectMonitoring, stopMonitoring
     case currentSnapshot, updates
 }
 
@@ -197,8 +197,8 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
             IntegrationPreview(
                 source: source,
                 path: "/CANARY/\(source.rawValue).json",
-                before: "{}",
-                after: "{}",
+                before: "{\"CANARY_EXISTING\":\"\(source.rawValue)\"}",
+                after: "{\"CANARY_AGENT_LIGHT\":\"\(source.rawValue)\"}",
                 hadOwnedEntries: hadOwnedEntries
             )
         }
@@ -322,6 +322,7 @@ actor FakeMonitor: MonitoringOrchestrating {
     private var resumeBlocked = false
     private var resumeRelease: CheckedContinuation<Void, Never>?
     private var resumeWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var reconnectWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var stopBlocked = false
     private var stopRelease: CheckedContinuation<Void, Never>?
     private var stopWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
@@ -332,6 +333,7 @@ actor FakeMonitor: MonitoringOrchestrating {
     private(set) var startCount = 0
     private(set) var pauseCount = 0
     private(set) var resumeCount = 0
+    private(set) var reconnectCount = 0
     private(set) var stopCount = 0
     private(set) var updateSubscriptionCount = 0
     private(set) var terminationCount = 0
@@ -379,7 +381,13 @@ actor FakeMonitor: MonitoringOrchestrating {
         for waiter in ready { waiter.1.resume() }
         if stopBlocked { await withCheckedContinuation { stopRelease = $0 } }
     }
-    func reconnect() async {}
+    func reconnect() async {
+        calls.append(.reconnectMonitoring)
+        reconnectCount += 1
+        let ready = reconnectWaiters.filter { reconnectCount >= $0.0 }
+        reconnectWaiters.removeAll { reconnectCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
+    }
     func recoverIfNeeded() async throws {}
     func currentSnapshot() async -> MonitoringSnapshot {
         calls.append(.currentSnapshot)
@@ -415,6 +423,7 @@ actor FakeMonitor: MonitoringOrchestrating {
     func finish(_ id: UUID) { historicalContinuations[id]?.finish() }
     func setStartError(_ error: (any Error & Sendable)?) { startError = error }
     func setResumeError(_ error: (any Error & Sendable)?) { resumeError = error }
+    func setSnapshot(_ value: MonitoringSnapshot) { snapshot = value }
     func blockStart() { startBlocked = true }
     func releaseStart() { startBlocked = false; startRelease?.resume(); startRelease = nil }
     func waitForStartCount(_ expected: Int) async {
@@ -439,6 +448,10 @@ actor FakeMonitor: MonitoringOrchestrating {
         if resumeCount >= expected { return }
         await withCheckedContinuation { resumeWaiters.append((expected, $0)) }
     }
+    func waitForReconnectCount(_ expected: Int) async {
+        if reconnectCount >= expected { return }
+        await withCheckedContinuation { reconnectWaiters.append((expected, $0)) }
+    }
     func blockStop() { stopBlocked = true }
     func releaseStop() { stopBlocked = false; stopRelease?.resume(); stopRelease = nil }
     func waitForStopCount(_ expected: Int) async {
@@ -457,6 +470,7 @@ actor FakeMonitor: MonitoringOrchestrating {
         start: Int,
         pause: Int,
         resume: Int,
+        reconnect: Int,
         stop: Int,
         subscriptions: Int,
         terminations: Int,
@@ -467,6 +481,7 @@ actor FakeMonitor: MonitoringOrchestrating {
             startCount,
             pauseCount,
             resumeCount,
+            reconnectCount,
             stopCount,
             updateSubscriptionCount,
             terminationCount,
@@ -546,7 +561,7 @@ final class ViewModelHarness {
     let verifier: FakeVerifier
     let ownershipLedger: AppOwnershipLedger
     let validDraft = ConnectionDraft(
-        endpoint: "https://openapi.tuyaus.com",
+        endpoint: "https://openapi.tuyain.com",
         accessID: "CANARY_ACCESS_ID",
         accessSecret: "CANARY_ACCESS_SECRET",
         deviceID: "CANARY_DEVICE_ID"

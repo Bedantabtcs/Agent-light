@@ -7,7 +7,7 @@ public protocol TuyaConnectionVerifying: Sendable {
 }
 
 @MainActor
-public protocol AppViewModeling: AnyObject {
+public protocol AppViewModeling: AnyObject, Sendable {
     var phase: AppPhase { get }
     var connectionStatus: LightConnectionStatus { get }
     var currentState: AgentState { get }
@@ -16,6 +16,9 @@ public protocol AppViewModeling: AnyObject {
     var presentedError: PresentationError? { get }
     var outstandingObligations: Set<OutstandingObligation> { get }
     var loginItemStatus: LoginItemStatus { get }
+    var maskedAccessID: String? { get }
+    var maskedDeviceID: String? { get }
+    var repairPreviews: [IntegrationPreview] { get }
     func connect(using draft: ConnectionDraft) async
     func approveIntegrations() async
     func pause() async
@@ -25,12 +28,23 @@ public protocol AppViewModeling: AnyObject {
     func observeMonitoring() async
     func synchronizeOwnership() async
     func requestLaunchAtLogin() async
+    func reconnect() async
+    func previewIntegrationRepair() async
+    func uninstallIntegrations() async
+    func replaceDevice() async
 }
 
 public extension AppViewModeling {
     func synchronizeOwnership() async {}
     var loginItemStatus: LoginItemStatus { .unknown }
     func requestLaunchAtLogin() async {}
+    var maskedAccessID: String? { nil }
+    var maskedDeviceID: String? { nil }
+    var repairPreviews: [IntegrationPreview] { [] }
+    func reconnect() async {}
+    func previewIntegrationRepair() async {}
+    func uninstallIntegrations() async {}
+    func replaceDevice() async {}
 }
 
 public enum AppPhase: Equatable, Sendable {
@@ -89,6 +103,9 @@ public final class AppViewModel: AppViewModeling {
     public private(set) var presentedError: PresentationError?
     public private(set) var outstandingObligations: Set<OutstandingObligation> = []
     public private(set) var loginItemStatus: LoginItemStatus
+    public private(set) var maskedAccessID: String?
+    public private(set) var maskedDeviceID: String?
+    public private(set) var repairPreviews: [IntegrationPreview] = []
 
     @ObservationIgnored private let credentials: any CredentialStoring
     @ObservationIgnored private let integrations: any IntegrationInstalling
@@ -461,6 +478,7 @@ public final class AppViewModel: AppViewModeling {
             self.repairTask = nil
         }
         await operation.wait()
+        repairPreviews = []
     }
 
     public func disconnect() async {
@@ -534,6 +552,76 @@ public final class AppViewModel: AppViewModeling {
             presentedError = .operationFailed
         }
         await ownershipLedger.releaseLease(lease)
+    }
+
+    public func reconnect() async {
+        guard await hydrateOwnership(), phase == .monitoring, ownsMonitoring else { return }
+        await monitor.reconnect()
+        let observation = await Self.preparedObservation(from: monitor)
+        guard phase == .monitoring else { return }
+        apply(observation.snapshot)
+        if observationTask == nil {
+            installObservation(observation)
+        }
+        presentedError = connectionStatus == .connected ? nil : .bulbOffline
+    }
+
+    public func previewIntegrationRepair() async {
+        guard phase == .monitoring || phase == .paused || phase == .repairRequired,
+              let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        do {
+            repairPreviews = try await integrations.preview()
+            presentedError = nil
+        } catch {
+            repairPreviews = []
+            presentedError = Self.presentationError(for: error)
+        }
+        await ownershipLedger.releaseLease(lease)
+    }
+
+    public func uninstallIntegrations() async {
+        guard phase == .monitoring || phase == .paused || phase == .repairRequired,
+              let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        let snapshot = await ownershipLedger.snapshot()
+        switch snapshot.integration {
+        case .uninstallable:
+            do {
+                try await integrations.uninstall()
+                await ownershipLedger.setIntegration(.none)
+                await ownershipLedger.remove(.integrationUninstallRetry)
+                presentedError = nil
+            } catch IntegrationError.artifactCleanupFailure,
+                    IntegrationError.committedWithCleanupFailure,
+                    IntegrationError.committedWithReceiptCleanupFailure {
+                await ownershipLedger.setIntegration(.none)
+                await ownershipLedger.insert(.integrationArtifactCleanup)
+                phase = .repairRequired
+                presentedError = .operationFailed
+            } catch {
+                await ownershipLedger.insert(.integrationUninstallRetry)
+                phase = .repairRequired
+                presentedError = Self.presentationError(for: error)
+            }
+        case .preexisting, .mixed:
+            await ownershipLedger.setIntegration(.mixed)
+            await ownershipLedger.insert(.integrationMixedAdoption)
+            phase = .repairRequired
+            presentedError = .integrationConflict
+        case .uncertain:
+            await ownershipLedger.insert(.integrationRollbackRepair)
+            phase = .repairRequired
+            presentedError = .integrationConflict
+        case .none:
+            presentedError = .integrationConflict
+        }
+        let final = await ownershipLedger.snapshot()
+        syncOwnership(final)
+        repairPreviews = []
+        await ownershipLedger.releaseLease(lease)
+    }
+
+    public func replaceDevice() async {
+        await disconnect()
     }
 
     public func observeMonitoring() async {
@@ -657,11 +745,15 @@ public final class AppViewModel: AppViewModeling {
         switch result {
         case let .success(temporary, previews):
             pendingCredentials = temporary
+            maskedAccessID = Self.maskedIdentifier(temporary.accessID)
+            maskedDeviceID = Self.maskedIdentifier(temporary.deviceID)
             integrationPreviews = previews
             presentedError = nil
             phase = .integrationReview
         case let .failure(error):
             pendingCredentials = nil
+            maskedAccessID = nil
+            maskedDeviceID = nil
             integrationPreviews = []
             phase = .onboarding
             presentedError = error
@@ -881,6 +973,9 @@ public final class AppViewModel: AppViewModeling {
         ownsMonitoring = snapshot.monitoringOwned
 
         pendingCredentials = nil
+        maskedAccessID = nil
+        maskedDeviceID = nil
+        repairPreviews = []
         integrationPreviews = []
         currentState = .idle
         sessions = []
@@ -1188,24 +1283,20 @@ public final class AppViewModel: AppViewModeling {
         guard !accessID.isEmpty, !accessSecret.isEmpty, !deviceID.isEmpty else {
             throw ValidationError.invalidCredential
         }
-        guard let components = URLComponents(string: endpointText),
-              components.scheme?.lowercased() == "https",
-              let host = components.host,
-              !host.isEmpty,
-              components.user == nil,
-              components.password == nil,
-              components.query == nil,
-              components.fragment == nil,
-              components.path.isEmpty || components.path == "/",
-              let endpoint = components.url else {
+        guard let endpoint = URL(string: endpointText),
+              let dataCenter = TuyaDataCenter(endpoint: endpoint) else {
             throw ValidationError.invalidEndpoint
         }
         return TuyaCredentials(
-            endpoint: endpoint,
+            endpoint: dataCenter.endpoint,
             accessID: accessID,
             accessSecret: accessSecret,
             deviceID: deviceID
         )
+    }
+
+    private static func maskedIdentifier(_ value: String) -> String {
+        "••••" + value.suffix(4)
     }
 
     private static func integrationOwnership(

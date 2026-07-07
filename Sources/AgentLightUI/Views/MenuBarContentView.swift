@@ -20,8 +20,6 @@ public struct MenuBarContentView: View {
             Task { await viewModel.pause() }
         case .resume:
             Task { await viewModel.resume() }
-        case .repair:
-            Task { await viewModel.repairIntegrations() }
         case .quit:
             quit()
         }
@@ -95,15 +93,13 @@ public struct MenuBarContentView: View {
                         .accessibilityIdentifier("integrationReview.status")
                 }
 
-                Button {
-                    perform(.approve)
-                } label: {
-                    Label("Approve & Start Monitoring", systemImage: "checkmark.shield")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .accessibilityIdentifier(AmbientAccessibilityID.integrationApprove)
+                NativeActionButton(
+                    title: "Approve & Start Monitoring",
+                    accessibilityIdentifier: AmbientAccessibilityID.integrationApprove,
+                    keyEquivalent: "\r",
+                    isProminent: true
+                ) { perform(.approve) }
+                .frame(maxWidth: .infinity)
             }
             .padding(AmbientTheme.Spacing.window)
         }
@@ -118,12 +114,13 @@ public struct MenuBarContentView: View {
                 Text(preview.hadOwnedEntries ? "Change / conflict" : "New entry")
                     .font(.caption.weight(.semibold))
             }
-            Text(preview.path)
-                .font(.caption.monospaced())
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-            summaryRow("Before", value: preview.before)
-            summaryRow("After", value: preview.after)
+            NativeWrappingText(
+                text: preview.path,
+                accessibilityIdentifier: "integrationReview.\(preview.source.rawValue).path",
+                isMonospaced: true
+            )
+            summaryRow("Before", value: preview.before, source: preview.source)
+            summaryRow("After", value: preview.after, source: preview.source)
             Text(preview.before == preview.after ? "No content change" : "Agent Light hook entry will be merged; unrelated configuration is preserved.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -136,13 +133,14 @@ public struct MenuBarContentView: View {
         .accessibilityIdentifier("integrationReview.\(preview.source.rawValue)")
     }
 
-    private func summaryRow(_ title: String, value: String) -> some View {
+    private func summaryRow(_ title: String, value: String, source: AgentSource) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title).font(.caption.weight(.semibold))
-            Text(value.isEmpty ? "Empty file" : value)
-                .font(.caption.monospaced())
-                .lineLimit(3)
-                .fixedSize(horizontal: false, vertical: true)
+            NativeWrappingText(
+                text: value.isEmpty ? "Empty file" : value,
+                accessibilityIdentifier: "integrationReview.\(source.rawValue).\(title.lowercased())",
+                isMonospaced: true
+            )
         }
     }
 
@@ -232,11 +230,11 @@ public struct MenuBarContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(event.source.displayName)
                     .font(.callout.weight(.medium))
-                Text(event.workspace ?? event.sessionID)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
+                NativeWrappingText(
+                    text: event.workspace ?? event.sessionID,
+                    accessibilityIdentifier: "monitor.session.\(event.sessionID).workspace",
+                    isSelectable: false
+                )
             }
             Spacer(minLength: AmbientTheme.Spacing.compact)
             Label(event.state.displayName, systemImage: event.state.symbolName)
@@ -251,34 +249,37 @@ public struct MenuBarContentView: View {
     private var actionControls: some View {
         VStack(spacing: AmbientTheme.Spacing.compact) {
             if viewModel.phase == .monitoring {
-                Button { perform(.pause) } label: {
-                    Label("Pause Monitoring", systemImage: "pause.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .accessibilityIdentifier(AmbientAccessibilityID.monitorPause)
+                NativeActionButton(
+                    title: "Pause Monitoring",
+                    accessibilityIdentifier: AmbientAccessibilityID.monitorPause
+                ) { perform(.pause) }
+                .frame(maxWidth: .infinity)
             } else if viewModel.phase == .paused {
-                Button { perform(.resume) } label: {
-                    Label("Resume Monitoring", systemImage: "play.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .accessibilityIdentifier(AmbientAccessibilityID.monitorResume)
+                NativeActionButton(
+                    title: "Resume Monitoring",
+                    accessibilityIdentifier: AmbientAccessibilityID.monitorResume
+                ) { perform(.resume) }
+                .frame(maxWidth: .infinity)
             }
             if viewModel.phase == .repairRequired {
-                Button { perform(.repair) } label: {
-                    Label("Repair Integrations", systemImage: "wrench.and.screwdriver")
-                        .frame(maxWidth: .infinity)
-                }
-                .accessibilityIdentifier(AmbientAccessibilityID.monitorRepair)
+                NativeActionButton(
+                    title: "Review Repair",
+                    accessibilityIdentifier: AmbientAccessibilityID.monitorRepair
+                ) { showsSettings = true }
+                .frame(maxWidth: .infinity)
             }
             HStack {
-                Button("Settings") { showsSettings = true }
-                    .accessibilityIdentifier(AmbientAccessibilityID.monitorSettings)
+                NativeActionButton(
+                    title: "Settings",
+                    accessibilityIdentifier: AmbientAccessibilityID.monitorSettings
+                ) { showsSettings = true }
                 Spacer()
-                Button("Quit") { perform(.quit) }
-                    .accessibilityIdentifier(AmbientAccessibilityID.monitorQuit)
+                NativeActionButton(
+                    title: "Quit",
+                    accessibilityIdentifier: AmbientAccessibilityID.monitorQuit
+                ) { perform(.quit) }
             }
         }
-        .buttonStyle(.bordered)
     }
 
     private var activeSession: AgentEvent? { viewModel.sessions.first }
@@ -299,7 +300,6 @@ enum MenuAction {
     case approve
     case pause
     case resume
-    case repair
     case quit
 }
 

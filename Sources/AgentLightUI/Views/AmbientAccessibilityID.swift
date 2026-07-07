@@ -12,8 +12,13 @@ enum AmbientAccessibilityID {
     static let monitorQuit = "monitor.quit"
     static let settingsBack = "settings.back"
     static let settingsDisconnect = "settings.light.disconnect"
+    static let settingsReconnect = "settings.light.reconnect"
+    static let settingsReplaceDevice = "settings.light.replaceDevice"
     static let settingsRepair = "settings.integrations.repair"
+    static let settingsConfirmRepair = "settings.integrations.confirmRepair"
+    static let settingsUninstall = "settings.integrations.uninstall"
     static let settingsEnableLogin = "settings.general.enableLogin"
+    static let settingsMonitoring = "settings.general.monitoring"
 
     static let interactive: [String] = [
         onboardingEndpoint,
@@ -29,7 +34,12 @@ enum AmbientAccessibilityID {
         monitorQuit,
         settingsBack,
         settingsDisconnect,
+        settingsReconnect,
+        settingsReplaceDevice,
         settingsRepair,
+        settingsConfirmRepair,
+        settingsUninstall,
+        settingsMonitoring,
         settingsEnableLogin
     ]
 }
