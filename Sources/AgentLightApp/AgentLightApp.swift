@@ -20,7 +20,7 @@ struct AgentLightApp: App {
                     MenuBarContentView(viewModel: viewModel) {
                         environment.requestQuit()
                     }
-                case .loading, .failed:
+                case .loading, .failed, .credentialResetFailed:
                     StartupStatusView(
                         status: environment.status,
                         retry: environment.requestStart,
@@ -51,11 +51,11 @@ struct StartupStatusView: View {
             } else {
                 Label("Agent Light could not start", systemImage: "exclamationmark.triangle")
                     .font(.headline)
-                Text("Recovery or local relay setup failed. No agent events are being accepted.")
+                Text(failureMessage)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 NativeActionButton(
-                    title: "Retry Startup",
+                    title: retryTitle,
                     accessibilityIdentifier: "app.startup.retry",
                     action: retry
                 )
@@ -69,5 +69,16 @@ struct StartupStatusView: View {
         .padding(24)
         .frame(minWidth: 380, maxWidth: 380, minHeight: 240)
         .accessibilityIdentifier(status == .loading ? "app.startup.loading" : "app.startup.failed")
+    }
+
+    private var failureMessage: String {
+        if status == .credentialResetFailed {
+            return "Stored Tuya credentials could not be reset. No agent events are being accepted."
+        }
+        return "Recovery or local relay setup failed. No agent events are being accepted."
+    }
+
+    private var retryTitle: String {
+        status == .credentialResetFailed ? "Reset Stored Credentials & Retry" : "Retry Startup"
     }
 }

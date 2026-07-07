@@ -195,6 +195,30 @@ final class ViewRenderingTests: XCTestCase {
         XCTAssertEqual(pauseCount, 1)
     }
 
+    func testRenderedMonitoringSwitchTracksActiveMonitorDuringRepair() async throws {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.integrations.setRepairError(TuyaClientError.transport)
+        await harness.viewModel.repairIntegrations()
+        let hosting = host(SettingsView(viewModel: harness.viewModel))
+        let monitoringSwitch = try XCTUnwrap(
+            descendants(of: hosting)
+                .compactMap { $0 as? NSSwitch }
+                .first { $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsMonitoring }
+        )
+        XCTAssertEqual(monitoringSwitch.state, .on)
+
+        monitoringSwitch.state = .off
+        XCTAssertTrue(monitoringSwitch.sendAction(monitoringSwitch.action, to: monitoringSwitch.target))
+        await harness.monitor.waitForPauseCount(1)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+
+        monitoringSwitch.state = .on
+        XCTAssertTrue(monitoringSwitch.sendAction(monitoringSwitch.action, to: monitoringSwitch.target))
+        await harness.monitor.waitForResumeCount(1)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
     func testRenderedSettingsActionsInvokeOnceAndRepairRequiresPreviewConfirmation() async throws {
         let reconnectHarness = ViewModelHarness()
         await reconnectHarness.connectAndApprove()
@@ -220,6 +244,14 @@ final class ViewRenderingTests: XCTestCase {
         await uninstallHarness.integrations.waitForUninstallCount(1)
         let uninstallCount = await uninstallHarness.integrations.counts().uninstall
         XCTAssertEqual(uninstallCount, 1)
+        for _ in 0..<100 where uninstallHarness.viewModel.integrationStatus != .notInstalled {
+            await nextMainTurn()
+        }
+        await nextMainTurn()
+        uninstallHost.layoutSubtreeIfNeeded()
+        let uninstallText = descendants(of: uninstallHost)
+            .compactMap { ($0 as? NSTextField)?.stringValue }
+        XCTAssertTrue(uninstallText.contains("Not Installed"), "\(uninstallText)")
 
         let repairHarness = ViewModelHarness()
         await repairHarness.connectAndApprove()
@@ -263,26 +295,88 @@ final class ViewRenderingTests: XCTestCase {
                 .map { $0.accessibilityIdentifier() }
                 .filter { !$0.isEmpty }
         })
-        let expected = [
-            AmbientAccessibilityID.onboardingEndpoint,
-            AmbientAccessibilityID.onboardingVerify,
-            AmbientAccessibilityID.integrationApprove,
-            AmbientAccessibilityID.monitorPause,
-            AmbientAccessibilityID.monitorResume,
-            AmbientAccessibilityID.monitorRepair,
-            AmbientAccessibilityID.monitorSettings,
-            AmbientAccessibilityID.monitorQuit,
-            AmbientAccessibilityID.settingsBack,
-            AmbientAccessibilityID.settingsDisconnect,
-            AmbientAccessibilityID.settingsReconnect,
-            AmbientAccessibilityID.settingsReplaceDevice,
-            AmbientAccessibilityID.settingsRepair,
-            AmbientAccessibilityID.settingsUninstall,
-            AmbientAccessibilityID.settingsMonitoring
+        let expected: [(String, String, NSAccessibility.Role)] = [
+            (AmbientAccessibilityID.onboardingEndpoint, "Tuya data center", .popUpButton),
+            (AmbientAccessibilityID.onboardingVerify, "Verify & Connect", .button),
+            (AmbientAccessibilityID.integrationApprove, "Approve & Start Monitoring", .button),
+            (AmbientAccessibilityID.monitorPause, "Pause Monitoring", .button),
+            (AmbientAccessibilityID.monitorResume, "Resume Monitoring", .button),
+            (AmbientAccessibilityID.monitorRepair, "Review Repair", .button),
+            (AmbientAccessibilityID.monitorSettings, "Settings", .button),
+            (AmbientAccessibilityID.monitorQuit, "Quit", .button),
+            (AmbientAccessibilityID.settingsBack, "Back", .button),
+            (AmbientAccessibilityID.settingsDisconnect, "Disconnect and restore light", .button),
+            (AmbientAccessibilityID.settingsReconnect, "Reconnect Light", .button),
+            (AmbientAccessibilityID.settingsReplaceDevice, "Replace Device", .button),
+            (AmbientAccessibilityID.settingsRepair, "Preview Repair", .button),
+            (AmbientAccessibilityID.settingsUninstall, "Uninstall Integrations", .button),
+            (AmbientAccessibilityID.settingsMonitoring, "Monitoring", .checkBox)
         ]
-        for identifier in expected {
+        for (identifier, label, role) in expected {
             XCTAssertTrue(identifiers.contains(identifier), "Missing rendered identifier \(identifier)")
+            let control = roots.lazy
+                .flatMap { self.descendants(of: $0) }
+                .first { $0.accessibilityIdentifier() == identifier }
+            XCTAssertEqual(control?.accessibilityLabel(), label, identifier)
+            XCTAssertEqual(control?.accessibilityRole(), role, identifier)
+            XCTAssertEqual(control?.isAccessibilityElement(), true, identifier)
         }
+    }
+
+    func testNativeControlsAndWrappingTextScaleForAccessibilityDynamicType() async throws {
+        let session = AgentEvent(
+            source: .codex,
+            sessionID: "CANARY_DYNAMIC_SESSION",
+            workspace: "/CANARY/DYNAMIC/WORKSPACE",
+            state: .working,
+            sequence: 1
+        )
+        let normalOnboarding = host(OnboardingView(viewModel: PreviewViewModel.onboarding()))
+        let largeOnboarding = host(
+            OnboardingView(viewModel: PreviewViewModel.onboarding())
+                .dynamicTypeSize(.accessibility5)
+        )
+        let normalReview = host(MenuBarContentView(viewModel: await PreviewViewModel.integrationReview()))
+        let largeReview = host(
+            MenuBarContentView(viewModel: await PreviewViewModel.integrationReview())
+                .dynamicTypeSize(.accessibility5)
+        )
+        let normalMonitor = host(MenuBarContentView(
+            viewModel: await PreviewViewModel.monitoring(state: .working, sessions: [session])
+        ))
+        let largeMonitor = host(
+            MenuBarContentView(
+                viewModel: await PreviewViewModel.monitoring(state: .working, sessions: [session])
+            )
+            .dynamicTypeSize(.accessibility5)
+        )
+        let normalSettings = host(SettingsView(viewModel: await PreviewViewModel.monitoring(state: .idle)))
+        let largeSettings = host(
+            SettingsView(viewModel: await PreviewViewModel.monitoring(state: .idle))
+                .dynamicTypeSize(.accessibility5)
+        )
+
+        let comparisons: [(NSView, NSView, String)] = [
+            (normalOnboarding, largeOnboarding, AmbientAccessibilityID.onboardingEndpoint),
+            (normalOnboarding, largeOnboarding, AmbientAccessibilityID.onboardingVerify),
+            (normalReview, largeReview, "integrationReview.codex.path"),
+            (normalReview, largeReview, "integrationReview.codex.before"),
+            (normalMonitor, largeMonitor, "monitor.session.CANARY_DYNAMIC_SESSION.workspace"),
+            (normalSettings, largeSettings, AmbientAccessibilityID.settingsMonitoring)
+        ]
+        for (normal, large, identifier) in comparisons {
+            let normalSize = try renderedFontSize(identifier, in: normal)
+            let largeSize = try renderedFontSize(identifier, in: large)
+            XCTAssertGreaterThan(largeSize, normalSize, "\(identifier): \(normalSize) -> \(largeSize)")
+        }
+        assertFiniteLayout(largeOnboarding)
+        assertFiniteLayout(largeReview)
+        assertFiniteLayout(largeMonitor)
+        assertFiniteLayout(largeSettings)
+        XCTAssertTrue(descendants(of: largeReview).contains { view in
+            guard let clip = view as? NSClipView, let document = clip.documentView else { return false }
+            return document.frame.height > clip.bounds.height
+        })
     }
 
     func testRenderedSettingsAccessibilityContainsInteractiveControls() async {
@@ -335,6 +429,21 @@ final class ViewRenderingTests: XCTestCase {
                 .first { $0.accessibilityIdentifier() == identifier },
             "Missing rendered button \(identifier)"
         )
+    }
+
+    private func renderedFontSize(_ identifier: String, in view: NSView) throws -> CGFloat {
+        let rendered = try XCTUnwrap(
+            descendants(of: view).first { $0.accessibilityIdentifier() == identifier },
+            "Missing rendered view \(identifier)"
+        )
+        if let control = rendered as? NSControl {
+            return try XCTUnwrap(control.font?.pointSize, "Missing control font for \(identifier)")
+        }
+        if let text = rendered as? NSTextField {
+            return try XCTUnwrap(text.font?.pointSize, "Missing text font for \(identifier)")
+        }
+        XCTFail("Rendered view has no font: \(identifier)")
+        return 0
     }
 
     private func nextMainTurn() async {

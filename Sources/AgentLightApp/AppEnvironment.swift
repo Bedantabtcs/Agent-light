@@ -55,6 +55,7 @@ enum AppEnvironmentStatus: Equatable {
     case loading
     case ready
     case failed
+    case credentialResetFailed
 }
 
 @MainActor
@@ -68,9 +69,11 @@ final class AppEnvironment {
     @ObservationIgnored private let relay: any RelayServing
     @ObservationIgnored private let coordinator: any RelayEventCoordinating
     @ObservationIgnored private let prepareStorage: @Sendable () async throws -> Void
-    @ObservationIgnored private var startTask: Task<Void, Never>?
-    @ObservationIgnored private var startID: UUID?
-    @ObservationIgnored private var started = false
+    @ObservationIgnored private let shutdownController: EnvironmentShutdownController
+    @ObservationIgnored private var lifecycle: Lifecycle = .idle
+    @ObservationIgnored private var operationID: UUID?
+    @ObservationIgnored private var operationTail: Task<Void, Never>?
+    @ObservationIgnored private var restartAfterStop = false
 
     init(
         viewModel: any AppViewModeling,
@@ -86,24 +89,45 @@ final class AppEnvironment {
         self.relay = relay
         self.coordinator = coordinator
         self.prepareStorage = prepareStorage
+        shutdownController = EnvironmentShutdownController(relay: relay, viewModel: viewModel)
     }
 
     deinit {
-        startTask?.cancel()
+        let tail = operationTail
+        tail?.cancel()
+        let shutdownController = shutdownController
+        Task {
+            await tail?.value
+            await shutdownController.shutdown()
+        }
     }
 
     func requestStart() {
-        guard !started, startTask == nil else { return }
+        switch lifecycle {
+        case .idle:
+            beginStart()
+        case .stopping:
+            restartAfterStop = true
+        case .starting, .ready:
+            break
+        }
+    }
+
+    private func beginStart() {
+        guard lifecycle == .idle else { return }
         status = .loading
         let id = UUID()
-        startID = id
+        lifecycle = .starting
+        operationID = id
         let viewModel = viewModel
         let credentials = credentials
         let monitor = monitor
         let relay = relay
         let coordinator = coordinator
         let prepareStorage = prepareStorage
+        let shutdownController = shutdownController
         let task = Task { [weak self] in
+            await shutdownController.arm()
             let outcome = await Self.performStart(
                 viewModel: viewModel,
                 credentials: credentials,
@@ -112,15 +136,21 @@ final class AppEnvironment {
                 coordinator: coordinator,
                 prepareStorage: prepareStorage
             )
+            if outcome != .ready {
+                await shutdownController.shutdown()
+            }
             self?.finishStart(outcome, id: id)
         }
-        startTask = task
+        operationTail = task
     }
 
     func start() async {
-        if started { return }
         requestStart()
-        await startTask?.value
+        while lifecycle == .starting || lifecycle == .stopping {
+            let current = operationTail
+            await current?.value
+            if current == nil { break }
+        }
     }
 
     private nonisolated static func performStart(
@@ -136,7 +166,17 @@ final class AppEnvironment {
             try Task.checkCancellation()
             try await monitor.recoverIfNeeded()
             try Task.checkCancellation()
-            let storedCredentials = try credentials.load()
+            let storedCredentials: TuyaCredentials?
+            do {
+                storedCredentials = try credentials.load()
+            } catch CredentialStoreError.malformedData {
+                do {
+                    try credentials.delete()
+                    storedCredentials = nil
+                } catch {
+                    return .credentialResetFailed
+                }
+            }
             await viewModel.synchronizeOwnership()
             try Task.checkCancellation()
             if let storedCredentials, await viewModel.phase == .onboarding {
@@ -158,41 +198,63 @@ final class AppEnvironment {
             try Task.checkCancellation()
             return .ready
         } catch is CancellationError {
-            await relay.stop()
-            await viewModel.disconnect()
             return .cancelled
         } catch {
-            await relay.stop()
-            await viewModel.disconnect()
             return .failed
         }
     }
 
     private func finishStart(_ outcome: StartOutcome, id: UUID) {
-        guard startID == id else { return }
-        startTask = nil
-        startID = nil
+        guard lifecycle == .starting, operationID == id else { return }
+        operationTail = nil
+        operationID = nil
         switch outcome {
         case .ready:
-            started = true
+            lifecycle = .ready
             status = .ready
         case .failed:
-            started = false
+            lifecycle = .idle
             status = .failed
+        case .credentialResetFailed:
+            lifecycle = .idle
+            status = .credentialResetFailed
         case .cancelled:
-            started = false
+            lifecycle = .idle
         }
     }
 
     func stop() async {
-        let startup = startTask
-        startTask = nil
-        startID = nil
-        startup?.cancel()
-        await startup?.value
-        await relay.stop()
-        await viewModel.disconnect()
-        started = false
+        if lifecycle == .stopping {
+            restartAfterStop = false
+            await operationTail?.value
+            return
+        }
+
+        let prior = operationTail
+        let id = UUID()
+        lifecycle = .stopping
+        operationID = id
+        restartAfterStop = false
+        prior?.cancel()
+        let shutdownController = shutdownController
+        let task = Task { [weak self] in
+            await prior?.value
+            await shutdownController.shutdown()
+            self?.finishStop(id: id)
+        }
+        operationTail = task
+        await task.value
+    }
+
+    private func finishStop(id: UUID) {
+        guard lifecycle == .stopping, operationID == id else { return }
+        let shouldRestart = restartAfterStop
+        lifecycle = .idle
+        operationID = nil
+        operationTail = nil
+        restartAfterStop = false
+        status = .loading
+        if shouldRestart { beginStart() }
     }
 
     func requestQuit() {
@@ -205,7 +267,50 @@ final class AppEnvironment {
     private enum StartOutcome: Sendable {
         case ready
         case failed
+        case credentialResetFailed
         case cancelled
+    }
+
+    private enum Lifecycle: Sendable {
+        case idle
+        case starting
+        case ready
+        case stopping
+    }
+}
+
+private actor EnvironmentShutdownController {
+    private let relay: any RelayServing
+    private let viewModel: any AppViewModeling
+    private var isArmed = true
+    private var shutdownTask: Task<Void, Never>?
+
+    init(relay: any RelayServing, viewModel: any AppViewModeling) {
+        self.relay = relay
+        self.viewModel = viewModel
+    }
+
+    func arm() async {
+        await shutdownTask?.value
+        isArmed = true
+    }
+
+    func shutdown() async {
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
+        guard isArmed else { return }
+        isArmed = false
+        let relay = relay
+        let viewModel = viewModel
+        let task = Task {
+            await relay.stop()
+            await viewModel.disconnect()
+        }
+        shutdownTask = task
+        await task.value
+        shutdownTask = nil
     }
 }
 

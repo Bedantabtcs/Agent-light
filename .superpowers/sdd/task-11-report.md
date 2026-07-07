@@ -99,3 +99,48 @@ Correction base: `a4331119eaa833eaf989d43a135bbf835a6a2144`
 
 - Exercise picker-to-field focus progression and Return/Escape behavior in the packaged menu-bar window with VoiceOver enabled.
 - Toggle macOS Reduce Motion and Increase Contrast in System Settings and verify the packaged app follows both settings.
+
+## Final findings correction batch
+
+Correction base: `87ab1cb1ae83f0609ff93f809eed7e271899a8f6`
+
+### Lifecycle serialization and deinit cleanup RED/GREEN
+
+- RED: a start requested while blocked startup cleanup was in progress entered recovery twice and started the relay once before cleanup completed (`2` versus `1` recoveries; `1` versus `0` relay starts). A start requested during ready cleanup was lost (`1` versus `2` final relay starts). Deallocating a ready environment produced no relay stop (`0` versus `1`).
+- GREEN: `AppEnvironment` now owns an explicit `idle`, `starting`, `ready`, or `stopping` lifecycle plus one operation ID and tail task. Stop marks `stopping` before its first suspension, retains the tail through dependency cleanup, and coalesces any start requested during stop into one post-cleanup start.
+- GREEN: a dependency-only `EnvironmentShutdownController` is armed per lifecycle, coalesces cleanup, and outlives the environment without retaining it. Ready and starting deinitialization stop the relay and invoke view-model disconnect/restoration exactly once.
+
+### Stored credential recovery RED/GREEN
+
+- RED: legacy arbitrary-origin credentials and malformed bytes both ended in permanent generic startup failure, never deleted the unusable item, and never started the relay. A delete failure had no explicit reset state and repeated the same failure.
+- GREEN: `CredentialStoreError.malformedData` is handled separately. Startup deletes through `CredentialStoring`, keeps the view model in onboarding without the bad value, and continues recovery and relay startup without connection verification/signing. A failed delete presents the sanitized `credentialResetFailed` state with `Reset Stored Credentials & Retry`; retry reattempts deletion and then starts normally.
+
+### Explicit Settings state RED/GREEN
+
+- RED: focused tests did not compile because explicit integration-installed/status, monitoring-active, and monitoring-enable APIs were absent. The phase-derived switch could not pause or resume during repair, and post-uninstall Settings remained `Installed`.
+- GREEN: the protocol and view model expose `integrationInstalled`, `integrationStatus`, and `monitoringActive`. Integration state is projected from the ownership ledger; monitor state changes only at monitor start/pause/resume/cleanup boundaries. Successful uninstall renders `Not Installed` in monitoring and keeps `integrationInstalled == false` when another obligation preserves repair phase.
+- GREEN: `setMonitoringEnabled(_:)` pauses and resumes owned monitoring during `repairRequired`, preserves the repair phase and its sanitized error, refreshes observation on resume, and drives the native switch from `monitoringActive`.
+
+### AppKit accessibility and Dynamic Type RED/GREEN
+
+- RED: hosted tests reported unchanged `13`/`11` point fonts, a missing switch font, a picker without label/role/exposure, primary buttons as `AXUnknown` and ignored, and the switch as `AXButton`.
+- GREEN: every native wrapper consumes SwiftUI `dynamicTypeSize` and applies deterministic system or monospaced AppKit font scaling. Hosted normal-versus-Accessibility 5 tests cover button, picker, switch, integration path/summary, and session workspace text while retaining finite 380-point layout and scroll reachability.
+- GREEN: primary controls now set programmatic identifier, label, role, and accessibility-element exposure. The picker is exposed as `AXPopUpButton` with label `Tuya data center`; the visual switch is exposed with its checkbox accessibility role.
+
+### Final verification
+
+- `AppEnvironmentTests`: 16 passed, 0 failures.
+- `AppViewModelTests`: 115 passed, 0 failures.
+- `ViewRenderingTests`: 16 passed, 0 failures.
+- Critical lifecycle subset repeated 20 times: 120 test executions passed, 0 failures.
+- `swift test`: 423 passed, 0 failures.
+- `swift build`: exit 0.
+- `swift build -c release`: exit 0.
+- `git diff --check`: exit 0.
+- Static scan: no added TODO/FIXME markers, debug logging, forced casts/tries, fatal traps, private-key material, source credential literals, dynamic evaluation, custom color/timing controls, or direct UI light commands.
+- Process scan: no orphaned `xctest` or `AgentLightPackageTests` process.
+
+### Remaining manual checks
+
+- With VoiceOver enabled in the packaged app, traverse the data-center picker and each primary action and confirm the programmed labels and roles are announced once.
+- Set the packaged app to the largest supported text size and verify every Settings action and full integration preview remains reachable by scrolling.

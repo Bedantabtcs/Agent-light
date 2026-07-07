@@ -3,6 +3,7 @@ import AgentLightCore
 import SwiftUI
 
 struct NativeDataCenterPicker: NSViewRepresentable {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Binding var selection: TuyaDataCenter
     let accessibilityIdentifier: String
     let onSelection: () -> Void
@@ -16,8 +17,13 @@ struct NativeDataCenterPicker: NSViewRepresentable {
         picker.addItems(withTitles: TuyaDataCenter.allCases.map(\.displayName))
         picker.target = context.coordinator
         picker.action = #selector(Coordinator.changed(_:))
-        picker.setAccessibilityIdentifier(accessibilityIdentifier)
-        picker.identifier = NSUserInterfaceItemIdentifier(accessibilityIdentifier)
+        configureAccessibility(
+            picker,
+            identifier: accessibilityIdentifier,
+            label: "Tuya data center",
+            role: .popUpButton
+        )
+        picker.font = NativeDynamicType.font(for: dynamicTypeSize, baseSize: NSFont.systemFontSize)
         picker.focusWhenAttached = true
         return picker
     }
@@ -26,6 +32,7 @@ struct NativeDataCenterPicker: NSViewRepresentable {
         context.coordinator.selection = $selection
         context.coordinator.onSelection = onSelection
         picker.selectItem(at: TuyaDataCenter.allCases.firstIndex(of: selection) ?? 0)
+        picker.font = NativeDynamicType.font(for: dynamicTypeSize, baseSize: NSFont.systemFontSize)
     }
 
     @MainActor
@@ -61,6 +68,7 @@ final class FocusedPopUpButton: NSPopUpButton {
 }
 
 public struct NativeActionButton: NSViewRepresentable {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let title: String
     let accessibilityIdentifier: String
     var keyEquivalent = ""
@@ -90,8 +98,13 @@ public struct NativeActionButton: NSViewRepresentable {
         button.bezelStyle = .rounded
         button.controlSize = .large
         button.keyEquivalent = keyEquivalent
-        button.setAccessibilityIdentifier(accessibilityIdentifier)
-        button.identifier = NSUserInterfaceItemIdentifier(accessibilityIdentifier)
+        configureAccessibility(
+            button,
+            identifier: accessibilityIdentifier,
+            label: title,
+            role: .button
+        )
+        button.font = NativeDynamicType.font(for: dynamicTypeSize, baseSize: NSFont.systemFontSize)
         if isProminent {
             button.bezelColor = .controlAccentColor
         }
@@ -103,6 +116,8 @@ public struct NativeActionButton: NSViewRepresentable {
         button.title = title
         button.keyEquivalent = keyEquivalent
         button.bezelColor = isProminent ? .controlAccentColor : nil
+        button.font = NativeDynamicType.font(for: dynamicTypeSize, baseSize: NSFont.systemFontSize)
+        button.setAccessibilityLabel(title)
     }
 
     @MainActor
@@ -120,6 +135,7 @@ public struct NativeActionButton: NSViewRepresentable {
 }
 
 struct NativeMonitoringToggle: NSViewRepresentable {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let isOn: Bool
     let accessibilityIdentifier: String
     let onChange: (Bool) -> Void
@@ -132,9 +148,16 @@ struct NativeMonitoringToggle: NSViewRepresentable {
         let monitoringSwitch = NSSwitch(frame: .zero)
         monitoringSwitch.target = context.coordinator
         monitoringSwitch.action = #selector(Coordinator.invoke(_:))
-        monitoringSwitch.setAccessibilityLabel("Monitoring")
-        monitoringSwitch.setAccessibilityIdentifier(accessibilityIdentifier)
-        monitoringSwitch.identifier = NSUserInterfaceItemIdentifier(accessibilityIdentifier)
+        configureAccessibility(
+            monitoringSwitch,
+            identifier: accessibilityIdentifier,
+            label: "Monitoring",
+            role: .checkBox
+        )
+        monitoringSwitch.font = NativeDynamicType.font(
+            for: dynamicTypeSize,
+            baseSize: NSFont.systemFontSize
+        )
         monitoringSwitch.state = isOn ? .on : .off
         return monitoringSwitch
     }
@@ -142,6 +165,10 @@ struct NativeMonitoringToggle: NSViewRepresentable {
     func updateNSView(_ monitoringSwitch: NSSwitch, context: Context) {
         context.coordinator.onChange = onChange
         monitoringSwitch.state = isOn ? .on : .off
+        monitoringSwitch.font = NativeDynamicType.font(
+            for: dynamicTypeSize,
+            baseSize: NSFont.systemFontSize
+        )
     }
 
     @MainActor
@@ -159,6 +186,7 @@ struct NativeMonitoringToggle: NSViewRepresentable {
 }
 
 struct NativeWrappingText: NSViewRepresentable {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let text: String
     let accessibilityIdentifier: String
     var isMonospaced = false
@@ -169,16 +197,78 @@ struct NativeWrappingText: NSViewRepresentable {
         field.maximumNumberOfLines = 0
         field.lineBreakMode = .byWordWrapping
         field.isSelectable = isSelectable
-        field.setAccessibilityIdentifier(accessibilityIdentifier)
-        field.identifier = NSUserInterfaceItemIdentifier(accessibilityIdentifier)
-        if isMonospaced {
-            field.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
-        }
+        configureAccessibility(
+            field,
+            identifier: accessibilityIdentifier,
+            label: text,
+            role: .staticText
+        )
+        field.font = renderedFont
         return field
     }
 
     func updateNSView(_ field: NSTextField, context: Context) {
         field.stringValue = text
         field.isSelectable = isSelectable
+        field.font = renderedFont
+        field.setAccessibilityLabel(text)
+    }
+
+    private var renderedFont: NSFont {
+        if isMonospaced {
+            return NativeDynamicType.monospacedFont(
+                for: dynamicTypeSize,
+                baseSize: NSFont.smallSystemFontSize
+            )
+        }
+        return NativeDynamicType.font(for: dynamicTypeSize, baseSize: NSFont.systemFontSize)
+    }
+}
+
+@MainActor
+private func configureAccessibility(
+    _ view: NSView,
+    identifier: String,
+    label: String,
+    role: NSAccessibility.Role
+) {
+    view.setAccessibilityElement(true)
+    view.setAccessibilityIdentifier(identifier)
+    view.setAccessibilityLabel(label)
+    view.setAccessibilityRole(role)
+    view.identifier = NSUserInterfaceItemIdentifier(identifier)
+}
+
+private enum NativeDynamicType {
+    static func font(
+        for size: DynamicTypeSize,
+        baseSize: CGFloat
+    ) -> NSFont {
+        .systemFont(ofSize: baseSize * scale(for: size))
+    }
+
+    static func monospacedFont(
+        for size: DynamicTypeSize,
+        baseSize: CGFloat
+    ) -> NSFont {
+        .monospacedSystemFont(ofSize: baseSize * scale(for: size), weight: .regular)
+    }
+
+    private static func scale(for size: DynamicTypeSize) -> CGFloat {
+        switch size {
+        case .xSmall: 0.82
+        case .small: 0.9
+        case .medium: 0.96
+        case .large: 1
+        case .xLarge: 1.08
+        case .xxLarge: 1.16
+        case .xxxLarge: 1.24
+        case .accessibility1: 1.32
+        case .accessibility2: 1.4
+        case .accessibility3: 1.48
+        case .accessibility4: 1.56
+        case .accessibility5: 1.64
+        @unknown default: 1
+        }
     }
 }

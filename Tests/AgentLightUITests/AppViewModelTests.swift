@@ -5,6 +5,57 @@ import Observation
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testExplicitIntegrationStateBecomesNotInstalledAfterSuccessfulUninstall() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        XCTAssertTrue(harness.viewModel.integrationInstalled)
+        XCTAssertEqual(harness.viewModel.integrationStatus, .installed)
+
+        await harness.viewModel.uninstallIntegrations()
+
+        XCTAssertFalse(harness.viewModel.integrationInstalled)
+        XCTAssertEqual(harness.viewModel.integrationStatus, .notInstalled)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+
+        let repairHarness = ViewModelHarness()
+        await repairHarness.connectAndApprove()
+        await repairHarness.integrations.setRepairError(TuyaClientError.transport)
+        await repairHarness.viewModel.repairIntegrations()
+        await repairHarness.integrations.setRepairError(nil)
+
+        await repairHarness.viewModel.uninstallIntegrations()
+
+        XCTAssertFalse(repairHarness.viewModel.integrationInstalled)
+        XCTAssertEqual(repairHarness.viewModel.integrationStatus, .needsRepair)
+        XCTAssertEqual(repairHarness.viewModel.phase, .repairRequired)
+    }
+
+    func testMonitoringToggleWorksDuringRepairWithoutChangingRepairPresentation() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.integrations.setRepairError(TuyaClientError.transport)
+        await harness.viewModel.repairIntegrations()
+        let repairError = harness.viewModel.presentedError
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertTrue(harness.viewModel.monitoringActive)
+
+        await harness.viewModel.setMonitoringEnabled(false)
+
+        var metrics = await harness.monitor.metrics()
+        XCTAssertEqual(metrics.pause, 1)
+        XCTAssertFalse(harness.viewModel.monitoringActive)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.presentedError, repairError)
+
+        await harness.viewModel.setMonitoringEnabled(true)
+
+        metrics = await harness.monitor.metrics()
+        XCTAssertEqual(metrics.resume, 1)
+        XCTAssertTrue(harness.viewModel.monitoringActive)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.presentedError, repairError)
+    }
+
     func testSettingsExposeOnlyMaskedIdentifiersAfterApproval() async {
         let harness = ViewModelHarness()
         await harness.connectAndApprove()

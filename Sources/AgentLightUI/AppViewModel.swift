@@ -19,6 +19,9 @@ public protocol AppViewModeling: AnyObject, Sendable {
     var maskedAccessID: String? { get }
     var maskedDeviceID: String? { get }
     var repairPreviews: [IntegrationPreview] { get }
+    var integrationInstalled: Bool { get }
+    var integrationStatus: IntegrationInstallationStatus { get }
+    var monitoringActive: Bool { get }
     func connect(using draft: ConnectionDraft) async
     func approveIntegrations() async
     func pause() async
@@ -32,6 +35,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     func previewIntegrationRepair() async
     func uninstallIntegrations() async
     func replaceDevice() async
+    func setMonitoringEnabled(_ enabled: Bool) async
 }
 
 public extension AppViewModeling {
@@ -41,10 +45,14 @@ public extension AppViewModeling {
     var maskedAccessID: String? { nil }
     var maskedDeviceID: String? { nil }
     var repairPreviews: [IntegrationPreview] { [] }
+    var integrationInstalled: Bool { false }
+    var integrationStatus: IntegrationInstallationStatus { .notInstalled }
+    var monitoringActive: Bool { false }
     func reconnect() async {}
     func previewIntegrationRepair() async {}
     func uninstallIntegrations() async {}
     func replaceDevice() async {}
+    func setMonitoringEnabled(_ enabled: Bool) async {}
 }
 
 public enum AppPhase: Equatable, Sendable {
@@ -55,6 +63,20 @@ public enum AppPhase: Equatable, Sendable {
     case monitoring
     case paused
     case repairRequired
+}
+
+public enum IntegrationInstallationStatus: Equatable, Sendable {
+    case notInstalled
+    case installed
+    case needsRepair
+
+    public var displayName: String {
+        switch self {
+        case .notInstalled: "Not Installed"
+        case .installed: "Installed"
+        case .needsRepair: "Needs Repair"
+        }
+    }
 }
 
 public struct ConnectionDraft: Equatable, Sendable {
@@ -106,6 +128,9 @@ public final class AppViewModel: AppViewModeling {
     public private(set) var maskedAccessID: String?
     public private(set) var maskedDeviceID: String?
     public private(set) var repairPreviews: [IntegrationPreview] = []
+    public private(set) var integrationInstalled = false
+    public private(set) var integrationStatus: IntegrationInstallationStatus = .notInstalled
+    public private(set) var monitoringActive = false
 
     @ObservationIgnored private let credentials: any CredentialStoring
     @ObservationIgnored private let integrations: any IntegrationInstalling
@@ -349,13 +374,16 @@ public final class AppViewModel: AppViewModeling {
         guard phase == .monitoring else { return }
         switch result {
         case .cancelledAndRestored:
+            monitoringActive = true
             break
         case .paused:
             cancelObservation(resetState: true)
+            monitoringActive = false
             phase = .paused
             presentedError = nil
         case let .pausedWithFailure(error):
             cancelObservation(resetState: true)
+            monitoringActive = false
             phase = .paused
             presentedError = error
         }
@@ -397,6 +425,7 @@ public final class AppViewModel: AppViewModeling {
                 }
                 guard self.phase == .paused else { return }
                 self.ownsMonitoring = true
+                self.monitoringActive = true
                 self.installObservation(observation)
                 guard !Task.isCancelled, self.phase == .paused else { return }
                 self.phase = .monitoring
@@ -622,6 +651,89 @@ public final class AppViewModel: AppViewModeling {
 
     public func replaceDevice() async {
         await disconnect()
+    }
+
+    public func setMonitoringEnabled(_ enabled: Bool) async {
+        let originalPhase = phase
+        let preservedError = presentedError
+        guard await hydrateOwnership(), ownsMonitoring else { return }
+        if originalPhase == .repairRequired, phase == .repairRequired {
+            presentedError = preservedError
+        }
+        if phase == .monitoring, !enabled {
+            await pause()
+            return
+        }
+        if phase == .paused, enabled {
+            await resume()
+            return
+        }
+        guard phase == .repairRequired, enabled != monitoringActive else { return }
+        if enabled {
+            if let pauseTask { await pauseTask.wait() }
+            if let resumeTask {
+                await resumeTask.wait()
+                return
+            }
+            let monitor = monitor
+            let task = Task { [weak self, monitor] in
+                do {
+                    try await monitor.resume()
+                    if Task.isCancelled {
+                        await monitor.pause()
+                        return
+                    }
+                    let observation = await Self.preparedObservation(from: monitor)
+                    guard !Task.isCancelled, let self, self.phase == .repairRequired else {
+                        await monitor.pause()
+                        return
+                    }
+                    self.monitoringActive = true
+                    self.installObservation(observation)
+                    self.presentedError = preservedError
+                } catch {
+                    guard let self, !Task.isCancelled, self.phase == .repairRequired else { return }
+                    self.monitoringActive = false
+                    self.presentedError = preservedError
+                }
+            }
+            let operation = SharedOperation(task: task)
+            resumeTask = operation
+            operation.onFinish { [weak self, weak operation] in
+                guard let self, self.resumeTask === operation else { return }
+                self.resumeTask = nil
+            }
+            await operation.wait()
+        } else {
+            if let resumeTask { await resumeTask.wait() }
+            if let pauseTask {
+                await pauseTask.wait()
+                return
+            }
+            let monitor = monitor
+            let task = Task { [weak self, monitor] in
+                await monitor.pause()
+                if Task.isCancelled {
+                    do {
+                        try await monitor.resume()
+                    } catch {
+                        self?.monitoringActive = false
+                    }
+                    return
+                }
+                guard let self, self.phase == .repairRequired else { return }
+                self.cancelObservation(resetState: true)
+                self.monitoringActive = false
+                self.presentedError = preservedError
+            }
+            let operation = SharedOperation(task: task)
+            pauseTask = operation
+            operation.onFinish { [weak self, weak operation] in
+                guard let self, self.pauseTask === operation else { return }
+                self.pauseTask = nil
+            }
+            await operation.wait()
+        }
     }
 
     public func observeMonitoring() async {
@@ -944,6 +1056,7 @@ public final class AppViewModel: AppViewModeling {
             syncOwnership(snapshot)
             loginItemStatus = loginItem.status()
             ownsMonitoring = snapshot.monitoringOwned
+            monitoringActive = snapshot.monitoringOwned
             installObservation(observation)
             phase = .monitoring
             presentedError = nil
@@ -963,6 +1076,8 @@ public final class AppViewModel: AppViewModeling {
 
     private func syncOwnership(_ snapshot: OwnershipSnapshot) {
         integrationOwnership = snapshot.integration
+        integrationInstalled = snapshot.integration != .none
+        integrationStatus = Self.installationStatus(for: snapshot)
         credentialOwnership = snapshot.credentials
         loginRegistrationOwned = snapshot.loginRegistrationOwned
         outstandingObligations = snapshot.obligations
@@ -971,6 +1086,7 @@ public final class AppViewModel: AppViewModeling {
     private func finishDisconnect(_ snapshot: OwnershipSnapshot) {
         syncOwnership(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
+        monitoringActive = false
 
         pendingCredentials = nil
         maskedAccessID = nil
@@ -1000,6 +1116,28 @@ public final class AppViewModel: AppViewModeling {
         repairTask?.cancel()
         cancelObservation(resetState: true)
         finishDisconnect(snapshot)
+    }
+
+    private static func installationStatus(
+        for snapshot: OwnershipSnapshot
+    ) -> IntegrationInstallationStatus {
+        let repairObligations: Set<OutstandingObligation> = [
+            .integrationUninstallRetry,
+            .integrationRollbackRepair,
+            .integrationMixedAdoption,
+            .integrationArtifactCleanup
+        ]
+        if !snapshot.obligations.isDisjoint(with: repairObligations) {
+            return .needsRepair
+        }
+        switch snapshot.integration {
+        case .none:
+            return .notInstalled
+        case .uninstallable, .preexisting:
+            return .installed
+        case .mixed, .uncertain:
+            return .needsRepair
+        }
     }
 
     private static func repairPlan(

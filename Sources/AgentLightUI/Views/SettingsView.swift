@@ -56,9 +56,9 @@ public struct SettingsView: View {
                 }
 
                 Section("Integrations") {
-                    LabeledContent("Codex", value: integrationStatus)
-                    LabeledContent("Claude Code", value: integrationStatus)
-                    LabeledContent("Cursor", value: integrationStatus)
+                    LabeledContent("Codex", value: viewModel.integrationStatus.displayName)
+                    LabeledContent("Claude Code", value: viewModel.integrationStatus.displayName)
+                    LabeledContent("Cursor", value: viewModel.integrationStatus.displayName)
                     NativeActionButton(
                         title: "Preview Repair",
                         accessibilityIdentifier: AmbientAccessibilityID.settingsRepair
@@ -146,10 +146,6 @@ public struct SettingsView: View {
         .accessibilityIdentifier("settings.root")
     }
 
-    private var integrationStatus: String {
-        viewModel.phase == .repairRequired ? "Needs repair" : "Installed"
-    }
-
     private var loginStatusTitle: String {
         switch viewModel.loginItemStatus {
         case .enabled: "Enabled"
@@ -161,15 +157,9 @@ public struct SettingsView: View {
 
     private var monitoringBinding: Binding<Bool> {
         Binding(
-            get: { viewModel.phase == .monitoring },
+            get: { viewModel.monitoringActive },
             set: { enabled in
-                Task {
-                    if enabled {
-                        await viewModel.resume()
-                    } else {
-                        await viewModel.pause()
-                    }
-                }
+                Task { await viewModel.setMonitoringEnabled(enabled) }
             }
         )
     }
