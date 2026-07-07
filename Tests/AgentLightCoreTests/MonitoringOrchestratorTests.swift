@@ -31,6 +31,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 1 })
 
@@ -65,6 +66,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let baselineOwnership = await store.storedRecovery()
 
         await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually {
@@ -87,6 +89,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         try await orchestrator.start()
 
         await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually {
@@ -109,6 +112,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
         await orchestrator.accept(makeEvent(source: .codex, session: "a", state: .thinking, externalSequence: 999))
         await orchestrator.accept(makeEvent(source: .cursor, session: "b", state: .working, externalSequence: 1))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 1 })
@@ -123,7 +127,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .thinking))
-        await XCTAssertAsyncTrue(await eventually { await clock.sleeperCount() >= 1 })
+        await clock.waitForSleepCount(1)
 
         await clock.advance(by: .milliseconds(999))
         await XCTAssertAsyncEqual(await light.appliedStates(), [])
@@ -140,6 +144,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .milliseconds(999))
         await orchestrator.accept(makeEvent(state: .needsYou))
         await clock.advance(by: .milliseconds(1))
@@ -154,7 +159,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .completed))
-        await XCTAssertAsyncTrue(await eventually { await clock.sleeperCount() == 2 })
+        await clock.waitForSleepCount(2)
 
         await clock.advance(by: .seconds(7))
         await XCTAssertAsyncEqual(await light.restoreCount(), 0)
@@ -172,7 +177,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .error))
-        await XCTAssertAsyncTrue(await eventually { await clock.sleeperCount() == 2 })
+        await clock.waitForSleepCount(2)
 
         await clock.advance(by: .seconds(11))
         await XCTAssertAsyncEqual(await light.restoreCount(), 0)
@@ -188,6 +193,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .completed))
         await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(12))
 
         await XCTAssertAsyncEqual(await light.restoreCount(), 0)
@@ -201,6 +207,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(source: .codex, session: "active", state: .working))
         await orchestrator.accept(makeEvent(source: .cursor, session: "done", state: .completed))
+        await clock.waitForSleepCount(2)
         await clock.advance(by: .seconds(8))
         await XCTAssertAsyncTrue(await eventually { (await orchestrator.currentSnapshot()).state == .working })
 
@@ -226,6 +233,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 1 })
 
@@ -246,6 +254,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 1 })
 
@@ -267,6 +276,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(session: "old", state: .working))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 1 })
 
@@ -301,6 +311,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await pause.value
         try await resume.value
         await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates() == [desired(.working)] })
@@ -330,8 +341,10 @@ final class MonitoringOrchestratorTests: XCTestCase {
         try await orchestrator.start()
 
         let firstPause = Task { await orchestrator.pause() }
-        await XCTAssertAsyncTrue(await eventually { await light.restoreCount() == 1 })
+        await light.waitForOperationCount(2)
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .milliseconds(500))
+        await clock.waitForSleepCount(2)
         await clock.advance(by: .seconds(1))
         await firstPause.value
         await XCTAssertAsyncNotNil(await store.storedRecord())
@@ -367,6 +380,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually { (await orchestrator.currentSnapshot()).connection == .disconnected })
@@ -379,11 +393,12 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 1 })
 
         await orchestrator.accept(makeEvent(state: .working))
-        await clock.advance(by: .milliseconds(500))
+        await clock.waitForSleepCount(3)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 2 })
@@ -481,6 +496,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, store: store, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 1 })
         await XCTAssertAsyncTrue(await eventually { await store.operations.saveRecords.count == 3 })
@@ -505,6 +521,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
         await XCTAssertAsyncTrue(await eventually { await store.successfulSaveRevisions.count == 3 })
         await orchestrator.pause()
@@ -564,6 +581,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
         await XCTAssertAsyncTrue(await eventually { (await orchestrator.currentSnapshot()).connection == .disconnected })
         await orchestrator.accept(makeEvent(state: .working))
@@ -590,7 +608,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
         orchestrator = nil
         for _ in 0..<200 where weakOrchestrator != nil {
-            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(1))
         }
 
         XCTAssertNil(weakOrchestrator)
@@ -649,6 +667,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
         await light.releaseRestore()
         await idle.value
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates() == [desired(.working)] })
@@ -662,13 +681,12 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
-        await XCTAssertAsyncTrue(await eventually { await light.appliedStates().count == 1 })
+        await light.waitForOperationCount(2)
 
         let pause = Task { await orchestrator.pause() }
-        await XCTAssertAsyncTrue(await eventually {
-            await orchestrator.lifecycleRequestNumber() >= 2
-        })
+        await orchestrator.waitForLifecycleRequestNumber(2)
         let resumed = CompletionFlag()
         let resume = Task {
             try await orchestrator.resume()
@@ -707,6 +725,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await pause.value
         try await resume.value
         await orchestrator.accept(makeEvent(state: .needsYou))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
 
         await XCTAssertAsyncTrue(await eventually { await light.appliedStates().last == desired(.needsYou) })
@@ -887,13 +906,13 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let orchestrator = makeOrchestrator(light: light, clock: clock)
         try await orchestrator.start()
         await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
         await clock.advance(by: .seconds(1))
-        await XCTAssertAsyncTrue(await eventually { await light.appliedStates() == [desired(.thinking)] })
+        await orchestrator.waitForLastApplied(desired(.thinking))
         await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(2)
         await clock.advance(by: .seconds(1))
-        await XCTAssertAsyncTrue(await eventually {
-            (await orchestrator.currentSnapshot()).connection == .disconnected
-        })
+        await orchestrator.waitForConnection(.disconnected)
         await XCTAssertAsyncEqual(
             await light.appliedStates(),
             [desired(.thinking), desired(.working)]
@@ -1026,7 +1045,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
     func testReconnectNoWinnerCompletesExactlyOnce() async throws {
         let coordinator = SessionCoordinator()
         let setup = try await makeDisconnectedOrchestrator(
-            matchResults: [.success(false)],
+            matchResults: [.success(true)],
             coordinator: coordinator
         )
         await setup.light.setMatchBlocked(true)
@@ -1053,7 +1072,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
     func testReconnectDeduplicatedWinnerCompletesExactlyOnce() async throws {
         let coordinator = SessionCoordinator()
         let setup = try await makeDisconnectedOrchestrator(
-            matchResults: [.success(false)],
+            matchResults: [.success(true)],
             coordinator: coordinator
         )
         await setup.light.setMatchBlocked(true)
@@ -1188,6 +1207,102 @@ final class MonitoringOrchestratorTests: XCTestCase {
         )
     }
 
+    func testWinnerAfterPhysicalReconnectApplyBeforeCommittedSaveKeepsReconnectPending() async throws {
+        let store = MemoryRecoveryStore()
+        await store.blockSaveCall(6)
+        let setup = try await makeDisconnectedOrchestrator(
+            matchResults: [.success(false)],
+            store: store
+        )
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await store.waitUntilSaveCallIsBlocked(6)
+
+        await setup.orchestrator.accept(makeEvent(session: "post-write", state: .needsYou))
+        await store.releaseSaveCall(6)
+        await setup.orchestrator.waitForLastApplied(desired(.working))
+        await setup.clock.waitForSleepCount(5)
+
+        await XCTAssertAsyncEqual(await completions.value(), 0)
+        await XCTAssertAsyncEqual((await store.storedRecord())?.lastCommand, desired(.working))
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(6)
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(await completions.value(), 1)
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.needsYou))
+        await XCTAssertAsyncEqual((await store.storedRecord())?.lastCommand, desired(.needsYou))
+    }
+
+    func testPostWriteWinnerEqualToPreviousLogicalStateIsNotDeduplicated() async throws {
+        let store = MemoryRecoveryStore()
+        await store.blockSaveCall(6)
+        let setup = try await makeDisconnectedOrchestrator(
+            matchResults: [.success(false)],
+            store: store
+        )
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await store.waitUntilSaveCallIsBlocked(6)
+
+        await setup.orchestrator.accept(makeEvent(session: "return", state: .thinking))
+        await store.releaseSaveCall(6)
+        await setup.orchestrator.waitForLastApplied(desired(.working))
+        await setup.clock.waitForSleepCount(5)
+
+        await XCTAssertAsyncEqual(await completions.value(), 0)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(6)
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.thinking))
+        await XCTAssertAsyncEqual((await store.storedRecord())?.lastCommand, desired(.thinking))
+    }
+
+    func testMismatchingHealthForcesApplyWhenWinnerEqualsLastApplied() async throws {
+        let coordinator = SessionCoordinator()
+        let setup = try await makeDisconnectedOrchestrator(
+            matchResults: [.success(false)],
+            coordinator: coordinator
+        )
+        await coordinator.accept(
+            makeEvent(session: "physical-mismatch", state: .thinking, externalSequence: 999)
+        )
+
+        let reconnect = Task { await setup.orchestrator.reconnect() }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.thinking))
+        await XCTAssertAsyncEqual(
+            await setup.light.appliedStates().filter { $0 == desired(.thinking) }.count,
+            2
+        )
+    }
+
     func testCancellingSoleStartCallerCancelsBlockedCaptureAndNeverActivates() async {
         let light = RecordingLightController()
         await light.setCaptureBlocked(true)
@@ -1244,6 +1359,98 @@ final class MonitoringOrchestratorTests: XCTestCase {
         XCTAssertTrue(secondSucceeded)
         await XCTAssertAsyncEqual(await light.captureCancellations(), 0)
         await XCTAssertAsyncEqual(await light.operations.captureCount, 1)
+    }
+
+    func testNewStartDuringCancelledInitiatingStartDrainCreatesFreshRequest() async throws {
+        let light = RecordingLightController()
+        let store = MemoryRecoveryStore()
+        await store.blockSaveCall(1)
+        let orchestrator = makeOrchestrator(light: light, store: store)
+        let first = Task { try await orchestrator.start() }
+        await store.waitUntilSaveCallIsBlocked(1)
+
+        first.cancel()
+        await orchestrator.waitForLifecycleRequestNumber(2)
+        let second = Task { try await orchestrator.start() }
+        await orchestrator.waitForLifecycleRequestNumber(3)
+        await store.releaseSaveCall(1)
+
+        let firstResult = await first.result
+        guard case let .failure(error) = firstResult else {
+            XCTFail("Expected cancelled initiating start to fail")
+            return
+        }
+        XCTAssertTrue(error is CancellationError)
+        try await second.value
+        await XCTAssertAsyncEqual(await light.operations.captureCount, 2)
+    }
+
+    func testNewStartDuringCancelledNonInitiatingFinalWaiterDrainCreatesFreshRequest() async throws {
+        let light = RecordingLightController()
+        let store = MemoryRecoveryStore()
+        await store.blockSaveCall(1)
+        let orchestrator = makeOrchestrator(light: light, store: store)
+        let first = Task { try await orchestrator.start() }
+        await store.waitUntilSaveCallIsBlocked(1)
+        let second = Task { try await orchestrator.start() }
+        await orchestrator.waitForLifecycleWaiterCount(2)
+
+        first.cancel()
+        _ = await first.result
+        second.cancel()
+        await orchestrator.waitForLifecycleRequestNumber(2)
+        let third = Task { try await orchestrator.start() }
+        await orchestrator.waitForLifecycleRequestNumber(3)
+        await store.releaseSaveCall(1)
+
+        let secondResult = await second.result
+        guard case let .failure(error) = secondResult else {
+            XCTFail("Expected cancelled final shared start waiter to fail")
+            return
+        }
+        XCTAssertTrue(error is CancellationError)
+        try await third.value
+        await XCTAssertAsyncEqual(await light.operations.captureCount, 2)
+    }
+
+    func testCancellingSolePauseRollsBackToActiveAfterRestoreDrain() async throws {
+        let light = RecordingLightController()
+        await light.setRestoreBlocked(true)
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        let pause = Task { await orchestrator.pause() }
+        await light.waitForOperationCount(2)
+
+        pause.cancel()
+        await light.releaseRestore()
+        await pause.value
+        await orchestrator.accept(makeEvent(state: .working))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+
+        await XCTAssertAsyncEqual(await light.appliedStates().last, desired(.working))
+    }
+
+    func testCancellingSoleStopRollsBackToActiveAfterRestoreDrain() async throws {
+        let light = RecordingLightController()
+        await light.setRestoreBlocked(true)
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        let stop = Task { await orchestrator.stop() }
+        await light.waitForOperationCount(2)
+
+        stop.cancel()
+        await light.releaseRestore()
+        await stop.value
+        await orchestrator.accept(makeEvent(state: .needsYou))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+
+        await XCTAssertAsyncEqual(await light.appliedStates().last, desired(.needsYou))
     }
 
     func testCancellingSoleReconnectWaiterCancelsHealthAndCompletesExactlyOnce() async throws {
@@ -1307,6 +1514,138 @@ final class MonitoringOrchestratorTests: XCTestCase {
             (await setup.orchestrator.currentSnapshot()).connection,
             .connected
         )
+    }
+
+    func testReconnectCallerAttachingDuringFinalWaiterCompletionSurvives() async throws {
+        let setup = try await makeDisconnectedOrchestrator()
+        await setup.light.setMatchBlocked(true)
+        await setup.orchestrator.blockNextReconnectWaiterCompletion()
+        let first = Task { await setup.orchestrator.reconnect() }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+
+        first.cancel()
+        await setup.orchestrator.waitUntilReconnectWaiterCompletionIsBlocked()
+        let second = Task { await setup.orchestrator.reconnect() }
+        await setup.orchestrator.waitForReconnectWaiterCount(1)
+        await setup.orchestrator.releaseReconnectWaiterCompletion()
+        await first.value
+
+        await XCTAssertAsyncEqual(await setup.light.matchCancellations(), 0)
+        await setup.light.releaseMatch()
+        await setup.clock.waitForSleepCount(4)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await second.value
+        await XCTAssertAsyncEqual((await setup.orchestrator.currentSnapshot()).connection, .connected)
+    }
+
+    func testIdleDuringBlockedReconnectHealthDrainsHealthBeforeRestore() async throws {
+        let setup = try await makeDisconnectedOrchestrator()
+        await setup.light.setMatchBlocked(true)
+        let reconnect = Task { await setup.orchestrator.reconnect() }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+
+        let idle = Task { await setup.orchestrator.accept(makeEvent(state: .idle)) }
+        await setup.light.waitForMatchCancellationCount(1)
+        await idle.value
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(await setup.light.restoreCount(), 1)
+        await XCTAssertAsyncEqual(await setup.light.matchCancellations(), 1)
+    }
+
+    func testFinalReconnectCancellationCancelsBlockedPendingClear() async throws {
+        let store = MemoryRecoveryStore(clearFailures: [.permanent])
+        let light = RecordingLightController()
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(light: light, store: store, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .idle))
+        await store.blockNextClear()
+        let reconnect = Task { await orchestrator.reconnect() }
+        await store.waitUntilClearIsBlocked()
+
+        reconnect.cancel()
+        await store.waitForClearCancellationCount(1)
+        await reconnect.value
+
+        await XCTAssertAsyncNotNil(await store.storedRecord())
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).connection, .disconnected)
+    }
+
+    func testFinalReconnectCancellationDuringCommandDelayDrainsBeforePauseRestore() async throws {
+        let setup = try await makeDisconnectedOrchestrator(matchResults: [.success(false)])
+        let reconnect = Task { await setup.orchestrator.reconnect() }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+
+        reconnect.cancel()
+        await reconnect.value
+        await setup.orchestrator.pause()
+
+        await XCTAssertAsyncEqual(await setup.clock.sleeperCount(), 0)
+        await XCTAssertAsyncEqual(await setup.light.restoreCount(), 1)
+    }
+
+    func testFinalReconnectCancellationDuringPhysicalApplyDrainsBeforePauseRestore() async throws {
+        let setup = try await makeDisconnectedOrchestrator(matchResults: [.success(false)])
+        await setup.light.setApplyBlocked(true)
+        let reconnect = Task { await setup.orchestrator.reconnect() }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+
+        reconnect.cancel()
+        await reconnect.value
+        let pause = Task { await setup.orchestrator.pause() }
+        await XCTAssertAsyncEqual(await setup.light.restoreCount(), 0)
+        await setup.light.releaseApply()
+        await pause.value
+
+        await XCTAssertAsyncEqual(
+            await setup.light.physicalPhases.suffix(4),
+            [
+                .applyStarted(desired(.working)),
+                .applyFinished(desired(.working)),
+                .restoreStarted(.testBaseline),
+                .restoreFinished(.testBaseline)
+            ]
+        )
+    }
+
+    func testReconnectDriverDoesNotRetainOrchestratorAfterFinalCancellation() async throws {
+        var setup: (
+            orchestrator: MonitoringOrchestrator,
+            light: RecordingLightController,
+            clock: ManualClock
+        )? = try await makeDisconnectedOrchestrator()
+        let light = try XCTUnwrap(setup?.light)
+        let clock = try XCTUnwrap(setup?.clock)
+        var orchestrator: MonitoringOrchestrator? = setup?.orchestrator
+        setup = nil
+        weak var weakOrchestrator = orchestrator
+        await light.setMatchBlocked(true)
+        let reconnect = Task { [weak orchestrator] in await orchestrator?.reconnect() }
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+
+        reconnect.cancel()
+        await light.waitForMatchCancellationCount(1)
+        await reconnect.value
+        await orchestrator?.pause()
+        orchestrator = nil
+
+        XCTAssertNil(weakOrchestrator)
     }
 
     func testReconnectApplyUsesThrottleAndPauseDrainsItBeforeRestore() async throws {
@@ -1471,7 +1810,8 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
     private func makeDisconnectedOrchestrator(
         matchResults: [Result<Bool, TestLightError>] = [],
-        coordinator: any SessionCoordinating = SessionCoordinator()
+        coordinator: any SessionCoordinating = SessionCoordinator(),
+        store: MemoryRecoveryStore = MemoryRecoveryStore()
     ) async throws -> (
         orchestrator: MonitoringOrchestrator,
         light: RecordingLightController,
@@ -1484,7 +1824,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let clock = ManualClock()
         let orchestrator = MonitoringOrchestrator(
             light: light,
-            recoveryStore: MemoryRecoveryStore(),
+            recoveryStore: store,
             coordinator: coordinator,
             clock: clock,
             jitter: { _ in .zero },

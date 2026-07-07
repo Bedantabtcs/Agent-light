@@ -59,14 +59,12 @@ actor ManualClock: AgentLightClock {
     }
 
     func advance(by duration: Duration) async {
-        for _ in 0..<20 { await Task.yield() }
         nowNanoseconds += duration.nanoseconds
         let ready = sleepers.values.filter { $0.deadline <= nowNanoseconds }
         for sleeper in ready {
             sleepers.removeValue(forKey: sleeper.id)
             sleeper.continuation.resume()
         }
-        for _ in 0..<20 { await Task.yield() }
     }
 
     func sleeperCount() -> Int {
@@ -498,6 +496,14 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
     private var saveFailureCalls: Set<Int>
     private var saveCallCount = 0
     private var clearFailures: [TestLightError]
+    private var blockedSaveCalls: Set<Int> = []
+    private var blockedSaves: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var blockedSaveWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+    private var shouldBlockNextClear = false
+    private var blockedClear: CheckedContinuation<Void, Error>?
+    private var blockedClearWaiters: [CheckedContinuation<Void, Never>] = []
+    private var clearCancellationCount = 0
+    private var clearCancellationWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private(set) var operations: [Operation] = []
     private(set) var successfulSaveRevisions: [MonitoringRecoveryRevision] = []
     private(set) var clearExpectations: [StoredMonitoringRecovery] = []
@@ -531,6 +537,14 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
     func save(_ record: MonitoringRecoveryRecord) async throws -> MonitoringRecoveryRevision {
         operations.append(.save(record))
         saveCallCount += 1
+        let call = saveCallCount
+        if blockedSaveCalls.remove(call) != nil {
+            let waiters = blockedSaveWaiters.removeValue(forKey: call) ?? []
+            for waiter in waiters { waiter.resume() }
+            await withCheckedContinuation { continuation in
+                blockedSaves[call] = continuation
+            }
+        }
         if saveFailureCalls.remove(saveCallCount) != nil {
             throw TestLightError.permanent
         }
@@ -553,6 +567,19 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
         if !clearFailures.isEmpty {
             throw clearFailures.removeFirst()
         }
+        if shouldBlockNextClear {
+            shouldBlockNextClear = false
+            let waiters = blockedClearWaiters
+            blockedClearWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    blockedClear = continuation
+                }
+            } onCancel: {
+                Task { await self.cancelBlockedClear() }
+            }
+        }
         guard stored == expected else {
             throw MonitoringRecoveryStoreError.concurrentModification
         }
@@ -565,6 +592,49 @@ actor MemoryRecoveryStore: MonitoringRecoveryStoring {
 
     func storedRecovery() -> StoredMonitoringRecovery? {
         stored
+    }
+
+    func blockSaveCall(_ call: Int) {
+        blockedSaveCalls.insert(call)
+    }
+
+    func waitUntilSaveCallIsBlocked(_ call: Int) async {
+        if blockedSaves[call] != nil { return }
+        await withCheckedContinuation { continuation in
+            blockedSaveWaiters[call, default: []].append(continuation)
+        }
+    }
+
+    func releaseSaveCall(_ call: Int) {
+        blockedSaves.removeValue(forKey: call)?.resume()
+    }
+
+    func blockNextClear() {
+        shouldBlockNextClear = true
+    }
+
+    func waitUntilClearIsBlocked() async {
+        if blockedClear != nil { return }
+        await withCheckedContinuation { continuation in
+            blockedClearWaiters.append(continuation)
+        }
+    }
+
+    func waitForClearCancellationCount(_ count: Int) async {
+        if clearCancellationCount >= count { return }
+        await withCheckedContinuation { continuation in
+            clearCancellationWaiters.append((count, continuation))
+        }
+    }
+
+    private func cancelBlockedClear() {
+        guard let blockedClear else { return }
+        self.blockedClear = nil
+        clearCancellationCount += 1
+        blockedClear.resume(throwing: CancellationError())
+        let ready = clearCancellationWaiters.filter { clearCancellationCount >= $0.0 }
+        clearCancellationWaiters.removeAll { clearCancellationCount >= $0.0 }
+        for waiter in ready { waiter.1.resume() }
     }
 }
 
@@ -601,7 +671,7 @@ func eventually(
 ) async -> Bool {
     for _ in 0..<attempts {
         if await condition() { return true }
-        await Task.yield()
+        try? await Task.sleep(for: .milliseconds(1))
     }
     return false
 }

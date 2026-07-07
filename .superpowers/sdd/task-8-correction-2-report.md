@@ -73,3 +73,35 @@ swift build -c release
 Expected failure mode: failed health or current-winner apply remains disconnected and resolves each registered caller once; final-caller cancellation drains shared work without later activation.
 
 Next phase: none — ready for review/testing.
+
+---
+
+## Re-review Correction
+
+### RED
+
+- Post-write supersession and physical-mismatch command:
+  `perl -e 'alarm 10; exec @ARGV' swift test --filter 'MonitoringOrchestratorTests/(testWinnerAfterPhysicalReconnectApplyBeforeCommittedSaveKeepsReconnectPending|testPostWriteWinnerEqualToPreviousLogicalStateIsNotDeduplicated|testMismatchingHealthForcesApplyWhenWinnerEqualsLastApplied)'`
+  bounded exit 142. The old physical write was not installed as `lastApplied`, reconnect could deduplicate against stale logical state, and mismatch was deduplicated again in the throttle. Log: `/tmp/task8-correction-2-rereview-red-post-write.log`.
+- Lifecycle cancellation handoff command for initiating/non-initiating start plus pause/stop bounded exit 142. A new start remained joinable with the cancelled request, and pause/stop cancellation left lifecycle mode inconsistent. Log: `/tmp/task8-correction-2-rereview-red-lifecycle.log`.
+- Driver focused command initially bounded exit 142. Reconnect had no operation-owned driver terminal callback for blocked health, pending clear, delay/apply drain, waiter attachment during cancellation, or deallocation. Log: `/tmp/task8-correction-2-rereview-driver-focused.log`.
+- Removing `Task.yield()` from `ManualClock.advance` exposed missed-registration tests. Explicit sleep, operation, connection, and applied-state barriers replaced those assumptions.
+
+### GREEN
+
+- A physical apply is now always followed by a cancellation-independent committed-state save and a second currency check. `SendOutcome.physicallyAppliedButSuperseded` records actual physical state and keeps reconnect non-terminal for the current winner.
+- Mismatching health disables deduplication until a corrective physical apply.
+- Final lifecycle cancellation marks the transition non-joinable immediately. New starts queue after drain; pause/stop roll back to the prior active mode only after drain when no newer lifecycle request exists.
+- Reconnect owns a weak-self driver task. Terminal requests cancel owned health/throttle work; only `finishReconnectFromDriver` drains subwork, publishes terminal state, clears operation identity, and finishes callers.
+- Final waiter cancellation removes the waiter, resolves it, then rechecks the live operation/waiter set before cancelling the driver.
+- `ManualClock.advance` resumes only registered due sleepers and contains no scheduling yields.
+
+Verification:
+
+- `swift test --filter MonitoringOrchestratorTests`: 81 passed, 0 failures.
+- Direct bounded `xctest` repetition: 260/260 passed (13 critical tests × 20, five-second bound). Log: `/tmp/task8-correction-2-rereview-repeats-final.log`.
+- `swift test --filter 'MonitoringOrchestratorTests|FileMonitoringRecoveryStoreTests'`: 120 passed, 0 failures. Log: `/tmp/task8-correction-2-rereview-relevant.log`.
+- `swift test`: 220 passed, 0 failures. Log: `/tmp/task8-correction-2-rereview-full.log`.
+- `swift build -c release`: exit 0. Log: `/tmp/task8-correction-2-rereview-release.log`.
+
+Remaining concerns are unchanged: no live-bulb or process-kill acceptance test was run.
