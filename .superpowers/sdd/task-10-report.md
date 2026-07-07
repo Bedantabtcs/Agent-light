@@ -365,6 +365,39 @@ Starting commit: `d0ad043a973a56efc3e54fc29d882a0869c32bc3`
 
 ---
 
+## Receipt Authority Correction
+
+Date: 2026-07-07
+Starting commit: `c85c43ea528411eb1e203f4ee74f9832ce25d918`
+
+### Fail-closed receipt handling
+
+- Receipt-bearing committed cleanup errors now bind and validate their associated `IntegrationInstallReceipt`.
+- A valid complete receipt retains the existing authoritative repair transition and adds the artifact cleanup obligation.
+- A duplicate, omitted-source, or otherwise malformed receipt is treated as unproven legacy cleanup. The prior mixed-adoption, rollback, uninstall, health, or artifact-only ownership state and obligation remain intact while artifact cleanup is tracked independently.
+- Artifact verification is selected before mixed adoption when both obligations exist. Verified artifact absence clears only the artifact obligation; mixed adoption remains repair-required until a later valid authoritative receipt succeeds.
+
+### RED/GREEN evidence
+
+- RED: malformed receipt cleanup during mixed adoption cleared `integrationMixedAdoption`; artifact verification then incorrectly returned to integration review.
+- GREEN: malformed receipt cleanup retains mixed plus artifact obligations, artifact verification clears only artifact, and valid adoption later clears mixed and returns to integration review.
+- Focused audit coverage confirms malformed receipt evidence cannot clear rollback, uninstall, health, or artifact-only ownership. A valid complete receipt follows the authoritative transition.
+
+### Verification
+
+- `swift test --filter AppViewModelTests`: 106 passed, 0 failures.
+- Focused receipt-authority audit: 4 passed, 0 failures.
+- `swift test`: 376 passed, 0 failures.
+- `swift build -c release`: exit 0.
+- `git diff --check`: exit 0 with no output.
+- Security/orphan scan: no polling/sleeps, debug output, dynamic evaluation, TODO/FIXME markers, force tries/casts, private-key markers, non-canary test credentials, unvalidated receipt-bearing repair catch, or removed lifecycle flags.
+
+### Remaining concern
+
+- Malformed receipt evidence intentionally cannot resolve cleanup ownership automatically. Recovery requires a later valid complete authoritative receipt.
+
+---
+
 ## Second Re-review Correction Batch
 
 Date: 2026-07-07

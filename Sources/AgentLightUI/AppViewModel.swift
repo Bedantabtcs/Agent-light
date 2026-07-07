@@ -886,8 +886,8 @@ public final class AppViewModel: AppViewModeling {
     ) -> RepairPlan? {
         if obligations.contains(.integrationUninstallRetry) { return .uninstall }
         if obligations.contains(.integrationRollbackRepair) { return .rollback }
-        if obligations.contains(.integrationMixedAdoption) { return .adoptMixed }
         if obligations.contains(.integrationArtifactCleanup) { return .artifactOnly }
+        if obligations.contains(.integrationMixedAdoption) { return .adoptMixed }
         return phase == .monitoring || phase == .paused ? .health : nil
     }
 
@@ -933,8 +933,8 @@ public final class AppViewModel: AppViewModeling {
             return .success
         } catch IntegrationError.artifactCleanupFailure {
             return .artifactCleanupRequired
-        } catch IntegrationError.committedWithReceiptCleanupFailure {
-            return .artifactCleanupRequired
+        } catch let IntegrationError.committedWithReceiptCleanupFailure(receipt, _) {
+            return receipt.isValid ? .artifactCleanupRequired : .legacyArtifactCleanupRequired
         } catch IntegrationError.committedWithCleanupFailure {
             return plan == .adoptMixed ? .legacyArtifactCleanupRequired : .artifactCleanupRequired
         } catch is CancellationError {

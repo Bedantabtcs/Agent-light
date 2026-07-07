@@ -663,6 +663,137 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
     }
 
+    func testMixedAdoptionMalformedCommittedReceiptRetainsMixedThroughArtifactVerification() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.integrations.setInstallOwnership([.fresh])
+        await harness.viewModel.approveIntegrations()
+        let malformedReceipt = IntegrationInstallReceipt(
+            sources: [
+                IntegrationSourceReceipt(source: .cursor, ownership: .fresh),
+                IntegrationSourceReceipt(source: .cursor, ownership: .fresh),
+                IntegrationSourceReceipt(source: .claudeCode, ownership: .fresh)
+            ]
+        )
+        await harness.integrations.setInstallError(
+            IntegrationError.committedWithReceiptCleanupFailure(
+                receipt: malformedReceipt,
+                failures: ["CANARY_ARTIFACT"]
+            )
+        )
+
+        await harness.viewModel.repairIntegrations()
+
+        XCTAssertEqual(
+            harness.viewModel.outstandingObligations,
+            [.integrationMixedAdoption, .integrationArtifactCleanup]
+        )
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+
+        await harness.integrations.setInstallError(nil)
+        await harness.integrations.setArtifactVerification(clean: true)
+        await harness.viewModel.repairIntegrations()
+
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationMixedAdoption])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+
+        await harness.integrations.setInstallOwnership([.fresh, .fresh, .fresh])
+        await harness.viewModel.repairIntegrations()
+
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+        XCTAssertEqual(harness.viewModel.phase, .integrationReview)
+    }
+
+    func testMalformedCommittedReceiptCannotClearRollbackOrUninstallOwnership() async {
+        let malformedReceipt = IntegrationInstallReceipt(
+            sources: [
+                IntegrationSourceReceipt(source: .codex, ownership: .fresh),
+                IntegrationSourceReceipt(source: .codex, ownership: .fresh),
+                IntegrationSourceReceipt(source: .cursor, ownership: .fresh)
+            ]
+        )
+        let malformedError = IntegrationError.committedWithReceiptCleanupFailure(
+            receipt: malformedReceipt,
+            failures: ["CANARY_ARTIFACT"]
+        )
+
+        let rollback = ViewModelHarness()
+        await rollback.viewModel.connect(using: rollback.validDraft)
+        await rollback.integrations.setInstallError(
+            IntegrationError.rollbackFailed(["CANARY_ROLLBACK"])
+        )
+        await rollback.viewModel.approveIntegrations()
+        await rollback.integrations.setRepairError(malformedError)
+        await rollback.viewModel.repairIntegrations()
+        XCTAssertEqual(
+            rollback.viewModel.outstandingObligations,
+            [.integrationRollbackRepair, .integrationArtifactCleanup]
+        )
+
+        let uninstall = ViewModelHarness()
+        await uninstall.connectAndApprove()
+        await uninstall.integrations.setUninstallError(HarnessSensitiveError("CANARY_UNINSTALL"))
+        await uninstall.viewModel.disconnect()
+        await uninstall.integrations.setUninstallError(malformedError)
+        await uninstall.viewModel.repairIntegrations()
+        XCTAssertEqual(
+            uninstall.viewModel.outstandingObligations,
+            [.integrationUninstallRetry, .integrationArtifactCleanup]
+        )
+    }
+
+    func testMalformedCommittedReceiptCannotClearHealthOrArtifactOnlyOwnership() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        let malformedReceipt = IntegrationInstallReceipt(
+            sources: [
+                IntegrationSourceReceipt(source: .claudeCode, ownership: .fresh),
+                IntegrationSourceReceipt(source: .claudeCode, ownership: .fresh),
+                IntegrationSourceReceipt(source: .cursor, ownership: .fresh)
+            ]
+        )
+        let malformedError = IntegrationError.committedWithReceiptCleanupFailure(
+            receipt: malformedReceipt,
+            failures: ["CANARY_ARTIFACT"]
+        )
+        await harness.integrations.setRepairError(malformedError)
+        await harness.viewModel.repairIntegrations()
+        await harness.integrations.setRepairError(nil)
+        await harness.integrations.setArtifactVerification(clean: false, error: malformedError)
+
+        await harness.viewModel.repairIntegrations()
+        await harness.viewModel.disconnect()
+
+        let counts = await harness.integrations.counts()
+        XCTAssertEqual(counts.uninstall, 1)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationArtifactCleanup])
+    }
+
+    func testMixedAdoptionValidCommittedReceiptAppliesAuthoritativeCleanupTransition() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.integrations.setInstallOwnership([.fresh])
+        await harness.viewModel.approveIntegrations()
+        await harness.integrations.setInstallError(
+            IntegrationError.committedWithReceiptCleanupFailure(
+                receipt: harness.freshInstallReceipt,
+                failures: ["CANARY_ARTIFACT"]
+            )
+        )
+
+        await harness.viewModel.repairIntegrations()
+
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationArtifactCleanup])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+
+        await harness.integrations.setInstallError(nil)
+        await harness.integrations.setArtifactVerification(clean: true)
+        await harness.viewModel.repairIntegrations()
+
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+        XCTAssertEqual(harness.viewModel.phase, .integrationReview)
+    }
+
     func testMixedAdoptionInvalidReceiptRetainsMixedObligation() async {
         let harness = ViewModelHarness()
         await harness.integrations.setPreviewOwnership([true, false, false])
