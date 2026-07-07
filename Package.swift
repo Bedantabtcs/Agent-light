@@ -7,13 +7,15 @@ let package = Package(
     products: [
         .library(name: "AgentLightProtocol", targets: ["AgentLightProtocol"]),
         .library(name: "AgentLightCore", targets: ["AgentLightCore"]),
+        .library(name: "AgentLightUI", targets: ["AgentLightUI"]),
         .executable(name: "AgentLight", targets: ["AgentLightApp"]),
         .executable(name: "AgentLightRelay", targets: ["AgentLightRelay"])
     ],
     targets: [
         .target(name: "AgentLightProtocol"),
         .target(name: "AgentLightCore", dependencies: ["AgentLightProtocol"]),
-        .executableTarget(name: "AgentLightApp"),
+        .target(name: "AgentLightUI", dependencies: ["AgentLightCore"]),
+        .executableTarget(name: "AgentLightApp", dependencies: ["AgentLightCore", "AgentLightUI"]),
         .executableTarget(
             name: "AgentLightRelay",
             dependencies: ["AgentLightCore", "AgentLightProtocol"]
@@ -23,6 +25,10 @@ let package = Package(
             name: "AgentLightCoreTests",
             dependencies: ["AgentLightCore"],
             resources: [.process("Fixtures")]
+        ),
+        .testTarget(
+            name: "AgentLightUITests",
+            dependencies: ["AgentLightUI", "AgentLightCore", "AgentLightProtocol"]
         )
     ],
     swiftLanguageModes: [.v6]
