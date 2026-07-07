@@ -30,6 +30,52 @@ final class HarnessCallRecorder: @unchecked Sendable {
     func removeAll() { lock.withLock { storage.removeAll() } }
 }
 
+actor ControllableSetupOwnershipStore: SetupOwnershipStoring {
+    private var stored: SetupOwnershipReceipt?
+    private var saveCount = 0
+    private var failingSaveNumbers: Set<Int> = []
+    private var failAllWrites = false
+
+    func load() async throws -> SetupOwnershipReceipt? { stored }
+    func save(_ receipt: SetupOwnershipReceipt) async throws {
+        saveCount += 1
+        if failAllWrites || failingSaveNumbers.contains(saveCount) {
+            throw SetupOwnershipStoreError.writeFailed
+        }
+        stored = receipt
+    }
+    func delete() async throws {
+        saveCount += 1
+        if failAllWrites || failingSaveNumbers.contains(saveCount) {
+            throw SetupOwnershipStoreError.writeFailed
+        }
+        stored = nil
+    }
+    func failSaves(_ numbers: Set<Int>) { failingSaveNumbers = numbers }
+    func failEveryWrite() { failAllWrites = true }
+    func current() -> SetupOwnershipReceipt? { stored }
+    func writes() -> Int { saveCount }
+}
+
+actor ResettableCorruptSetupOwnershipStore: SetupOwnershipStoring {
+    private var isCorrupt = true
+    private(set) var resetCount = 0
+
+    func load() async throws -> SetupOwnershipReceipt? {
+        if isCorrupt { throw SetupOwnershipStoreError.malformedReceipt }
+        return nil
+    }
+    func save(_ receipt: SetupOwnershipReceipt) async throws {
+        throw SetupOwnershipStoreError.malformedReceipt
+    }
+    func delete() async throws { throw SetupOwnershipStoreError.malformedReceipt }
+    func resetInvalidReceipt() async throws {
+        guard isCorrupt else { throw SetupOwnershipStoreError.resetNotRequired }
+        isCorrupt = false
+        resetCount += 1
+    }
+}
+
 final class FakeCredentialStore: CredentialStoring, PreviousCredentialStoring, @unchecked Sendable {
     private let lock = NSLock()
     private let calls: HarnessCallRecorder
@@ -185,6 +231,7 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     private var installError: (any Error & Sendable)?
     private var previewError: (any Error & Sendable)?
     private var repairError: (any Error & Sendable)?
+    private var repairedReceipt: IntegrationInstallReceipt?
     private var uninstallError: (any Error & Sendable)?
     private var artifactVerificationError: (any Error & Sendable)?
     private var artifactCleanupVerified = false
@@ -206,6 +253,8 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     private(set) var previewCount = 0
     private(set) var installCount = 0
     private(set) var repairCount = 0
+    private(set) var blindRepairCount = 0
+    private(set) var verifiedRepairCount = 0
     private(set) var uninstallCount = 0
     private(set) var blindUninstallCount = 0
     private(set) var lastVerifiedReceipt: IntegrationInstallReceipt?
@@ -266,6 +315,20 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     }
 
     func repair() async throws {
+        blindRepairCount += 1
+        try await performRepair()
+    }
+
+    func repair(using receipt: IntegrationInstallReceipt) async throws -> IntegrationInstallReceipt {
+        verifiedRepairCount += 1
+        guard receipt.hasVerifiableFingerprints, currentHooksMatchReceipt else {
+            throw IntegrationError.ownershipVerificationFailed
+        }
+        try await performRepair()
+        return repairedReceipt ?? receipt
+    }
+
+    private func performRepair() async throws {
         calls.append(.repair)
         repairCount += 1
         let ready = repairWaiters.filter { repairCount >= $0.0 }
@@ -308,6 +371,7 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
     func setInstallError(_ error: (any Error & Sendable)?) { installError = error }
     func setPreviewError(_ error: (any Error & Sendable)?) { previewError = error }
     func setRepairError(_ error: (any Error & Sendable)?) { repairError = error }
+    func setRepairedReceipt(_ receipt: IntegrationInstallReceipt?) { repairedReceipt = receipt }
     func setUninstallError(_ error: (any Error & Sendable)?) { uninstallError = error }
     func setCurrentHooksMatchReceipt(_ matches: Bool) { currentHooksMatchReceipt = matches }
     func setArtifactVerification(clean: Bool, error: (any Error & Sendable)? = nil) {
@@ -358,6 +422,9 @@ actor FakeIntegrationInstaller: IntegrationInstalling {
 
     func uninstallVerification() -> (blind: Int, receipt: IntegrationInstallReceipt?) {
         (blindUninstallCount, lastVerifiedReceipt)
+    }
+    func repairVerification() -> (blind: Int, verified: Int) {
+        (blindRepairCount, verifiedRepairCount)
     }
 }
 

@@ -259,7 +259,9 @@ final class ViewRenderingTests: XCTestCase {
         try renderedButton(AmbientAccessibilityID.settingsReplaceDevice, in: replaceHost).performClick(nil)
         await replaceHarness.monitor.waitForStopCount(1)
         await replaceHarness.integrations.waitForUninstallCount(1)
-        await nextMainTurn()
+        for _ in 0..<100 where replaceHarness.viewModel.phase != .onboarding {
+            await nextMainTurn()
+        }
         XCTAssertEqual(replaceHarness.viewModel.phase, .onboarding)
 
         let uninstallHarness = ViewModelHarness()
@@ -296,6 +298,26 @@ final class ViewRenderingTests: XCTestCase {
         await repairHarness.integrations.waitForRepairCount(1)
         let repairCount = await repairHarness.integrations.counts().repair
         XCTAssertEqual(repairCount, 1)
+    }
+
+    func testRenderedOwnershipReceiptResetIsExplicitSanitizedAndReturnsToOnboarding() async throws {
+        let store = ResettableCorruptSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.viewModel.synchronizeOwnership()
+        let hosting = host(SettingsView(viewModel: harness.viewModel))
+
+        let rendered = renderedText(in: hosting)
+        XCTAssertTrue(rendered.contains("The saved ownership receipt cannot be used safely."), "\(rendered)")
+        XCTAssertFalse(rendered.contains { $0.contains("setup-ownership-v1") }, "\(rendered)")
+        try renderedButton(AmbientAccessibilityID.settingsResetOwnershipReceipt, in: hosting).performClick(nil)
+
+        for _ in 0..<100 where await store.resetCount == 0 {
+            await nextMainTurn()
+        }
+        let resetCount = await store.resetCount
+        XCTAssertEqual(resetCount, 1)
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.isEmpty)
     }
 
     func testRenderedPrimaryControlsHaveStableAccessibilityIdentifiers() async {

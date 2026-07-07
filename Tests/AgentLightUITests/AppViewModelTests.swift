@@ -1,5 +1,6 @@
 import XCTest
 import AgentLightCore
+import AgentLightProtocol
 import Observation
 @testable import AgentLightUI
 
@@ -633,6 +634,20 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(relaunched.phase, .repairRequired)
     }
 
+    func testHealthRepairRevalidatesPersistedReceiptAndRejectsChangedOwnedHooks() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.integrations.setCurrentHooksMatchReceipt(false)
+
+        await harness.viewModel.repairIntegrations()
+
+        let verification = await harness.integrations.repairVerification()
+        XCTAssertEqual(verification.blind, 0)
+        XCTAssertEqual(verification.verified, 1)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.integrationRollbackRepair))
+    }
+
     func testPreexistingHookReceiptRemainsNonOwnedAfterRelaunch() async {
         let store = MemorySetupOwnershipStore()
         let harness = ViewModelHarness(ownershipStore: store)
@@ -646,6 +661,76 @@ final class AppViewModelTests: XCTestCase {
         let counts = await harness.integrations.counts()
         XCTAssertEqual(counts.uninstall, 0)
         XCTAssertEqual(relaunched.outstandingObligations, [])
+    }
+
+    func testCleanupStopsBeforeCredentialsOrHooksAfterDurableLoginMutationFailure() async {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        await store.failEveryWrite()
+        let active = harness.credentials.storedCredentials()
+
+        await harness.viewModel.disconnect()
+
+        let integrationCounts = await harness.integrations.counts()
+        XCTAssertEqual(harness.credentials.storedCredentials(), active)
+        XCTAssertEqual(harness.credentials.deleteCount, 0)
+        XCTAssertEqual(integrationCounts.uninstall, 0)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.ownershipReceiptRepair))
+    }
+
+    func testFailedCompensationUninstallRetainsReceiptAndDurableRetryObligation() async {
+        let store = ControllableSetupOwnershipStore()
+        await store.failSaves([1])
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.integrations.setUninstallError(HarnessSensitiveError("CANARY_UNINSTALL"))
+
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.viewModel.approveIntegrations()
+
+        let receipt = await store.current()
+        guard case .uninstallable? = receipt?.integration else {
+            return XCTFail("Expected persisted verified uninstall authority")
+        }
+        XCTAssertTrue(receipt?.obligations.contains(.integrationUninstallRetry) == true)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.integrationUninstallRetry))
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
+    func testFailedLoginPersistenceAndUnregisterRetainsDurableCleanupObligation() async {
+        let store = ControllableSetupOwnershipStore()
+        await store.failSaves([3])
+        let harness = ViewModelHarness(ownershipStore: store)
+        harness.loginItem.disableError = HarnessSensitiveError("CANARY_LOGIN_UNREGISTER")
+
+        await harness.connectAndApprove()
+
+        let receipt = await store.current()
+        XCTAssertNotEqual(receipt?.login, PersistentLoginOwnership.none)
+        XCTAssertTrue(receipt?.obligations.contains(.loginRegistrationCleanup) == true)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.loginRegistrationCleanup))
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+    }
+
+    func testExplicitOwnershipReceiptResetReturnsToSafeOnboardingWithoutIntegrationMutation() async {
+        let store = ResettableCorruptSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.viewModel.synchronizeOwnership()
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.ownershipReceiptRepair])
+
+        await harness.viewModel.resetOwnershipReceipt()
+
+        let resetCount = await store.resetCount
+        XCTAssertEqual(resetCount, 1)
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
+        XCTAssertNil(harness.viewModel.presentedError)
+        let counts = await harness.integrations.counts()
+        XCTAssertEqual(counts.install, 0)
+        XCTAssertEqual(counts.repair, 0)
+        XCTAssertEqual(counts.uninstall, 0)
     }
 
     func testCredentialRestoreFailureCreatesTypedObligationAndRetryClearsIt() async {
@@ -859,21 +944,20 @@ final class AppViewModelTests: XCTestCase {
         await harness.viewModel.disconnect()
         XCTAssertEqual(
             harness.viewModel.outstandingObligations,
-            [.integrationMixedAdoption, .credentialDelete]
+            [.credentialDelete]
         )
-
-        await harness.viewModel.repairIntegrations()
-
-        XCTAssertEqual(harness.viewModel.outstandingObligations, [.credentialDelete])
-        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
 
         harness.credentials.setDeleteError(nil)
         await harness.viewModel.disconnect()
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationMixedAdoption])
+
+        await harness.viewModel.repairIntegrations()
+
         XCTAssertEqual(harness.viewModel.outstandingObligations, [])
         XCTAssertEqual(harness.viewModel.phase, .onboarding)
     }
 
-    func testRepairOfMixedAdoptionUsesAuthoritativeInstallNotRepairOrUninstall() async {
+    func testRepairOfMixedAdoptionUsesVerifiedRepairNotInstallOrUninstall() async {
         let harness = ViewModelHarness()
         await harness.integrations.setPreviewOwnership([true, false, false])
         await harness.connectAndApprove()
@@ -883,8 +967,8 @@ final class AppViewModelTests: XCTestCase {
         await harness.viewModel.repairIntegrations()
 
         let counts = await harness.integrations.counts()
-        XCTAssertEqual(counts.install, 2)
-        XCTAssertEqual(counts.repair, 0)
+        XCTAssertEqual(counts.install, 1)
+        XCTAssertEqual(counts.repair, 1)
         XCTAssertEqual(counts.uninstall, 0)
         XCTAssertEqual(harness.viewModel.outstandingObligations, [])
     }
@@ -894,7 +978,7 @@ final class AppViewModelTests: XCTestCase {
         await harness.integrations.setPreviewOwnership([true, false, false])
         await harness.connectAndApprove()
         await harness.viewModel.disconnect()
-        await harness.integrations.setInstallError(
+        await harness.integrations.setRepairError(
             IntegrationError.committedWithCleanupFailure(["CANARY_ARTIFACT"])
         )
 
@@ -909,9 +993,9 @@ final class AppViewModelTests: XCTestCase {
 
     func testMixedAdoptionMalformedCommittedReceiptRetainsMixedThroughArtifactVerification() async {
         let harness = ViewModelHarness()
-        await harness.viewModel.connect(using: harness.validDraft)
-        await harness.integrations.setInstallOwnership([.fresh])
-        await harness.viewModel.approveIntegrations()
+        await harness.integrations.setPreviewOwnership([true, false, false])
+        await harness.connectAndApprove()
+        await harness.viewModel.disconnect()
         let malformedReceipt = IntegrationInstallReceipt(
             sources: [
                 IntegrationSourceReceipt(source: .cursor, ownership: .fresh),
@@ -919,7 +1003,7 @@ final class AppViewModelTests: XCTestCase {
                 IntegrationSourceReceipt(source: .claudeCode, ownership: .fresh)
             ]
         )
-        await harness.integrations.setInstallError(
+        await harness.integrations.setRepairError(
             IntegrationError.committedWithReceiptCleanupFailure(
                 receipt: malformedReceipt,
                 failures: ["CANARY_ARTIFACT"]
@@ -934,18 +1018,17 @@ final class AppViewModelTests: XCTestCase {
         )
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
 
-        await harness.integrations.setInstallError(nil)
+        await harness.integrations.setRepairError(nil)
         await harness.integrations.setArtifactVerification(clean: true)
         await harness.viewModel.repairIntegrations()
 
         XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationMixedAdoption])
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
 
-        await harness.integrations.setInstallOwnership([.fresh, .fresh, .fresh])
         await harness.viewModel.repairIntegrations()
 
         XCTAssertEqual(harness.viewModel.outstandingObligations, [])
-        XCTAssertEqual(harness.viewModel.phase, .integrationReview)
+        XCTAssertEqual(harness.viewModel.phase, .onboarding)
     }
 
     func testMalformedCommittedReceiptCannotClearRollbackOrUninstallOwnership() async {
@@ -971,7 +1054,7 @@ final class AppViewModelTests: XCTestCase {
         await rollback.viewModel.repairIntegrations()
         XCTAssertEqual(
             rollback.viewModel.outstandingObligations,
-            [.integrationRollbackRepair, .integrationArtifactCleanup]
+            [.integrationRollbackRepair]
         )
 
         let uninstall = ViewModelHarness()
@@ -1016,9 +1099,9 @@ final class AppViewModelTests: XCTestCase {
     func testMixedAdoptionValidCommittedReceiptAppliesAuthoritativeCleanupTransition() async {
         let harness = ViewModelHarness()
         await harness.viewModel.connect(using: harness.validDraft)
-        await harness.integrations.setInstallOwnership([.fresh])
+        await harness.integrations.setInstallOwnership([.fullyPreexisting, .fresh, .fresh])
         await harness.viewModel.approveIntegrations()
-        await harness.integrations.setInstallError(
+        await harness.integrations.setRepairError(
             IntegrationError.committedWithReceiptCleanupFailure(
                 receipt: harness.freshInstallReceipt,
                 failures: ["CANARY_ARTIFACT"]
@@ -1030,7 +1113,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationArtifactCleanup])
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
 
-        await harness.integrations.setInstallError(nil)
+        await harness.integrations.setRepairError(nil)
         await harness.integrations.setArtifactVerification(clean: true)
         await harness.viewModel.repairIntegrations()
 
@@ -1043,7 +1126,7 @@ final class AppViewModelTests: XCTestCase {
         await harness.integrations.setPreviewOwnership([true, false, false])
         await harness.connectAndApprove()
         await harness.viewModel.disconnect()
-        await harness.integrations.setInstallOwnership([.fresh])
+        await harness.integrations.setCurrentHooksMatchReceipt(false)
 
         await harness.viewModel.repairIntegrations()
 
@@ -1177,7 +1260,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationRollbackRepair])
     }
 
-    func testRepairOfRollbackFailureUsesRepairWithoutRepeatingInstall() async {
+    func testRepairOfRollbackFailureWithoutReceiptFailsClosedWithoutMutation() async {
         let harness = ViewModelHarness()
         await harness.viewModel.connect(using: harness.validDraft)
         await harness.integrations.setInstallError(
@@ -1189,10 +1272,10 @@ final class AppViewModelTests: XCTestCase {
 
         let counts = await harness.integrations.counts()
         XCTAssertEqual(counts.install, 1)
-        XCTAssertEqual(counts.repair, 1)
+        XCTAssertEqual(counts.repair, 0)
         XCTAssertEqual(counts.uninstall, 0)
-        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
-        XCTAssertEqual(harness.viewModel.phase, .integrationReview)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationRollbackRepair])
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
     }
 
     func testHealthRepairCommittedCleanupPreservesOwnedHooksForDisconnect() async {
@@ -1227,6 +1310,27 @@ final class AppViewModelTests: XCTestCase {
         }
     }
 
+    func testHealthRepairPersistsRefreshedFingerprintReceipt() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        let refreshed = IntegrationInstallReceipt(
+            sources: AgentSource.allCases.map {
+                IntegrationSourceReceipt(
+                    source: $0,
+                    ownership: .fresh,
+                    marker: AppIdentity.integrationIdentifier,
+                    installedContentFingerprint: String(repeating: "c", count: 64)
+                )
+            }
+        )
+        await harness.integrations.setRepairedReceipt(refreshed)
+
+        await harness.viewModel.repairIntegrations()
+
+        let snapshot = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(snapshot.integration, .uninstallable(refreshed))
+    }
+
     func testArtifactOnlyVerificationPreservesOwnedHooksAfterHealthCleanupFailure() async {
         let harness = ViewModelHarness()
         await harness.connectAndApprove()
@@ -1246,7 +1350,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.viewModel.phase, .onboarding)
     }
 
-    func testRollbackRepairClearsCleanupOwnershipAndAllowsApprovalRetry() async {
+    func testRollbackRepairWithoutReceiptBlocksApprovalRetry() async {
         let harness = ViewModelHarness()
         await harness.viewModel.connect(using: harness.validDraft)
         await harness.integrations.setInstallError(
@@ -1259,30 +1363,32 @@ final class AppViewModelTests: XCTestCase {
         await harness.viewModel.approveIntegrations()
 
         let counts = await harness.integrations.counts()
+        XCTAssertEqual(counts.install, 1)
+        XCTAssertEqual(counts.repair, 0)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.outstandingObligations, [.integrationRollbackRepair])
+    }
+
+    func testMixedAdoptionRepairClearsCleanupOwnershipAndAllowsApprovalRetry() async {
+        let harness = ViewModelHarness()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.integrations.setInstallOwnership([.fullyPreexisting, .fresh, .fresh])
+        await harness.viewModel.approveIntegrations()
+        await harness.viewModel.disconnect()
+        await harness.integrations.setInstallOwnership([.fresh, .fresh, .fresh])
+
+        await harness.viewModel.repairIntegrations()
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.viewModel.approveIntegrations()
+
+        let counts = await harness.integrations.counts()
         XCTAssertEqual(counts.install, 2)
         XCTAssertEqual(counts.repair, 1)
         XCTAssertEqual(harness.viewModel.phase, .monitoring)
         XCTAssertEqual(harness.viewModel.outstandingObligations, [])
     }
 
-    func testMixedAdoptionRepairClearsCleanupOwnershipAndAllowsApprovalRetry() async {
-        let harness = ViewModelHarness()
-        await harness.viewModel.connect(using: harness.validDraft)
-        await harness.integrations.setInstallOwnership([.fresh])
-        await harness.viewModel.approveIntegrations()
-        await harness.integrations.setInstallOwnership([.fresh, .fresh, .fresh])
-
-        await harness.viewModel.repairIntegrations()
-        await harness.viewModel.approveIntegrations()
-
-        let counts = await harness.integrations.counts()
-        XCTAssertEqual(counts.install, 3)
-        XCTAssertEqual(counts.repair, 0)
-        XCTAssertEqual(harness.viewModel.phase, .monitoring)
-        XCTAssertEqual(harness.viewModel.outstandingObligations, [])
-    }
-
-    func testReplacementReconcilesAfterRollbackRepairClearsCleanupOwnership() async {
+    func testReplacementRetainsRollbackRepairWhenNoReceiptExists() async {
         let harness = ViewModelHarness()
         let owner = makeViewModel(using: harness)
         await owner.connect(using: harness.validDraft)
@@ -1297,17 +1403,18 @@ final class AppViewModelTests: XCTestCase {
         await owner.repairIntegrations()
         await replacement.synchronizeOwnership()
 
-        XCTAssertEqual(replacement.outstandingObligations, [])
-        XCTAssertEqual(replacement.phase, .onboarding)
-        XCTAssertNil(replacement.presentedError)
+        XCTAssertEqual(replacement.outstandingObligations, [.integrationRollbackRepair])
+        XCTAssertEqual(replacement.phase, .repairRequired)
+        XCTAssertEqual(replacement.presentedError, .integrationConflict)
     }
 
     func testReplacementReconcilesAfterMixedAdoptionClearsCleanupOwnership() async {
         let harness = ViewModelHarness()
         let owner = makeViewModel(using: harness)
         await owner.connect(using: harness.validDraft)
-        await harness.integrations.setInstallOwnership([.fresh])
+        await harness.integrations.setInstallOwnership([.fullyPreexisting, .fresh, .fresh])
         await owner.approveIntegrations()
+        await owner.disconnect()
         let replacement = makeViewModel(using: harness)
         await replacement.synchronizeOwnership()
         XCTAssertEqual(replacement.phase, .repairRequired)
@@ -1668,7 +1775,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(replacement.phase, .repairRequired)
         XCTAssertEqual(
             replacement.outstandingObligations,
-            [.credentialDelete, .loginRegistrationCleanup, .integrationArtifactCleanup]
+            [.loginRegistrationCleanup]
         )
 
         harness.credentials.setDeleteError(nil)

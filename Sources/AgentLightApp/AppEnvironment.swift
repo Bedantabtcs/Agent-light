@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import Observation
 import AgentLightCore
@@ -350,7 +351,7 @@ struct ProductionAppComposition {
             monitor: monitor,
             relay: relay,
             coordinator: coordinator,
-            prepareStorage: prepareApplicationSupport
+            prepareStorage: { try await prepareApplicationSupport() }
         )
         return ProductionAppComposition(environment: environment, viewModel: viewModel)
     }
@@ -360,15 +361,42 @@ struct ProductionAppComposition {
             ?? AppIdentity.applicationSupportDirectory.appending(path: "AgentLightRelay").path
     }
 
-    private static func prepareApplicationSupport() async throws {
-        let directory = AppIdentity.applicationSupportDirectory
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true
+    static func prepareApplicationSupport(
+        at directory: URL = AppIdentity.applicationSupportDirectory
+    ) async throws {
+        let created: Bool
+        if mkdir(directory.path, mode_t(0o700)) == 0 {
+            created = true
+        } else if errno == EEXIST {
+            created = false
+        } else {
+            throw ApplicationSupportPreparationError.storageFailure
+        }
+        let descriptor = open(
+            directory.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
         )
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: directory.path
-        )
+        guard descriptor >= 0 else {
+            throw ApplicationSupportPreparationError.unsafeDirectory
+        }
+        defer { _ = close(descriptor) }
+        if created, fchmod(descriptor, mode_t(0o700)) != 0 {
+            throw ApplicationSupportPreparationError.storageFailure
+        }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFDIR,
+              metadata.st_uid == geteuid(),
+              metadata.st_mode & mode_t(0o7777) == mode_t(0o700) else {
+            throw ApplicationSupportPreparationError.unsafeDirectory
+        }
+        guard fsync(descriptor) == 0 else {
+            throw ApplicationSupportPreparationError.storageFailure
+        }
     }
+}
+
+enum ApplicationSupportPreparationError: Error, Equatable {
+    case unsafeDirectory
+    case storageFailure
 }

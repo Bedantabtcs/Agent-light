@@ -112,6 +112,7 @@ public protocol IntegrationInstalling: Sendable {
     func install() async throws
     func installWithReceipt() async throws -> IntegrationInstallReceipt
     func repair() async throws
+    func repair(using receipt: IntegrationInstallReceipt) async throws -> IntegrationInstallReceipt
     func uninstall() async throws
     func uninstall(using receipt: IntegrationInstallReceipt) async throws
     func verifyArtifactCleanup() async throws -> Bool
@@ -128,6 +129,10 @@ public extension IntegrationInstalling {
     }
 
     func verifyArtifactCleanup() async throws -> Bool { false }
+
+    func repair(using receipt: IntegrationInstallReceipt) async throws -> IntegrationInstallReceipt {
+        throw IntegrationError.ownershipVerificationFailed
+    }
 
     func uninstall(using receipt: IntegrationInstallReceipt) async throws {
         throw IntegrationError.ownershipVerificationFailed
@@ -744,6 +749,10 @@ public struct IntegrationInstaller: IntegrationInstalling {
             let before = try fileOperations.snapshot(at: configuration.url)
             let editor = IntegrationConfigEditor(source: configuration.source, relayPath: relayPath)
             let after = try editor.install(into: before.data)
+            if try editor.hasOwnedEntries(in: before.data),
+               try JSONValue.decode(before.data) != JSONValue.decode(after) {
+                throw IntegrationError.ownershipVerificationFailed
+            }
             return (
                 AtomicConfigurationChange(
                     destination: configuration.url,
@@ -771,7 +780,33 @@ public struct IntegrationInstaller: IntegrationInstalling {
     }
 
     public func repair() async throws {
-        try apply(includeMissing: true) { editor, data in try editor.install(into: data) }
+        throw IntegrationError.ownershipVerificationFailed
+    }
+
+    public func repair(using receipt: IntegrationInstallReceipt) async throws -> IntegrationInstallReceipt {
+        let prepared = try verifiedChanges(using: receipt) { editor, data in
+            try editor.install(into: data)
+        }
+        let updatedReceipt = IntegrationInstallReceipt(
+            sources: try prepared.map { change, sourceReceipt in
+                let editor = IntegrationConfigEditor(source: sourceReceipt.source, relayPath: relayPath)
+                return IntegrationSourceReceipt(
+                    source: sourceReceipt.source,
+                    ownership: sourceReceipt.ownership,
+                    marker: AppIdentity.integrationIdentifier,
+                    installedContentFingerprint: try editor.installedContentFingerprint(in: change.after)
+                )
+            }
+        )
+        let cleanupFailures = try AtomicConfigurationWriter(fileOperations: fileOperations)
+            .apply(prepared.map(\.0))
+        if !cleanupFailures.isEmpty {
+            throw IntegrationError.committedWithReceiptCleanupFailure(
+                receipt: updatedReceipt,
+                failures: cleanupFailures
+            )
+        }
+        return updatedReceipt
     }
 
     public func uninstall() async throws {
@@ -782,8 +817,24 @@ public struct IntegrationInstaller: IntegrationInstalling {
         guard receipt.hasVerifiableFingerprints, receipt.overallOwnership == .fresh else {
             throw IntegrationError.ownershipVerificationFailed
         }
+        let changes = try verifiedChanges(using: receipt) { editor, data in
+            try editor.uninstall(from: data)
+        }.map(\.0)
+        let cleanupFailures = try AtomicConfigurationWriter(fileOperations: fileOperations).apply(changes)
+        if !cleanupFailures.isEmpty {
+            throw IntegrationError.artifactCleanupFailure(cleanupFailures)
+        }
+    }
+
+    private func verifiedChanges(
+        using receipt: IntegrationInstallReceipt,
+        transform: (IntegrationConfigEditor, Data) throws -> Data
+    ) throws -> [(AtomicConfigurationChange, IntegrationSourceReceipt)] {
+        guard receipt.hasVerifiableFingerprints else {
+            throw IntegrationError.ownershipVerificationFailed
+        }
         let receipts = Dictionary(uniqueKeysWithValues: receipt.sources.map { ($0.source, $0) })
-        let changes = try paths.all.map { configuration -> AtomicConfigurationChange in
+        return try paths.all.map { configuration in
             guard let sourceReceipt = receipts[configuration.source],
                   let expected = sourceReceipt.installedContentFingerprint else {
                 throw IntegrationError.ownershipVerificationFailed
@@ -794,15 +845,14 @@ public struct IntegrationInstaller: IntegrationInstalling {
             guard try editor.installedContentFingerprint(in: before.data) == expected else {
                 throw IntegrationError.ownershipVerificationFailed
             }
-            return AtomicConfigurationChange(
-                destination: configuration.url,
-                before: before,
-                after: try editor.uninstall(from: before.data)
+            return (
+                AtomicConfigurationChange(
+                    destination: configuration.url,
+                    before: before,
+                    after: try transform(editor, before.data)
+                ),
+                sourceReceipt
             )
-        }
-        let cleanupFailures = try AtomicConfigurationWriter(fileOperations: fileOperations).apply(changes)
-        if !cleanupFailures.isEmpty {
-            throw IntegrationError.artifactCleanupFailure(cleanupFailures)
         }
     }
 

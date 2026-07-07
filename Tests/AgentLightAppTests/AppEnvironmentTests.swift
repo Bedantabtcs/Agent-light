@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 import AppKit
@@ -64,6 +65,53 @@ final class AppEnvironmentTests: XCTestCase {
 
         XCTAssertEqual(composition.environment.status, .loading)
         XCTAssertEqual(composition.viewModel.phase, .onboarding)
+    }
+
+    func testApplicationSupportPreparationRejectsSymlinkAndNonprivateExistingDirectory() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "agent-light-app-support-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let target = root.appending(path: "target", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: target.path)
+        let linked = root.appending(path: "linked", directoryHint: .isDirectory)
+        XCTAssertEqual(symlink(target.path, linked.path), 0)
+
+        do {
+            try await ProductionAppComposition.prepareApplicationSupport(at: linked)
+            XCTFail("Expected symlink rejection")
+        } catch {}
+        var linkedMetadata = stat()
+        XCTAssertEqual(lstat(linked.path, &linkedMetadata), 0)
+        XCTAssertEqual(linkedMetadata.st_mode & S_IFMT, S_IFLNK)
+
+        let nonprivate = root.appending(path: "nonprivate", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: nonprivate, withIntermediateDirectories: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: nonprivate.path)
+        do {
+            try await ProductionAppComposition.prepareApplicationSupport(at: nonprivate)
+            XCTFail("Expected nonprivate directory rejection")
+        } catch {}
+        let attributes = try FileManager.default.attributesOfItem(atPath: nonprivate.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o755)
+    }
+
+    func testApplicationSupportPreparationCreatesAndValidatesPrivateDirectory() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "agent-light-app-support-create-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let directory = root.appending(path: "private", directoryHint: .isDirectory)
+
+        try await ProductionAppComposition.prepareApplicationSupport(at: directory)
+        try await ProductionAppComposition.prepareApplicationSupport(at: directory)
+
+        var metadata = stat()
+        XCTAssertEqual(lstat(directory.path, &metadata), 0)
+        XCTAssertEqual(metadata.st_mode & S_IFMT, S_IFDIR)
+        XCTAssertEqual(metadata.st_mode & mode_t(0o7777), mode_t(0o700))
+        XCTAssertEqual(metadata.st_uid, geteuid())
     }
 
     func testRecoveryFinishesBeforeCredentialsLoadAndRelayAcceptance() async {

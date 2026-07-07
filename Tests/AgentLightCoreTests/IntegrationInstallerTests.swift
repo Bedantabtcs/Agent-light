@@ -87,6 +87,27 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertEqual(object["unrelated"] as? String, "preserved")
     }
 
+    func testVerifiedRepairRejectsChangedOwnedHooksWithoutMutatingAnySource() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+        let receipt = try await installer.installWithReceipt()
+        var changed = String(decoding: try Data(contentsOf: paths.codex), as: UTF8.self)
+        changed = changed.replacingOccurrences(of: "--event Stop", with: "--event Stop --changed")
+        try Data(changed.utf8).write(to: paths.codex)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: paths.codex.path)
+        let before = try paths.all.map { try Data(contentsOf: $0.url) }
+
+        do {
+            _ = try await installer.repair(using: receipt)
+            XCTFail("Expected ownership verification failure")
+        } catch IntegrationError.ownershipVerificationFailed {}
+
+        let after = try paths.all.map { try Data(contentsOf: $0.url) }
+        XCTAssertEqual(after, before)
+    }
+
     func testLegacyCommittedCleanupErrorRemainsConstructible() {
         let error = IntegrationError.committedWithCleanupFailure(["CANARY_ARTIFACT"])
 
@@ -274,7 +295,7 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertTrue(previews.allSatisfy { $0.before.isEmpty && $0.after.contains(AppIdentity.integrationIdentifier) })
         XCTAssertTrue(previews.allSatisfy { !$0.hadOwnedEntries })
 
-        try await installer.install()
+        let receipt = try await installer.installWithReceipt()
         for url in paths.all.map(\.url) {
             var metadata = stat()
             XCTAssertEqual(lstat(url.path, &metadata), 0)
@@ -283,7 +304,8 @@ final class IntegrationInstallerTests: XCTestCase {
         }
 
         let installed = try paths.all.map { try Data(contentsOf: $0.url) }
-        try await installer.repair()
+        let repairedReceipt = try await installer.repair(using: receipt)
+        XCTAssertEqual(repairedReceipt.sources.map(\.ownership), receipt.sources.map(\.ownership))
         XCTAssertEqual(try paths.all.map { try Data(contentsOf: $0.url) }, installed)
 
         try await installer.uninstall()
@@ -337,7 +359,7 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertEqual(receipt.sources.map(\.ownership), [.fullyPreexisting, .fullyPreexisting, .fullyPreexisting])
     }
 
-    func testInstallReceiptDetectsPartialEventDriftFromCommitTimeSnapshot() async throws {
+    func testReceiptlessInstallRejectsPartialOwnedEntriesWithoutMutatingAnySource() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = IntegrationConfigurationPaths(homeDirectory: root)
@@ -352,13 +374,15 @@ final class IntegrationInstallerTests: XCTestCase {
         try partial.write(to: paths.codex)
         let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
 
-        let receipt = try await installer.installWithReceipt()
-        let ownership = Dictionary(uniqueKeysWithValues: receipt.sources.map { ($0.source, $0.ownership) })
-
-        XCTAssertEqual(ownership[.codex], .partial)
-        XCTAssertEqual(ownership[.claudeCode], .fresh)
-        XCTAssertEqual(ownership[.cursor], .fresh)
-        XCTAssertEqual(receipt.overallOwnership, .mixed)
+        do {
+            _ = try await installer.installWithReceipt()
+            XCTFail("Expected partial marker-owned content to require persisted authority")
+        } catch {
+            XCTAssertEqual(error as? IntegrationError, .ownershipVerificationFailed)
+        }
+        XCTAssertEqual(try Data(contentsOf: paths.codex), partial)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.claudeCode.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.cursor.path))
     }
 
     func testInvalidExistingJSONFailsWithoutChangingFileOrLeavingArtifacts() async throws {

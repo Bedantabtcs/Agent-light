@@ -110,6 +110,19 @@ public struct SettingsView: View {
                     ) {
                         Task { await viewModel.uninstallIntegrations() }
                     }
+                    if viewModel.outstandingObligations.contains(.ownershipReceiptRepair) {
+                        NativeWrappingText(
+                            text: "The saved ownership receipt cannot be used safely.",
+                            accessibilityIdentifier: "settings.integrations.ownershipReceiptWarning",
+                            isSelectable: false
+                        )
+                        NativeActionButton(
+                            title: "Reset Ownership Receipt",
+                            accessibilityIdentifier: AmbientAccessibilityID.settingsResetOwnershipReceipt
+                        ) {
+                            Task { await viewModel.resetOwnershipReceipt() }
+                        }
+                    }
                 }
 
                 Section("General") {

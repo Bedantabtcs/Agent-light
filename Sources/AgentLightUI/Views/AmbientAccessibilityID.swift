@@ -17,6 +17,7 @@ enum AmbientAccessibilityID {
     static let settingsRepair = "settings.integrations.repair"
     static let settingsConfirmRepair = "settings.integrations.confirmRepair"
     static let settingsUninstall = "settings.integrations.uninstall"
+    static let settingsResetOwnershipReceipt = "settings.integrations.resetOwnershipReceipt"
     static let settingsEnableLogin = "settings.general.enableLogin"
     static let settingsMonitoring = "settings.general.monitoring"
 
@@ -39,6 +40,7 @@ enum AmbientAccessibilityID {
         settingsRepair,
         settingsConfirmRepair,
         settingsUninstall,
+        settingsResetOwnershipReceipt,
         settingsMonitoring,
         settingsEnableLogin
     ]

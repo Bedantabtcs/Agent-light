@@ -82,6 +82,13 @@ public protocol SetupOwnershipStoring: Sendable {
     func load() async throws -> SetupOwnershipReceipt?
     func save(_ receipt: SetupOwnershipReceipt) async throws
     func delete() async throws
+    func resetInvalidReceipt() async throws
+}
+
+public extension SetupOwnershipStoring {
+    func resetInvalidReceipt() async throws {
+        throw SetupOwnershipStoreError.resetNotRequired
+    }
 }
 
 public enum SetupOwnershipStoreError: Error, Equatable, Sendable {
@@ -91,6 +98,8 @@ public enum SetupOwnershipStoreError: Error, Equatable, Sendable {
     case receiptTooLarge
     case writeFailed
     case readFailed
+    case resetNotRequired
+    case invalidReceiptAlreadyPreserved
 }
 
 extension SetupOwnershipStoreError: LocalizedError, CustomStringConvertible {
@@ -102,6 +111,8 @@ extension SetupOwnershipStoreError: LocalizedError, CustomStringConvertible {
         case .receiptTooLarge: "Ownership receipt exceeds its size limit."
         case .writeFailed: "Ownership receipt could not be saved."
         case .readFailed: "Ownership receipt could not be read."
+        case .resetNotRequired: "Ownership receipt reset is not required."
+        case .invalidReceiptAlreadyPreserved: "An invalid ownership receipt is already preserved."
         }
     }
 
@@ -118,6 +129,12 @@ public actor MemorySetupOwnershipStore: SetupOwnershipStoring {
     public func load() async throws -> SetupOwnershipReceipt? { receipt }
     public func save(_ receipt: SetupOwnershipReceipt) async throws { self.receipt = receipt }
     public func delete() async throws { receipt = nil }
+    public func resetInvalidReceipt() async throws {
+        guard let receipt, !receipt.isValid else {
+            throw SetupOwnershipStoreError.resetNotRequired
+        }
+        self.receipt = nil
+    }
 }
 
 public actor FileSetupOwnershipStore: SetupOwnershipStoring {
@@ -131,8 +148,18 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
     public func load() async throws -> SetupOwnershipReceipt? {
         let directory = try openDirectory()
         defer { _ = close(directory) }
-        let name = url.lastPathComponent
-        let descriptor = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+        return try authenticatedReceipt(name: url.lastPathComponent, in: directory)?.receipt
+    }
+
+    private func authenticatedReceipt(
+        name: String,
+        in directory: Int32
+    ) throws -> (receipt: SetupOwnershipReceipt, identity: FileIdentity)? {
+        let descriptor = openat(
+            directory,
+            name,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK
+        )
         if descriptor < 0 {
             if errno == ENOENT { return nil }
             if errno == ELOOP { throw SetupOwnershipStoreError.unsafeReceipt }
@@ -164,7 +191,7 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
             throw SetupOwnershipStoreError.malformedReceipt
         }
         guard receipt.isValid else { throw SetupOwnershipStoreError.malformedReceipt }
-        return receipt
+        return (receipt, before)
     }
 
     public func save(_ receipt: SetupOwnershipReceipt) async throws {
@@ -188,7 +215,7 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
         let directory = try openDirectory()
         defer { _ = close(directory) }
         let name = url.lastPathComponent
-        let existing = try inspect(name: name, in: directory)
+        let existing = try authenticatedReceipt(name: name, in: directory)?.identity
         let temporary = ".\(name).agent-light-\(UUID().uuidString)"
         let descriptor = openat(
             directory,
@@ -253,7 +280,7 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
                         UInt32(RENAME_SWAP)
                     ) == 0 {
                         temporaryIsOwned = true
-                        try? sync(directory)
+                        try sync(directory)
                     }
                     throw SetupOwnershipStoreError.writeFailed
                 }
@@ -284,7 +311,7 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
         let directory = try openDirectory()
         defer { _ = close(directory) }
         let name = url.lastPathComponent
-        guard let existing = try inspect(name: name, in: directory) else { return }
+        guard let existing = try authenticatedReceipt(name: name, in: directory)?.identity else { return }
         let quarantine = ".\(name).agent-light-removal-\(UUID().uuidString)"
         guard renameatx_np(
             directory,
@@ -308,13 +335,67 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
         try sync(directory)
     }
 
+    public func resetInvalidReceipt() async throws {
+        let directory = try openDirectory()
+        defer { _ = close(directory) }
+        let name = url.lastPathComponent
+        let candidate = try inspect(name: name, in: directory)
+        do {
+            guard try authenticatedReceipt(name: name, in: directory) != nil else {
+                throw SetupOwnershipStoreError.resetNotRequired
+            }
+            throw SetupOwnershipStoreError.resetNotRequired
+        } catch SetupOwnershipStoreError.malformedReceipt,
+                SetupOwnershipStoreError.unsupportedVersion,
+                SetupOwnershipStoreError.receiptTooLarge {
+            // Only explicit reset may preserve an invalid receipt outside the active path.
+        }
+        guard let existing = candidate,
+              try inspectRequired(name: name, in: directory) == existing else {
+            throw SetupOwnershipStoreError.unsafeReceipt
+        }
+        let invalidName = url.deletingPathExtension()
+            .appendingPathExtension("invalid")
+            .lastPathComponent
+        guard try inspect(name: invalidName, in: directory) == nil else {
+            throw SetupOwnershipStoreError.invalidReceiptAlreadyPreserved
+        }
+        guard renameatx_np(
+            directory,
+            name,
+            directory,
+            invalidName,
+            UInt32(RENAME_EXCL)
+        ) == 0 else { throw SetupOwnershipStoreError.writeFailed }
+        var preserved = true
+        defer {
+            if !preserved { _ = renameat(directory, invalidName, directory, name) }
+        }
+        do {
+            guard try inspectRequired(name: invalidName, in: directory) == existing else {
+                throw SetupOwnershipStoreError.unsafeReceipt
+            }
+            try sync(directory)
+        } catch {
+            preserved = false
+            throw error
+        }
+    }
+
     private func openDirectory() throws -> Int32 {
         let directory = url.deletingLastPathComponent()
-        let descriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard descriptor >= 0 else { throw SetupOwnershipStoreError.readFailed }
+        let descriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            if errno == ELOOP || errno == ENOTDIR {
+                throw SetupOwnershipStoreError.unsafeReceipt
+            }
+            throw SetupOwnershipStoreError.readFailed
+        }
         var metadata = stat()
         guard fstat(descriptor, &metadata) == 0,
-              metadata.st_mode & S_IFMT == S_IFDIR else {
+              metadata.st_mode & S_IFMT == S_IFDIR,
+              metadata.st_uid == geteuid(),
+              metadata.st_mode & mode_t(0o7777) == mode_t(0o700) else {
             _ = close(descriptor)
             throw SetupOwnershipStoreError.unsafeReceipt
         }

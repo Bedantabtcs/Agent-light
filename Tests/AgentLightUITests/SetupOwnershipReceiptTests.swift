@@ -9,7 +9,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
     func testVersionOneReceiptRoundTripsWithoutCredentialMaterial() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try createPrivateDirectory(at: root)
         let url = root.appending(path: "setup-ownership-v1.json")
         let store = FileSetupOwnershipStore(url: url)
         let receipt = makeReceipt()
@@ -32,7 +32,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
     func testSaveCreatesMode0600AndAtomicallyReplacesEarlierReceipt() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try createPrivateDirectory(at: root)
         let url = root.appending(path: "setup-ownership-v1.json")
         let store = FileSetupOwnershipStore(url: url)
         var first = makeReceipt()
@@ -54,7 +54,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
     func testLoadRejectsSymlinkUnsafeModeMalformedAndUnsupportedReceipts() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try createPrivateDirectory(at: root)
         let url = root.appending(path: "setup-ownership-v1.json")
         let target = root.appending(path: "target.json")
         try Data("{}".utf8).write(to: target)
@@ -81,7 +81,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
     func testSaveAndDeleteNeverReplaceOrRemoveUnknownSymlink() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try createPrivateDirectory(at: root)
         let url = root.appending(path: "setup-ownership-v1.json")
         let target = root.appending(path: "unrelated.txt")
         let original = Data("CANARY_UNRELATED_CONTENT".utf8)
@@ -183,6 +183,109 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         XCTAssertEqual(snapshot.login, .owned)
     }
 
+    func testAutomaticSaveAndDeletePreserveMalformedOwnerOwnedReceiptBytes() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let url = root.appending(path: "setup-ownership-v1.json")
+        let corrupt = Data("malformed CANARY_UNKNOWN_RECEIPT".utf8)
+        try corrupt.write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        let store = FileSetupOwnershipStore(url: url)
+
+        await assertStoreError(.malformedReceipt) { try await store.save(makeReceipt()) }
+        XCTAssertEqual(try Data(contentsOf: url), corrupt)
+        await assertStoreError(.malformedReceipt) { try await store.delete() }
+        XCTAssertEqual(try Data(contentsOf: url), corrupt)
+    }
+
+    func testAutomaticSaveAndDeletePreserveUnsupportedOwnerOwnedReceiptBytes() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let url = root.appending(path: "setup-ownership-v1.json")
+        let unsupported = makeReceipt()
+        let current = try JSONEncoder().encode(unsupported)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: current) as? [String: Any])
+        object["version"] = SetupOwnershipReceipt.currentVersion + 1
+        let bytes = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        try bytes.write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        let store = FileSetupOwnershipStore(url: url)
+
+        await assertStoreError(.unsupportedVersion) { try await store.save(makeReceipt()) }
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+        await assertStoreError(.unsupportedVersion) { try await store.delete() }
+        XCTAssertEqual(try Data(contentsOf: url), bytes)
+    }
+
+    func testExplicitResetQuarantinesMalformedBytesAndLeavesNoOwnershipAuthority() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let url = root.appending(path: "setup-ownership-v1.json")
+        let invalidURL = root.appending(path: "setup-ownership-v1.invalid")
+        let corrupt = Data("malformed CANARY_QUARANTINED_RECEIPT".utf8)
+        try corrupt.write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        let store = FileSetupOwnershipStore(url: url)
+
+        try await store.resetInvalidReceipt()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try Data(contentsOf: invalidURL), corrupt)
+        let attributes = try FileManager.default.attributesOfItem(atPath: invalidURL.path)
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        let loaded = try await store.load()
+        XCTAssertNil(loaded)
+    }
+
+    func testExplicitResetQuarantinesOversizedUnknownBytes() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let url = root.appending(path: "setup-ownership-v1.json")
+        let invalidURL = root.appending(path: "setup-ownership-v1.invalid")
+        let oversized = Data(repeating: 0x58, count: 64 * 1024 + 1)
+        try oversized.write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        let store = FileSetupOwnershipStore(url: url)
+
+        try await store.resetInvalidReceipt()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        XCTAssertEqual(try Data(contentsOf: invalidURL), oversized)
+    }
+
+    func testStoreRejectsSymlinkedAndNonprivateParentDirectories() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let target = root.appending(path: "target", directoryHint: .isDirectory)
+        try createPrivateDirectory(at: target)
+        let linked = root.appending(path: "linked", directoryHint: .isDirectory)
+        XCTAssertEqual(symlink(target.path, linked.path), 0)
+        let linkedStore = FileSetupOwnershipStore(
+            url: linked.appending(path: "setup-ownership-v1.json")
+        )
+
+        await assertStoreError(.unsafeReceipt) { try await linkedStore.load() }
+
+        let publicDirectory = root.appending(path: "public", directoryHint: .isDirectory)
+        try createPrivateDirectory(at: publicDirectory)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: publicDirectory.path
+        )
+        let publicStore = FileSetupOwnershipStore(
+            url: publicDirectory.appending(path: "setup-ownership-v1.json")
+        )
+        await assertStoreError(.unsafeReceipt) { try await publicStore.save(makeReceipt()) }
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: publicDirectory.appending(path: "setup-ownership-v1.json").path
+        ))
+    }
+
     private func makeReceipt() -> SetupOwnershipReceipt {
         SetupOwnershipReceipt(
             version: SetupOwnershipReceipt.currentVersion,
@@ -209,6 +312,11 @@ final class SetupOwnershipReceiptTests: XCTestCase {
     private func temporaryRoot() -> URL {
         FileManager.default.temporaryDirectory
             .appending(path: "agent-light-ownership-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
+    }
+
+    private func createPrivateDirectory(at url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     }
 
     private func assertStoreError(
