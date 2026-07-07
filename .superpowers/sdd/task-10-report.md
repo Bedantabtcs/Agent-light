@@ -280,6 +280,50 @@ Starting commit: `f23c014ff486e596e25da2dd6b21bb0cdec82a0b`
 
 ---
 
+## Final Reconciliation and Commit-Order Correction
+
+Date: 2026-07-07
+Starting commit: `acb1ac7a2adab2bc414fed685476d7ffce146b13`
+
+### Reconciliation and repair requests
+
+- Empty final ledger snapshots now clear stale `repairRequired` presentation, obligations, and errors back to onboarding without disturbing valid integration-review or active connect state.
+- Repair captures the locally requested action, then re-reads the authoritative snapshot after acquiring its lease. If the requested obligation disappeared or changed, repair adopts the final snapshot without falling back to health repair or calling install, uninstall, or repair.
+- Health repair remains valid only while the leased snapshot still owns monitoring and has no integration repair obligation.
+
+### Lease cancellation and ordered presentation
+
+- Approval and repair drivers use cancellable FIFO acquisition. Cancellation while queued removes the waiter; cancellation racing lease handoff releases the granted token before any dependency call or ownership mutation.
+- Durable disconnect cleanup retains non-cancellable acquisition. Queued approval/repair cancellation cannot starve or delay the following disconnect transaction.
+- Approval, repair, synchronization, hydration, and disconnect commit main-actor presentation while still holding the lease. Disconnect uses weak presentation handles registered with the shared ledger so replacement cleanup also reconciles older live view models before release.
+- Dependency transactions check cancellation after acquisition and immediately before the first install, uninstall, or repair action. Every acquired token has an explicit release path.
+- `AppViewModeling.synchronizeOwnership()` now has a source-compatible default no-op implementation; `AppViewModel` retains its concrete reconciliation override.
+
+### RED/GREEN evidence
+
+- RED: an empty shared ledger left a stale replacement in `repairRequired`; GREEN: explicit synchronization returns it to onboarding with no error.
+- RED: sequential and queued stale repairs each called health repair after another view model cleared uninstall retry; GREEN: both make zero new integration calls and adopt the empty snapshot.
+- RED: release-order barriers observed approval as `approving`, repair as `repairRequired`, and disconnect as `monitoring` when presentation was deliberately moved after release; GREEN: all three final phases are committed before FIFO handoff.
+- RED: replacement cleanup left the earlier approval model monitoring and connected; GREEN: weak shared presentation reconciliation leaves both models onboarding and disconnected.
+- GREEN: queued and lease-grant-race cancellation tests for approval and repair make zero dependency calls, remove their waiter/token, and allow durable disconnect to run next.
+
+### Verification
+
+- `swift test --filter AppViewModelTests`: 95 passed, 0 failures.
+- `swift test --filter IntegrationInstallerTests`: 33 passed, 0 failures.
+- `swift test --filter LoginItemControllerTests`: 8 passed, 0 failures.
+- Cross-instance, commit-order, and cancellation subset: 20 consecutive runs; 10 tests per run, 0 failures.
+- `swift test`: 365 passed, 0 failures.
+- `swift build -c release`: exit 0.
+- `git diff --check`: exit 0 with no output.
+- Security/orphan scan: no polling/sleeps, debug output, dynamic evaluation, TODO/FIXME markers, force tries/casts, private-key markers, non-canary test credentials, or references to removed lifecycle flags.
+
+### Remaining concern
+
+- Presentation handles are process-memory-only and retain only weak view-model references. They coordinate live replacements but intentionally do not provide recovery after process termination.
+
+---
+
 ## Second Re-review Correction Batch
 
 Date: 2026-07-07

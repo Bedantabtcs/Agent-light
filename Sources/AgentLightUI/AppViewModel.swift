@@ -25,6 +25,10 @@ public protocol AppViewModeling: AnyObject {
     func synchronizeOwnership() async
 }
 
+public extension AppViewModeling {
+    func synchronizeOwnership() async {}
+}
+
 public enum AppPhase: Equatable, Sendable {
     case onboarding
     case verifying
@@ -87,6 +91,7 @@ public final class AppViewModel: AppViewModeling {
     @ObservationIgnored private let loginItem: any LoginItemControlling
     @ObservationIgnored private let verifier: any TuyaConnectionVerifying
     @ObservationIgnored private let ownershipLedger: AppOwnershipLedger
+    @ObservationIgnored private let presentationHandle: AppPresentationHandle
 
     @ObservationIgnored private var pendingCredentials: TuyaCredentials?
     @ObservationIgnored private var connectGeneration: UInt64 = 0
@@ -123,6 +128,9 @@ public final class AppViewModel: AppViewModeling {
         self.loginItem = loginItem
         self.verifier = verifier
         self.ownershipLedger = ownershipLedger
+        let presentationHandle = AppPresentationHandle()
+        self.presentationHandle = presentationHandle
+        presentationHandle.attach(self)
     }
 
     public convenience init(
@@ -201,7 +209,6 @@ public final class AppViewModel: AppViewModeling {
             await approvalTask.wait()
             return
         }
-        guard await hydrateOwnership() else { return }
         guard phase == .integrationReview,
               outstandingObligations.isEmpty,
               let pendingCredentials else {
@@ -216,9 +223,29 @@ public final class AppViewModel: AppViewModeling {
         let loginItem = loginItem
         let monitor = monitor
         let ledger = ownershipLedger
-        let task = Task { [weak self, integrations, credentials, monitor, ledger] in
-            let lease = await ledger.acquireLease()
+        let presentationHandle = presentationHandle
+        let task = Task { [weak self, integrations, credentials, monitor, ledger, presentationHandle] in
+            guard let lease = await ledger.acquireLeaseForCaller() else {
+                self?.cancelApproval(id: id)
+                return
+            }
+            guard !Task.isCancelled else {
+                self?.cancelApproval(id: id)
+                await ledger.releaseLease(lease)
+                return
+            }
             let existing = await ledger.snapshot()
+            guard !Task.isCancelled else {
+                self?.cancelApproval(id: id)
+                await ledger.releaseLease(lease)
+                return
+            }
+            await ledger.registerPresentationHandle(presentationHandle)
+            guard !Task.isCancelled else {
+                self?.cancelApproval(id: id)
+                await ledger.releaseLease(lease)
+                return
+            }
             let result: ApprovalResult
             if existing.hasOwnedState {
                 if existing.monitoringOwned, existing.obligations.isEmpty {
@@ -237,8 +264,8 @@ public final class AppViewModel: AppViewModeling {
                     ledger: ledger
                 )
             }
-            await ledger.releaseLease(lease)
             self?.applyApproval(result, id: id)
+            await ledger.releaseLease(lease)
         }
         let operation = SharedOperation(task: task)
         approvalTask = operation
@@ -248,6 +275,11 @@ public final class AppViewModel: AppViewModeling {
             self.approvalID = nil
         }
         await operation.wait()
+    }
+
+    private func cancelApproval(id: UUID) {
+        guard approvalID == id else { return }
+        phase = .integrationReview
     }
 
     public func pause() async {
@@ -373,23 +405,43 @@ public final class AppViewModel: AppViewModeling {
             await repairTask.wait()
             return
         }
-        guard await hydrateOwnership() else { return }
         if let pauseTask { await pauseTask.wait() }
         if let resumeTask { await resumeTask.wait() }
         let originalPhase = phase
         guard originalPhase == .monitoring || originalPhase == .paused || originalPhase == .repairRequired else {
             return
         }
+        let requestedPlan = Self.repairPlan(for: outstandingObligations, phase: originalPhase)
         let integrations = integrations
         let ledger = ownershipLedger
-        let task = Task { [weak self, integrations, ledger] in
-            let lease = await ledger.acquireLease()
+        let presentationHandle = presentationHandle
+        let task = Task { [weak self, integrations, ledger, presentationHandle] in
+            guard let lease = await ledger.acquireLeaseForCaller() else { return }
             let current = await ledger.snapshot()
-            let plan = Self.repairPlan(for: current.obligations)
+            guard !Task.isCancelled else {
+                await ledger.releaseLease(lease)
+                return
+            }
+            await ledger.registerPresentationHandle(presentationHandle)
+            guard !Task.isCancelled else {
+                await ledger.releaseLease(lease)
+                return
+            }
+            guard let plan = requestedPlan,
+                  Self.repairPlan(plan, isValidFor: current) else {
+                self?.applyRepair(
+                    .reconciled,
+                    snapshot: current,
+                    plan: requestedPlan ?? .health,
+                    originalPhase: originalPhase
+                )
+                await ledger.releaseLease(lease)
+                return
+            }
             let result = await Self.performRepair(plan, using: integrations)
             let snapshot = await Self.recordRepair(result, plan: plan, ledger: ledger)
-            await ledger.releaseLease(lease)
             self?.applyRepair(result, snapshot: snapshot, plan: plan, originalPhase: originalPhase)
+            await ledger.releaseLease(lease)
         }
         let operation = SharedOperation(task: task)
         repairTask = operation
@@ -424,12 +476,14 @@ public final class AppViewModel: AppViewModeling {
         let credentials = credentials
         let loginItem = loginItem
         let ledger = ownershipLedger
-        let cleanupTask = Task { [monitor, integrations, credentials, ledger] in
+        let presentationHandle = presentationHandle
+        let cleanupTask = Task { [monitor, integrations, credentials, ledger, presentationHandle] in
             await pendingApproval?.wait()
             await pendingPause?.wait()
             await pendingResume?.wait()
             await pendingRepair?.wait()
             let lease = await ledger.acquireLease()
+            await ledger.registerPresentationHandle(presentationHandle)
             let snapshot = await Self.cleanupOwnedState(
                 integrations: integrations,
                 credentials: credentials,
@@ -437,13 +491,13 @@ public final class AppViewModel: AppViewModeling {
                 monitor: monitor,
                 ledger: ledger
             )
+            let handles = await ledger.presentationHandles()
+            for handle in handles {
+                handle.commitSharedCleanup(snapshot)
+            }
             await ledger.releaseLease(lease)
-            return snapshot
         }
-        let task = Task { [weak self, cleanupTask] in
-            let snapshot = await cleanupTask.value
-            self?.finishDisconnect(snapshot)
-        }
+        let task = Task { await cleanupTask.value }
         let operation = SharedOperation(task: task)
         disconnectTask = operation
         operation.onFinish { [weak self, weak operation] in
@@ -466,8 +520,8 @@ public final class AppViewModel: AppViewModeling {
         pendingConnect?.cancel()
         await pendingConnect?.wait()
         guard let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        await ownershipLedger.registerPresentationHandle(presentationHandle)
         let snapshot = await ownershipLedger.snapshot()
-        await ownershipLedger.releaseLease(lease)
         syncOwnership(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
         if snapshot.obligations.isEmpty {
@@ -476,25 +530,41 @@ public final class AppViewModel: AppViewModeling {
                 integrationPreviews = []
                 phase = .onboarding
                 presentedError = nil
+            } else {
+                reconcileEmptyLedgerPresentation(snapshot)
             }
         } else {
             phase = .repairRequired
             presentedError = Self.presentationError(for: snapshot)
         }
+        await ownershipLedger.releaseLease(lease)
     }
 
     private func hydrateOwnership() async -> Bool {
         guard let lease = await ownershipLedger.acquireLeaseForCaller() else { return false }
+        await ownershipLedger.registerPresentationHandle(presentationHandle)
         let snapshot = await ownershipLedger.snapshot()
-        await ownershipLedger.releaseLease(lease)
         syncOwnership(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
-        guard !snapshot.obligations.isEmpty else { return true }
+        guard !snapshot.obligations.isEmpty else {
+            reconcileEmptyLedgerPresentation(snapshot)
+            await ownershipLedger.releaseLease(lease)
+            return true
+        }
         connectGeneration &+= 1
         connectTask?.cancel()
         phase = .repairRequired
         presentedError = Self.presentationError(for: snapshot)
+        await ownershipLedger.releaseLease(lease)
         return true
+    }
+
+    private func reconcileEmptyLedgerPresentation(_ snapshot: OwnershipSnapshot) {
+        guard !snapshot.hasOwnedState, phase == .repairRequired else { return }
+        pendingCredentials = nil
+        integrationPreviews = []
+        phase = .onboarding
+        presentedError = nil
     }
 
 #if DEBUG
@@ -580,6 +650,7 @@ public final class AppViewModel: AppViewModeling {
         ledger: AppOwnershipLedger
     ) async -> ApprovalResult {
         do {
+            try Task.checkCancellation()
             do {
                 let receipt = try await integrations.installWithReceipt()
                 guard receipt.isValid else {
@@ -793,12 +864,46 @@ public final class AppViewModel: AppViewModeling {
         }
     }
 
-    private static func repairPlan(for obligations: Set<OutstandingObligation>) -> RepairPlan {
+    fileprivate func commitSharedCleanup(_ snapshot: OwnershipSnapshot) {
+        connectGeneration &+= 1
+        connectTask?.cancel()
+        approvalTask?.cancel()
+        pauseTask?.cancel()
+        resumeTask?.cancel()
+        repairTask?.cancel()
+        cancelObservation(resetState: true)
+        finishDisconnect(snapshot)
+    }
+
+    private static func repairPlan(
+        for obligations: Set<OutstandingObligation>,
+        phase: AppPhase
+    ) -> RepairPlan? {
         if obligations.contains(.integrationUninstallRetry) { return .uninstall }
         if obligations.contains(.integrationRollbackRepair) { return .rollback }
         if obligations.contains(.integrationMixedAdoption) { return .adoptMixed }
         if obligations.contains(.integrationArtifactCleanup) { return .artifactOnly }
-        return .health
+        return phase == .monitoring || phase == .paused ? .health : nil
+    }
+
+    private static func repairPlan(
+        _ plan: RepairPlan,
+        isValidFor snapshot: OwnershipSnapshot
+    ) -> Bool {
+        switch plan {
+        case .uninstall: snapshot.obligations.contains(.integrationUninstallRetry)
+        case .rollback: snapshot.obligations.contains(.integrationRollbackRepair)
+        case .adoptMixed: snapshot.obligations.contains(.integrationMixedAdoption)
+        case .artifactOnly: snapshot.obligations.contains(.integrationArtifactCleanup)
+        case .health:
+            snapshot.monitoringOwned
+                && snapshot.obligations.isDisjoint(with: [
+                    .integrationUninstallRetry,
+                    .integrationRollbackRepair,
+                    .integrationMixedAdoption,
+                    .integrationArtifactCleanup
+                ])
+        }
     }
 
     private static func performRepair(
@@ -806,6 +911,7 @@ public final class AppViewModel: AppViewModeling {
         using integrations: any IntegrationInstalling
     ) async -> RepairResult {
         do {
+            try Task.checkCancellation()
             switch plan {
             case .uninstall:
                 try await integrations.uninstall()
@@ -866,6 +972,8 @@ public final class AppViewModel: AppViewModeling {
         case .artifactVerifiedClean:
             await ledger.remove(.integrationArtifactCleanup)
         case .artifactRetained, .invalidAdoptionReceipt, .cancelled:
+            break
+        case .reconciled:
             break
         case .failure:
             if plan == .health { await ledger.insert(.integrationRollbackRepair) }
@@ -930,6 +1038,14 @@ public final class AppViewModel: AppViewModeling {
             presentedError = error
         case .cancelled:
             break
+        case .reconciled:
+            ownsMonitoring = snapshot.monitoringOwned
+            if snapshot.obligations.isEmpty {
+                reconcileEmptyLedgerPresentation(snapshot)
+            } else {
+                phase = .repairRequired
+                presentedError = Self.presentationError(for: snapshot)
+            }
         }
     }
 
@@ -1105,6 +1221,20 @@ public final class AppViewModel: AppViewModeling {
     }
 }
 
+@MainActor
+fileprivate final class AppPresentationHandle: @unchecked Sendable {
+    nonisolated let id = UUID()
+    private weak var owner: AppViewModel?
+
+    func attach(_ owner: AppViewModel) {
+        self.owner = owner
+    }
+
+    func commitSharedCleanup(_ snapshot: OwnershipSnapshot) {
+        owner?.commitSharedCleanup(snapshot)
+    }
+}
+
 private enum ValidationError: Error {
     case invalidCredential
     case invalidEndpoint
@@ -1151,10 +1281,30 @@ public actor AppOwnershipLedger {
     }
 
     private var value = OwnershipSnapshot()
+    private var presentationHandlesByID: [UUID: AppPresentationHandle] = [:]
     private var activeLease: UUID?
     private var leaseWaiters: [LeaseWaiter] = []
+#if DEBUG
+    private var leaseCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var shouldBlockNextLeaseReleaseReturn = false
+    private var blockedLeaseRelease = false
+    private var blockedLeaseReleaseContinuation: CheckedContinuation<Void, Never>?
+    private var blockedLeaseReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var shouldBlockNextCancellableLeaseAcquisitionReturn = false
+    private var blockedCancellableLeaseAcquisition = false
+    private var blockedCancellableLeaseAcquisitionContinuation: CheckedContinuation<Void, Never>?
+    private var blockedCancellableLeaseAcquisitionWaiters: [CheckedContinuation<Void, Never>] = []
+#endif
 
     public init() {}
+
+    fileprivate func registerPresentationHandle(_ handle: AppPresentationHandle) {
+        presentationHandlesByID[handle.id] = handle
+    }
+
+    fileprivate func presentationHandles() -> [AppPresentationHandle] {
+        Array(presentationHandlesByID.values)
+    }
 
     fileprivate func acquireLease() async -> UUID {
         if activeLease == nil {
@@ -1165,6 +1315,7 @@ public actor AppOwnershipLedger {
         let id = UUID()
         let token: UUID? = await withCheckedContinuation {
             leaseWaiters.append(LeaseWaiter(id: id, continuation: $0))
+            notifyLeaseWaiterCountChanged()
         }
         guard let token else {
             preconditionFailure("A durable lease waiter cannot be canceled")
@@ -1173,25 +1324,32 @@ public actor AppOwnershipLedger {
     }
 
     fileprivate func acquireLeaseForCaller() async -> UUID? {
+        let token: UUID?
+        let wasQueued: Bool
         if activeLease == nil {
-            let token = UUID()
-            activeLease = token
-            return token
-        }
-        let id = UUID()
-        let token = await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<UUID?, Never>) in
-                if Task.isCancelled {
-                    continuation.resume(returning: nil)
-                } else {
-                    leaseWaiters.append(LeaseWaiter(id: id, continuation: continuation))
+            let immediateToken = UUID()
+            activeLease = immediateToken
+            token = immediateToken
+            wasQueued = false
+        } else {
+            wasQueued = true
+            let id = UUID()
+            token = await withTaskCancellationHandler {
+                await withCheckedContinuation { (continuation: CheckedContinuation<UUID?, Never>) in
+                    if Task.isCancelled {
+                        continuation.resume(returning: nil)
+                    } else {
+                        leaseWaiters.append(LeaseWaiter(id: id, continuation: continuation))
+                        notifyLeaseWaiterCountChanged()
+                    }
                 }
+            } onCancel: {
+                Task { await self.cancelLeaseWaiter(id) }
             }
-        } onCancel: {
-            Task { await self.cancelLeaseWaiter(id) }
         }
-        if Task.isCancelled, let token {
-            releaseLease(token)
+        if wasQueued, token != nil { await blockCancellableLeaseAcquisitionReturnIfNeeded() }
+        if wasQueued, Task.isCancelled, let token {
+            await releaseLease(token)
             return nil
         }
         return token
@@ -1200,18 +1358,95 @@ public actor AppOwnershipLedger {
     private func cancelLeaseWaiter(_ id: UUID) {
         guard let index = leaseWaiters.firstIndex(where: { $0.id == id }) else { return }
         leaseWaiters.remove(at: index).continuation.resume(returning: nil)
+        notifyLeaseWaiterCountChanged()
     }
 
-    fileprivate func releaseLease(_ token: UUID) {
+    fileprivate func releaseLease(_ token: UUID) async {
         guard activeLease == token else { return }
         guard !leaseWaiters.isEmpty else {
             activeLease = nil
+            await blockLeaseReleaseReturnIfNeeded()
             return
         }
         let next = UUID()
         activeLease = next
         leaseWaiters.removeFirst().continuation.resume(returning: next)
+        notifyLeaseWaiterCountChanged()
+        await blockLeaseReleaseReturnIfNeeded()
     }
+
+#if DEBUG
+    func acquireDurableLeaseForTesting() async -> UUID { await acquireLease() }
+
+    func releaseLeaseForTesting(_ token: UUID) async { await releaseLease(token) }
+
+    func leaseWaiterCountForTesting() -> Int { leaseWaiters.count }
+
+    func waitForLeaseWaiterCount(_ expected: Int) async {
+        if leaseWaiters.count == expected { return }
+        await withCheckedContinuation { leaseCountWaiters.append((expected, $0)) }
+    }
+
+    func blockNextLeaseReleaseReturnForTesting() {
+        shouldBlockNextLeaseReleaseReturn = true
+    }
+
+    func waitForBlockedLeaseReleaseForTesting() async {
+        if blockedLeaseRelease { return }
+        await withCheckedContinuation { blockedLeaseReleaseWaiters.append($0) }
+    }
+
+    func resumeBlockedLeaseReleaseForTesting() {
+        blockedLeaseReleaseContinuation?.resume()
+        blockedLeaseReleaseContinuation = nil
+    }
+
+    func blockNextCancellableLeaseAcquisitionReturnForTesting() {
+        shouldBlockNextCancellableLeaseAcquisitionReturn = true
+    }
+
+    func waitForBlockedCancellableLeaseAcquisitionForTesting() async {
+        if blockedCancellableLeaseAcquisition { return }
+        await withCheckedContinuation { blockedCancellableLeaseAcquisitionWaiters.append($0) }
+    }
+
+    func resumeBlockedCancellableLeaseAcquisitionForTesting() {
+        blockedCancellableLeaseAcquisitionContinuation?.resume()
+        blockedCancellableLeaseAcquisitionContinuation = nil
+    }
+
+    private func blockCancellableLeaseAcquisitionReturnIfNeeded() async {
+        guard shouldBlockNextCancellableLeaseAcquisitionReturn else { return }
+        shouldBlockNextCancellableLeaseAcquisitionReturn = false
+        blockedCancellableLeaseAcquisition = true
+        let waiters = blockedCancellableLeaseAcquisitionWaiters
+        blockedCancellableLeaseAcquisitionWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { blockedCancellableLeaseAcquisitionContinuation = $0 }
+        blockedCancellableLeaseAcquisition = false
+    }
+
+    private func blockLeaseReleaseReturnIfNeeded() async {
+        guard shouldBlockNextLeaseReleaseReturn else { return }
+        shouldBlockNextLeaseReleaseReturn = false
+        blockedLeaseRelease = true
+        let waiters = blockedLeaseReleaseWaiters
+        blockedLeaseReleaseWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+        await withCheckedContinuation { blockedLeaseReleaseContinuation = $0 }
+        blockedLeaseRelease = false
+    }
+
+    private func notifyLeaseWaiterCountChanged() {
+        let ready = leaseCountWaiters.filter { $0.0 == leaseWaiters.count }
+        leaseCountWaiters.removeAll { $0.0 == leaseWaiters.count }
+        for waiter in ready { waiter.1.resume() }
+    }
+#else
+    private func notifyLeaseWaiterCountChanged() {}
+    private func blockLeaseReleaseReturnIfNeeded() async {}
+    private func blockCancellableLeaseAcquisitionReturnIfNeeded() async {}
+#endif
 
     fileprivate func snapshot() -> OwnershipSnapshot { value }
     fileprivate func setIntegration(_ ownership: IntegrationOwnership) { value.integration = ownership }
@@ -1261,6 +1496,7 @@ private enum RepairResult {
     case invalidAdoptionReceipt
     case failure(PresentationError)
     case cancelled
+    case reconciled
 }
 
 private enum PauseResult {
