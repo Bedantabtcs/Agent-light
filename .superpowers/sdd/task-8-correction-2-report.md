@@ -224,3 +224,57 @@ swift build -c release
 Expected failure mode: a cancelled final reconnect caller must remain pending until cancellation-ignoring owned work is released; a mismatch superseded before physical write must remain disconnected and schedule the corrective winner.
 
 Next phase: none — ready for review/testing.
+
+---
+
+## Same-Winner Supersession Correction
+
+### RED
+
+Four deterministic tests were added before the production change:
+
+- same-winner instability before physical write;
+- forced-mismatch same-winner instability before physical write;
+- same-winner instability after physical write and during committed recovery save;
+- forced-mismatch same-winner instability after physical write and during committed recovery save.
+
+Command:
+
+```sh
+swift test --filter 'MonitoringOrchestratorTests.test(SameWinner|ForcedMismatchSameWinner)'
+```
+
+Result: all four tests failed. Both pre-write cases terminally disconnected instead of opening a fresh command window. Both post-write cases persisted and recorded the successful command but published disconnected. Log: `/tmp/task8-same-winner-red.log`.
+
+### GREEN
+
+- A stable current winner equal to the attempted winner is no longer treated as failure.
+- The reconnect connects only when `lastApplied` equals the attempted state and deduplication has been enabled by a successful physical write.
+- Without that physical/logical confirmation, reconnect remains pending and disconnected and schedules a fresh one-second command window.
+- Forced mismatch therefore cannot deduplicate a pre-write stale logical state, while a successful corrective physical write safely enables terminal connection without a redundant write.
+- Different-winner supersession behavior is unchanged.
+
+Focused result: 4 tests passed, 0 failures. Log: `/tmp/task8-same-winner-green.log`.
+
+### Final Verification
+
+- Direct externally bounded `xctest`: 4 critical races × 20 runs = 80/80 passed under ten-second per-run bounds. Log: `/tmp/task8-same-winner-races-20x.log`.
+- `swift test --filter MonitoringOrchestratorTests`: 95 passed, 0 failures. Log: `/tmp/task8-same-winner-orchestrator.log`.
+- `swift test --filter 'MonitoringOrchestratorTests|FileMonitoringRecoveryStoreTests'`: 134 passed, 0 failures. Log: `/tmp/task8-same-winner-relevant.log`.
+- `swift test`: 234 passed, 0 failures. Log: `/tmp/task8-same-winner-full.log`.
+- `swift build -c release`: exit 0. Log: `/tmp/task8-same-winner-release.log`.
+- `git diff --check`, production security scan, `Task.yield` scan, and orphan-process scan: clean. Log: `/tmp/task8-same-winner-security-diff.log` and `/tmp/task8-same-winner-orphans.log`.
+
+### Next Step
+
+Test with:
+
+```sh
+swift test --filter 'MonitoringOrchestratorTests|FileMonitoringRecoveryStoreTests'
+swift test
+swift build -c release
+```
+
+Expected failure mode: an unconfirmed same-winner supersession remains pending/disconnected and retries; a committed same-winner physical write connects exactly once without another write.
+
+Next phase: none — ready for review/testing.

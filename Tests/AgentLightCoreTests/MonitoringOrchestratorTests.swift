@@ -1547,6 +1547,160 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.thinking))
     }
 
+    func testSameWinnerPreWriteInstabilityRetriesBeforeConnecting() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let setup = try await makeDisconnectedOrchestrator(coordinator: coordinator)
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await coordinator.blockCurrentWinner(afterCalls: 4)
+        await setup.clock.advance(by: .seconds(1))
+        await coordinator.waitUntilCurrentWinnerIsBlocked()
+
+        await setup.orchestrator.accept(makeEvent(session: "unrelated", state: .idle))
+        await coordinator.releaseCurrentWinner()
+        await XCTAssertAsyncTrue(await eventually {
+            let completionCount = await completions.value()
+            let sleepCount = await setup.clock.sleepRequestCount()
+            return completionCount > 0 || sleepCount >= 5
+        })
+
+        guard await completions.value() == 0 else {
+            XCTFail("Same-winner pre-write instability terminally disconnected")
+            await reconnect.value
+            return
+        }
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().count, 2)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.working))
+        await XCTAssertAsyncEqual(
+            (await setup.orchestrator.currentSnapshot()).connection,
+            .connected
+        )
+    }
+
+    func testForcedMismatchSameWinnerPreWriteInstabilityStillForcesWrite() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let setup = try await makeDisconnectedOrchestrator(
+            matchResults: [.success(false)],
+            coordinator: coordinator
+        )
+        await setup.orchestrator.accept(makeEvent(session: "winner", state: .thinking))
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await setup.orchestrator.reconnect()
+            await completions.increment()
+        }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await coordinator.blockCurrentWinner(afterCalls: 4)
+        await setup.clock.advance(by: .seconds(1))
+        await coordinator.waitUntilCurrentWinnerIsBlocked()
+
+        await setup.orchestrator.accept(makeEvent(session: "unrelated", state: .idle))
+        await coordinator.releaseCurrentWinner()
+        await XCTAssertAsyncTrue(await eventually {
+            let completionCount = await completions.value()
+            let sleepCount = await setup.clock.sleepRequestCount()
+            return completionCount > 0 || sleepCount >= 5
+        })
+
+        guard await completions.value() == 0 else {
+            XCTFail("Forced mismatch deduplicated unstable pre-write winner")
+            await reconnect.value
+            return
+        }
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().count, 2)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(
+            await setup.light.appliedStates().filter { $0 == desired(.thinking) }.count,
+            2
+        )
+        await XCTAssertAsyncEqual(
+            (await setup.orchestrator.currentSnapshot()).connection,
+            .connected
+        )
+    }
+
+    func testSameWinnerPostWriteInstabilityConnectsWithoutRedundantWrite() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let store = MemoryRecoveryStore()
+        await store.blockSaveCall(6)
+        let setup = try await makeDisconnectedOrchestrator(
+            coordinator: coordinator,
+            store: store
+        )
+        let reconnect = Task { await setup.orchestrator.reconnect() }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await store.waitUntilSaveCallIsBlocked(6)
+
+        await setup.orchestrator.accept(makeEvent(session: "unrelated", state: .idle))
+        await store.releaseSaveCall(6)
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().count, 3)
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().last, desired(.working))
+        await XCTAssertAsyncEqual((await store.storedRecord())?.lastCommand, desired(.working))
+        await XCTAssertAsyncEqual(
+            (await setup.orchestrator.currentSnapshot()).connection,
+            .connected
+        )
+    }
+
+    func testForcedMismatchSameWinnerPostWriteInstabilityConnectsWithoutRedundantWrite() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let store = MemoryRecoveryStore()
+        await store.blockSaveCall(6)
+        let setup = try await makeDisconnectedOrchestrator(
+            matchResults: [.success(false)],
+            coordinator: coordinator,
+            store: store
+        )
+        await setup.orchestrator.accept(makeEvent(session: "winner", state: .thinking))
+        let reconnect = Task { await setup.orchestrator.reconnect() }
+        await setup.clock.waitForSleepCount(3)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(4)
+        await setup.clock.waitForSleepCount(4)
+        await setup.clock.advance(by: .seconds(1))
+        await setup.light.waitForOperationCount(5)
+        await store.waitUntilSaveCallIsBlocked(6)
+
+        await setup.orchestrator.accept(makeEvent(session: "unrelated", state: .idle))
+        await store.releaseSaveCall(6)
+        await reconnect.value
+
+        await XCTAssertAsyncEqual(await setup.light.appliedStates().count, 3)
+        await XCTAssertAsyncEqual(
+            await setup.light.appliedStates().filter { $0 == desired(.thinking) }.count,
+            2
+        )
+        await XCTAssertAsyncEqual((await store.storedRecord())?.lastCommand, desired(.thinking))
+        await XCTAssertAsyncEqual(
+            (await setup.orchestrator.currentSnapshot()).connection,
+            .connected
+        )
+    }
+
     func testPostHealthSnapshotRejectsTwoOverlappingInFlightAccepts() async throws {
         let coordinator = SnapshotBlockingSessionCoordinator()
         let setup = try await makeDisconnectedOrchestrator(coordinator: coordinator)

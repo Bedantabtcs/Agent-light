@@ -1631,8 +1631,16 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             return
         }
         let currentDesired = DesiredLightState(color: color)
-        guard currentWinner.sequence != attemptedWinnerSequence || currentDesired != appliedState else {
-            requestReconnectTerminal(id: id, terminal: .disconnected)
+        if currentWinner.sequence == attemptedWinnerSequence,
+           currentDesired == appliedState {
+            let physicalStateConfirmed = reconnectOperation?.allowsDeduplication == true
+                && lastApplied == appliedState
+            if physicalStateConfirmed {
+                requestReconnectTerminal(id: id, terminal: .connected)
+            } else {
+                throttleRescheduleRequested = false
+                scheduleReconnectWinnerRetry(id: id)
+            }
             return
         }
         let allowsDeduplication = reconnectOperation?.allowsDeduplication == true
