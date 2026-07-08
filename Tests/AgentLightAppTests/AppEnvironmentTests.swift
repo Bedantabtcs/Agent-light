@@ -162,6 +162,27 @@ final class AppEnvironmentTests: XCTestCase {
         )
     }
 
+    func testOwnedHookReconciliationFinishesBeforeCredentialsLoadAndRelayStart() async {
+        let recorder = EnvironmentRecorder()
+        let viewModel = EnvironmentViewModel(recorder: recorder)
+        viewModel.phase = .monitoring
+        let environment = AppEnvironment(
+            viewModel: viewModel,
+            credentials: EnvironmentCredentials(recorder: recorder, stored: nil),
+            monitor: EnvironmentMonitor(recorder: recorder),
+            relay: EnvironmentRelay(recorder: recorder),
+            coordinator: EnvironmentCoordinator(recorder: recorder),
+            prepareStorage: { recorder.append(.prepare) }
+        )
+
+        await environment.start()
+
+        XCTAssertEqual(
+            recorder.values,
+            [.prepare, .recover, .synchronize, .repairIntegrations, .loadCredentials, .relayStart]
+        )
+    }
+
     func testStoredCredentialsWithoutDurableOwnershipStopAtIntegrationReview() async throws {
         let recorder = EnvironmentRecorder()
         let stored = TuyaCredentials(
@@ -940,7 +961,7 @@ private actor VerifierService: TuyaDeviceServicing {
 
 private enum EnvironmentCall: Equatable, Sendable {
     case prepare, recover, loadCredentials, deleteCredentials, synchronize, connect, approve
-    case relayStart, relayAccept, relayStop, shutdownMonitoring, disconnect, terminate
+    case repairIntegrations, relayStart, relayAccept, relayStop, shutdownMonitoring, disconnect, terminate
     case environmentStopComplete
 }
 
@@ -1142,7 +1163,7 @@ private final class EnvironmentViewModel: AppViewModeling {
     }
     func pause() async {}
     func resume() async {}
-    func repairIntegrations() async {}
+    func repairIntegrations() async { recorder.append(.repairIntegrations) }
     func shutdownMonitoring() async {
         recorder.append(.shutdownMonitoring)
         if approvalInProgress {

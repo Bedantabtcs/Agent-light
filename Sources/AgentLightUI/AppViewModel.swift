@@ -1973,7 +1973,18 @@ public final class AppViewModel: AppViewModeling {
                     receipt = ownedReceipt
                 }
                 try await integrations.uninstall(using: receipt)
-            case .rollback, .health, .adoptMixed:
+            case .health:
+                guard let receipt = snapshot.integration.receipt else {
+                    return .invalidAdoptionReceipt
+                }
+                let updated = try await integrations.repair(using: receipt)
+                guard updated.isValid, updated.hasVerifiableFingerprints else {
+                    return .invalidAdoptionReceipt
+                }
+                return updated == receipt
+                    ? .reconciled
+                    : .success(updatedReceipt: updated)
+            case .rollback, .adoptMixed:
                 guard let receipt = snapshot.integration.receipt else {
                     return .invalidAdoptionReceipt
                 }

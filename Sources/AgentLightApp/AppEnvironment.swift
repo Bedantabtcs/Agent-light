@@ -194,6 +194,11 @@ final class AppEnvironment {
             try Task.checkCancellation()
             await viewModel.synchronizeOwnership()
             try Task.checkCancellation()
+            let synchronizedPhase = await viewModel.phase
+            if synchronizedPhase == .monitoring || synchronizedPhase == .paused {
+                await viewModel.repairIntegrations()
+            }
+            try Task.checkCancellation()
             let storedCredentials: TuyaCredentials?
             do {
                 storedCredentials = try credentials.load()

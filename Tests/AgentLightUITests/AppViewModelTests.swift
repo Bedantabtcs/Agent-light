@@ -648,6 +648,19 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.integrationRollbackRepair))
     }
 
+    func testHealthRepairWithUnchangedReceiptDoesNotRewriteOwnershipLedger() async {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        let writesBeforeRepair = await store.writes()
+
+        await harness.viewModel.repairIntegrations()
+
+        let writesAfterRepair = await store.writes()
+        XCTAssertEqual(writesAfterRepair, writesBeforeRepair)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+    }
+
     func testPreexistingHookReceiptRemainsNonOwnedAfterRelaunch() async {
         let store = MemorySetupOwnershipStore()
         let harness = ViewModelHarness(ownershipStore: store)
