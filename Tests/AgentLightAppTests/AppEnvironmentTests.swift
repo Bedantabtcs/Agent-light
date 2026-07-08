@@ -10,6 +10,20 @@ import AgentLightUI
 
 @MainActor
 final class AppEnvironmentTests: XCTestCase {
+    func testEveryStartupStateUsesStablePanelSize() {
+        for status: AppEnvironmentStatus in [.loading, .failed, .credentialResetFailed] {
+            let hosting = NSHostingView(rootView: StartupStatusView(
+                status: status,
+                retry: {},
+                quit: {}
+            ))
+            hosting.layoutSubtreeIfNeeded()
+
+            XCTAssertEqual(hosting.fittingSize.width, 380, accuracy: 1)
+            XCTAssertEqual(hosting.fittingSize.height, 540, accuracy: 1)
+        }
+    }
+
     func testStartupLoadingAndFailureRenderAtIntrinsicMenuWidthAndInvokeButtons() throws {
         let loading = NSHostingView(rootView: StartupStatusView(status: .loading, retry: {}, quit: {}))
         loading.layoutSubtreeIfNeeded()

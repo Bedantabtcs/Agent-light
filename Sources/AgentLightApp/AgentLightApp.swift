@@ -89,7 +89,7 @@ struct StartupStatusView: View {
             }
         }
         .padding(24)
-        .frame(minWidth: 380, maxWidth: 380, minHeight: 240)
+        .frame(width: 380, height: 540)
         .accessibilityIdentifier(status == .loading ? "app.startup.loading" : "app.startup.failed")
     }
 
