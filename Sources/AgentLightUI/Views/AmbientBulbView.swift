@@ -1,6 +1,19 @@
 import AgentLightCore
 import SwiftUI
 
+enum AmbientBulbMotion {
+    static let glowScale: CGFloat = 1
+    static let restingGlowOpacity = 0.62
+    static let activeGlowOpacity = 1.0
+    static let duration = 2.4
+    static let iconFrameSide: CGFloat = 48
+
+    static func glowOpacity(isPulsing: Bool, reduceMotion: Bool) -> Double {
+        guard !reduceMotion else { return activeGlowOpacity }
+        return isPulsing ? activeGlowOpacity : restingGlowOpacity
+    }
+}
+
 public struct AmbientBulbView: View {
     public let state: AgentState
     private let reduceMotionOverride: Bool?
@@ -36,7 +49,11 @@ public struct AmbientBulbView: View {
             Circle()
                 .fill(color.opacity(isHighContrast ? 0.42 : 0.28))
                 .frame(width: 122, height: 122)
-                .scaleEffect(shouldReduceMotion ? 1 : (isPulsing ? 1.08 : 0.92))
+                .scaleEffect(AmbientBulbMotion.glowScale)
+                .opacity(AmbientBulbMotion.glowOpacity(
+                    isPulsing: isPulsing,
+                    reduceMotion: shouldReduceMotion
+                ))
                 .blur(radius: isHighContrast ? 7 : 14)
             Circle()
                 .fill(.ultraThinMaterial)
@@ -45,14 +62,22 @@ public struct AmbientBulbView: View {
                     Circle().stroke(color.opacity(isHighContrast ? 1 : 0.65), lineWidth: 2)
                 }
             Image(systemName: state.bulbSymbolName)
-                .font(.system(size: 48, weight: .medium))
+                .resizable()
+                .scaledToFit()
+                .frame(
+                    width: AmbientBulbMotion.iconFrameSide,
+                    height: AmbientBulbMotion.iconFrameSide
+                )
                 .foregroundStyle(.white)
                 .shadow(color: color.opacity(0.9), radius: isHighContrast ? 8 : 18)
         }
         .frame(width: 142, height: 142)
         .onAppear {
             guard !shouldReduceMotion else { return }
-            withAnimation(.easeInOut(duration: 2.4).repeatForever(autoreverses: true)) {
+            withAnimation(
+                .easeInOut(duration: AmbientBulbMotion.duration)
+                    .repeatForever(autoreverses: true)
+            ) {
                 isPulsing = true
             }
         }

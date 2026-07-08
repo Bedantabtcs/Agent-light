@@ -38,6 +38,26 @@ final class ViewRenderingTests: XCTestCase {
         }
     }
 
+    func testAmbientBulbPulseChangesOnlyOpacity() {
+        XCTAssertEqual(AmbientBulbMotion.glowScale, 1)
+        XCTAssertEqual(
+            AmbientBulbMotion.glowOpacity(isPulsing: true, reduceMotion: true),
+            1
+        )
+        XCTAssertEqual(
+            AmbientBulbMotion.glowOpacity(isPulsing: false, reduceMotion: true),
+            1
+        )
+        XCTAssertLessThan(
+            AmbientBulbMotion.glowOpacity(isPulsing: false, reduceMotion: false),
+            AmbientBulbMotion.glowOpacity(isPulsing: true, reduceMotion: false)
+        )
+    }
+
+    func testAmbientBulbUsesFixedIconFrame() {
+        XCTAssertEqual(AmbientBulbMotion.iconFrameSide, 48)
+    }
+
     func testMenuBarContentOverridesLightHostAppearance() throws {
         NSApplication.shared.setActivationPolicy(.regular)
         let hosting = NSHostingView(rootView: AmbientDarkAppearance {
