@@ -28,15 +28,15 @@ Result before production changes: exit 1. The store retained 200 random `.monito
 ## Implementation
 
 - The configured recovery URL remains the active slot. Production composition therefore continues to use `monitoring-recovery-v1.json`; injected test URLs remain supported as alternate active names.
-- Fixed sibling names are `.monitoring-recovery.previous`, `.monitoring-recovery.tombstone`, and `.monitoring-recovery.lock`.
+- Fixed sibling names are `.monitoring-recovery.previous`, `.monitoring-recovery.tombstone`, and `.monitoring-recovery.lock`. The lock file is a validated fixed-name metadata marker; it is not the advisory-lock authority.
 - Failed pre-rotation writes reuse one `.monitoring-recovery.stage` pathname. Successful save consumes it as active; successful clear atomically absorbs it into previous. Repeated failures cannot create new names.
-- Every operation opens the exact private `0700` parent directory, opens the lock with `O_NOFOLLOW | O_CLOEXEC` at exact mode `0600`, acquires `flock(LOCK_EX)`, then reopens the lock path and compares live inode identity with the locked descriptor.
-- Lock pathname replacement causes a bounded retry. Eight consecutive replacements fail closed with `concurrentModification` before any recovery-slot mutation.
-- Active, previous, tombstone, lock, and any present stage are validated under the lock with `fstatat(..., AT_SYMLINK_NOFOLLOW)`, exact owner/type/mode checks, and link count 1.
-- Save file-syncs a fully written stage, rotates active to previous with atomic replacement, installs stage as active, directory-syncs, then revalidates the parent and lock before issuing a descriptor-pinned revision.
-- Clear authenticates the exact revision record and pinned inode, atomically rotates its owned active/previous slot to tombstone, directory-syncs, revalidates parent/lock, and invalidates sibling handles only after commit.
+- Every operation opens and validates the exact private `0700` parent directory, then holds `flock(LOCK_EX)` on that pinned directory descriptor for the full load/save/clear operation. This parent-directory vnode is the authoritative cross-instance lock.
+- The fixed lock marker is opened with `O_NOFOLLOW | O_CLOEXEC`, validated at exact mode `0600`, and compared with its reopened pathname. Replacement detected at a required revalidation fails closed with `concurrentModification`; there is no lock-file retry loop. If detection occurs after stage creation, the operation may retain that single bounded stage but cannot mutate active/previous/tombstone or create unbounded names. Replacement inside an already-authorized mutation still cannot split instances because the parent-directory lock remains held.
+- Active, previous, tombstone, lock marker, and any present stage are validated while the parent-directory lock is held with `fstatat(..., AT_SYMLINK_NOFOLLOW)`, exact owner/type/mode checks, and link count 1.
+- Save file-syncs a fully written stage, rotates active to previous with atomic replacement, installs stage as active, directory-syncs, then revalidates the parent/marker and reopens active to compare its inode with the pinned candidate before issuing a revision.
+- Clear authenticates the exact revision record and pinned inode, atomically rotates its owned active/previous slot to tombstone, directory-syncs, then revalidates parent/marker and reopens tombstone to compare its inode before returning success.
 - `load()` chooses active first. With no active it returns nil when tombstone marks a clear; otherwise it loads previous as interrupted-save recovery.
-- Post-install save failures use an atomic swap to preserve both candidate and prior generations in active/previous. Failed rollback retains the prior descriptor at previous so exact CAS clear can target it without touching the replacement.
+- Pre-commit post-install save failures may use an authenticated atomic swap to preserve both candidate and prior generations in active/previous. After the commit fsync, identity failure never rolls back over a replacement; missing committed paths are marked so a fresh load cannot resurrect previous.
 - Production never enumerates the directory and never calls recovery `unlink`/`unlinkat`; unknown names and bytes remain untouched.
 
 ## Coverage added and preserved
@@ -47,19 +47,19 @@ Added deterministic coverage for:
 - 100 repeated file-sync failures retaining one reusable stage, followed by successful stage absorption;
 - injected active URLs and byte-for-byte preservation of unknown files;
 - seeded crash states after active-to-previous, new-active installation, and active-to-tombstone boundaries;
-- 200 concurrent saves through two store instances using the same advisory lock;
+- 200 concurrent saves through two store instances using the authoritative parent-directory advisory lock;
 - stale cross-instance revision rejection;
-- one-time lock-inode replacement retry and persistent replacement fail-closed behavior;
+- lock-marker replacement before stage write and during rollback, proving a second instance cannot enter the directory mutation section until the first releases it;
 - unsafe symlink rejection in the fixed previous slot.
 
 Preserved coverage includes exact revision CAS, descriptor pinning, inode reuse, sibling descriptor invalidation, store deinitialization, save/clear replacement races, failed rollback retargeting, symlink/hard-link/owner/mode validation, file and directory fsync failures, cancellation, parent replacement, malformed/oversized records, temporary-name collision, and public opaque revision conformance.
 
 ## Verification
 
-- `swift test --filter FileMonitoringRecoveryStoreTests`: 47 tests, 0 failures.
-- `swift test --filter 'FileMonitoringRecoveryStoreTests|MonitoringOrchestratorTests|MonitoringRecoveryPublicAPITests'`: 160 tests, 0 failures (47 store, 112 orchestrator, 1 public API).
-- Ten externally bounded stress runs of the four bounded/cross-instance/lock tests: 40/40 tests passed.
-- `swift test --parallel --num-workers 2`: final run completed 534/534 tests, exit 0.
+- `swift test --filter FileMonitoringRecoveryStoreTests`: 53 tests, 0 failures.
+- `swift test --filter 'FileMonitoringRecoveryStoreTests|MonitoringOrchestratorTests|MonitoringRecoveryPublicAPITests'`: 166 tests, 0 failures (53 store, 112 orchestrator, 1 public API).
+- Twenty externally bounded runs of eight critical coordination/fsync/rollback/bounded tests: 160/160 tests passed.
+- `swift test --parallel --num-workers 2`: final run completed 540/540 tests, exit 0.
 - `swift build -c release`: passed.
 - `./scripts/build-app.sh release`: passed.
 - `codesign --verify --deep --strict "build/Agent Light.app"`: passed.
@@ -72,7 +72,7 @@ Preserved coverage includes exact revision CAS, descriptor pinning, inode reuse,
 
 ## Concerns
 
-- The first two-worker parallel run hit the pre-existing Task 3 relay subprocess wall-clock assertion: 0.73s versus the `<0.2s` test threshold. The isolated test immediately passed at 0.073s, and the fresh full two-worker rerun completed all 534 tests. Task 7 already owns removal of this CI-sensitive wall-clock assertion without weakening the deterministic 100ms transport budget.
+- The first final two-worker review run hit the pre-existing Task 3 relay subprocess wall-clock assertion: 0.58s versus the `<0.2s` test threshold. The isolated test immediately passed at 0.075s, and the fresh full two-worker rerun completed all 540 tests. Task 7 already owns removal of this CI-sensitive wall-clock assertion without weakening the deterministic 100ms transport budget.
 - Crash behavior is covered with seeded on-disk boundary states and deterministic syscall fault injection. No destructive process-kill test was run.
 - No live Tuya device was accessed; Task 5 physical timing remains covered by its deterministic clock/controller tests.
 
@@ -91,7 +91,7 @@ codesign --verify --deep --strict "build/Agent Light.app"
 plutil -lint "build/Agent Light.app/Contents/Info.plist"
 ```
 
-Expected failure mode: a persistent lock-path replacement must return `concurrentModification` without creating active/previous/tombstone/stage; a stale revision must never clear a newer active inode; successful repeated maintenance must never exceed the fixed active/previous/tombstone/lock set.
+Expected failure mode: replacing the fixed lock marker after authentication must return `concurrentModification` before any active/previous/tombstone mutation; if the stage was already created, only that one bounded stage may remain. A second store targeting the same directory inode must remain blocked on the parent-directory lock until the first releases it. A stale revision must never clear a newer active inode, and successful repeated maintenance must never exceed the fixed active/previous/tombstone/lock set.
 
 Ready-to-paste prompt:
 
