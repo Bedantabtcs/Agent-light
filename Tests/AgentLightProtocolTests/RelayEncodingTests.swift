@@ -28,7 +28,8 @@ final class RelayEncodingTests: XCTestCase {
                 sessionID: "session-from-input",
                 workspace: "Secure Access",
                 status: "completed",
-                emittedAtMilliseconds: 42
+                emittedAtMilliseconds: 42,
+                activity: nil
             )
         )
 
@@ -43,6 +44,7 @@ final class RelayEncodingTests: XCTestCase {
         )
         XCTAssertNil(object["prompt"])
         XCTAssertNil(object["token"])
+        XCTAssertNil(object["activity"])
         XCTAssertEqual(RelayEnvelope.maximumEncodedBytes, 2_048)
         XCTAssertLessThanOrEqual(encoded.count, RelayEnvelope.maximumEncodedBytes)
     }

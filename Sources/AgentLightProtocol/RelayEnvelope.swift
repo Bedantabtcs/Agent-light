@@ -11,6 +11,7 @@ public struct RelayEnvelope: Codable, Equatable, Sendable {
     public let workspace: String?
     public let status: String?
     public let emittedAtMilliseconds: Int64
+    public let activity: RelayActivity?
 
     public init(
         version: Int,
@@ -20,7 +21,8 @@ public struct RelayEnvelope: Codable, Equatable, Sendable {
         sessionID: String,
         workspace: String?,
         status: String?,
-        emittedAtMilliseconds: Int64
+        emittedAtMilliseconds: Int64,
+        activity: RelayActivity? = nil
     ) {
         self.version = version
         self.integrationID = integrationID
@@ -30,6 +32,7 @@ public struct RelayEnvelope: Codable, Equatable, Sendable {
         self.workspace = workspace
         self.status = status
         self.emittedAtMilliseconds = emittedAtMilliseconds
+        self.activity = activity
     }
 
     public static func decodeValidated(from data: Data) throws -> Self {

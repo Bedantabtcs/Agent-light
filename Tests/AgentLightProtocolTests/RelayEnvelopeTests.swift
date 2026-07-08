@@ -38,6 +38,32 @@ final class RelayEnvelopeTests: XCTestCase {
         }
     }
 
+    func testActivityRoundTripsWithoutChangingVersion() throws {
+        let envelope = makeEnvelope(activity: .reading)
+        let encoded = try JSONEncoder().encode(envelope)
+
+        XCTAssertEqual(try RelayEnvelope.decodeValidated(from: encoded), envelope)
+        XCTAssertEqual(envelope.version, 1)
+    }
+
+    func testLegacyEnvelopeWithoutActivityStillDecodes() throws {
+        let payload = Data(
+            #"{"emittedAtMilliseconds":1,"event":"PreToolUse","integrationID":"com.bbatchas.agentlight.hook.v1","sessionID":"session","source":"codex","version":1}"#.utf8
+        )
+
+        XCTAssertNil(try RelayEnvelope.decodeValidated(from: payload).activity)
+    }
+
+    func testUnknownActivityMapsToSanitizedInvalidPayload() {
+        let payload = Data(
+            #"{"activity":"CANARY_ACTIVITY","emittedAtMilliseconds":1,"event":"PreToolUse","integrationID":"com.bbatchas.agentlight.hook.v1","sessionID":"session","source":"codex","version":1}"#.utf8
+        )
+
+        assertValidationError(.invalidPayload) {
+            try RelayEnvelope.decodeValidated(from: payload)
+        }
+    }
+
     func testDecodeValidatedRejectsEachInvalidScalarBoundaryWithTypedSanitizedError() throws {
         let cases: [(RelayValidationError, RelayEnvelope)] = [
             (.unsupportedVersion, makeEnvelope(version: 2, workspace: "CANARY_VERSION")),
@@ -73,7 +99,8 @@ final class RelayEnvelopeTests: XCTestCase {
         event: String = "UserPromptSubmit",
         sessionID: String = "session",
         workspace: String? = nil,
-        status: String? = nil
+        status: String? = nil,
+        activity: RelayActivity? = nil
     ) -> RelayEnvelope {
         RelayEnvelope(
             version: version,
@@ -83,7 +110,8 @@ final class RelayEnvelopeTests: XCTestCase {
             sessionID: sessionID,
             workspace: workspace,
             status: status,
-            emittedAtMilliseconds: 1
+            emittedAtMilliseconds: 1,
+            activity: activity
         )
     }
 
