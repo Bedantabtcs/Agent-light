@@ -125,3 +125,37 @@ The final review finding was addressed with another deterministic RED/GREEN cycl
 ## Next Step
 
 Next phase: Task 6 — bounded recovery-generation rotation. Use the ready-to-paste Task 6 prompt above in a fresh chat or agent so this reviewed Task 5 state remains a clean checkpoint.
+
+## Final timer-invalidation correction
+
+The final terminal-expiry race was addressed with a deterministic RED/GREEN cycle.
+
+### Timer-invalidation RED evidence
+
+- `testTerminalExpiryInvalidatesReconnectReapplySuspendedAtFinalPermitNow` established an applied Completed winner with an active hold, made the connection fail on a different session, restored the terminal as current, and started a forced reconnect reapply after a current-state mismatch.
+- The reapply was suspended in its final `clock.now()`. Hold expiry synchronously removed the terminal token, then blocked in coordinator expiry before snapshot or desired-generation refresh.
+- Before the correction, releasing `clock.now()` allowed the stale terminal reapply to consume the t=9-second permit and enter the controller. The test expected two applies and attempt instants `[1s, 2s]`, but observed three applies and `[1s, 2s, 9s]`.
+
+### Timer-invalidation implementation
+
+- Physical command identity is now represented by `PhysicalCommandRequest`, captured when the winner is selected before any apply-path suspension.
+- The request includes the terminal-mutation epoch and exact active terminal-timer token in addition to desired state, full winner event, acceptance epoch, winner generation, lifecycle generation, throttle operation, and reconnect operation.
+- A valid terminal expiry advances the checked terminal-mutation epoch synchronously before removing the timer token or reaching its first await.
+- The post-`clock.now()` synchronous gate now requires the captured terminal epoch and, when present, the exact timer token and durable terminal identity to remain current. Expiry therefore drops stale work before permit consumption or controller entry even while snapshot refresh is still blocked.
+- Event-driven terminal cancellation remains protected by the synchronously advanced acceptance epoch; lifecycle bulk cancellation remains protected by lifecycle generation.
+
+### Timer-invalidation verification
+
+- New deterministic timer-expiry regression: passed after first failing with an extra t=9-second controller entry.
+- Related dispatch, terminal identity, durable hold, reconnect, and shared-gate set: 11 tests, 0 failures.
+- `swift test --filter MonitoringOrchestratorTests`: 111 tests, 0 failures.
+- Six timer/dispatch/epoch/gate/hold/terminal-identity regressions: 20/20 stress iterations passed.
+- `swift test --filter EndToEndPipelineTests`: 3 tests, 0 failures.
+- `swift test --parallel --num-workers 4`: 525 tests executed, exit 0 on the final post-refactor run. Unbounded parallel runs intermittently hit the known unrelated relay subprocess wall-clock threshold under saturation (0.78–0.83 seconds versus 0.2 seconds); the isolated test passed in 0.067 seconds. One post-refactor orchestrator run also stalled in an unrelated ownership-recapture test, which passed isolated in 0.003 seconds and on the immediate full 111-test rerun.
+- `swift build -c release`: passed.
+- `./scripts/build-app.sh release`: passed.
+- Code-sign verification, plist validation, and `git diff --check`: passed.
+
+## Next Step
+
+Next phase: Task 6 — bounded recovery-generation rotation. Use the ready-to-paste Task 6 prompt above in a fresh chat or agent so this reviewed Task 5 state remains a clean checkpoint.

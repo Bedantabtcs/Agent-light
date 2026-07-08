@@ -596,6 +596,9 @@ actor SnapshotBlockingSessionCoordinator: SessionCoordinating {
     private var blockedAcceptCountWaiters: [
         UUID: (Int, CheckedContinuation<Void, Never>)
     ] = [:]
+    private var shouldBlockNextTerminalExpiry = false
+    private var blockedTerminalExpiry: CheckedContinuation<Void, Never>?
+    private var terminalExpiryBlockedWaiters: [CheckedContinuation<Void, Never>] = []
 
     func blockCurrentWinner(afterCalls calls: Int) {
         precondition(calls > 0)
@@ -633,6 +636,22 @@ actor SnapshotBlockingSessionCoordinator: SessionCoordinating {
         for continuation in continuations { continuation.resume() }
     }
 
+    func blockNextTerminalExpiry() {
+        shouldBlockNextTerminalExpiry = true
+    }
+
+    func waitUntilTerminalExpiryIsBlocked() async {
+        if blockedTerminalExpiry != nil { return }
+        await withCheckedContinuation { continuation in
+            terminalExpiryBlockedWaiters.append(continuation)
+        }
+    }
+
+    func releaseTerminalExpiry() {
+        blockedTerminalExpiry?.resume()
+        blockedTerminalExpiry = nil
+    }
+
     func accept(_ event: AgentEvent) async {
         if acceptsRemainingToBlock > 0 {
             acceptsRemainingToBlock -= 1
@@ -652,6 +671,15 @@ actor SnapshotBlockingSessionCoordinator: SessionCoordinating {
     }
 
     func expireTerminalState(sessionID: String, sequence: UInt64) async {
+        if shouldBlockNextTerminalExpiry {
+            shouldBlockNextTerminalExpiry = false
+            let waiters = terminalExpiryBlockedWaiters
+            terminalExpiryBlockedWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            await withCheckedContinuation { continuation in
+                blockedTerminalExpiry = continuation
+            }
+        }
         await underlying.expireTerminalState(sessionID: sessionID, sequence: sequence)
     }
 

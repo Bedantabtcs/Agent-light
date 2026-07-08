@@ -503,6 +503,70 @@ final class MonitoringOrchestratorTests: XCTestCase {
         XCTAssertEqual(allEntries, [1_000_000_000, 7_000_000_000, 8_000_000_000])
     }
 
+    func testTerminalExpiryInvalidatesReconnectReapplySuspendedAtFinalPermitNow() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let clock = ManualClock()
+        let light = RecordingLightController(
+            attemptClock: clock,
+            applyResults: [.success(()), .failure(.permanent), .success(())],
+            matchResults: [.success(false)]
+        )
+        let orchestrator = MonitoringOrchestrator(
+            light: light,
+            recoveryStore: MemoryRecoveryStore(),
+            coordinator: coordinator,
+            clock: clock,
+            jitter: { _ in .zero },
+            isTransient: { ($0 as? TestLightError) == .transient }
+        )
+        try await orchestrator.start()
+
+        await orchestrator.accept(makeEvent(session: "terminal", state: .completed))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await orchestrator.waitForLastApplied(desired(.completed))
+        await clock.waitForSleepCount(2)
+
+        await orchestrator.accept(makeEvent(session: "failing", state: .working))
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(3)
+        await orchestrator.waitForConnection(.disconnected)
+        await orchestrator.accept(makeEvent(session: "failing", state: .idle))
+
+        let reconnect = Task { await orchestrator.reconnect() }
+        await clock.waitForSleepCount(4)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+        await clock.waitForSleepCount(5)
+        await clock.blockNextNow()
+        await coordinator.blockNextTerminalExpiry()
+        await clock.advance(by: .seconds(1))
+        await clock.waitUntilNowIsBlocked()
+
+        await clock.advance(by: .seconds(5))
+        await coordinator.waitUntilTerminalExpiryIsBlocked()
+        await clock.releaseNow()
+        await clock.waitUntilBlockedNowCompletes()
+        await XCTAssertAsyncTrue(await eventually {
+            let applyCount = await light.appliedStates().count
+            let sleepCount = await clock.sleepRequestCount()
+            return applyCount >= 3 || sleepCount >= 6
+        })
+
+        await XCTAssertAsyncEqual(await light.appliedStates().count, 2)
+        await XCTAssertAsyncEqual(
+            await light.commandAttemptNanoseconds,
+            [1_000_000_000, 2_000_000_000]
+        )
+
+        await coordinator.releaseTerminalExpiry()
+        reconnect.cancel()
+        await clock.advance(by: .seconds(20))
+        await reconnect.value
+    }
+
     func testEveryCommandAttemptIsAtLeastOneSecondApart() async throws {
         let clock = ManualClock()
         let light = RecordingLightController(

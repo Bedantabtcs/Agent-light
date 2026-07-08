@@ -228,11 +228,13 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         let lifecycleGeneration: UInt64
     }
 
-    private struct PhysicalRequestIdentity: Equatable, Sendable {
+    private struct PhysicalCommandRequest: Equatable, Sendable {
         let desired: DesiredLightState
         let winner: AgentEvent
         let winnerGeneration: UInt64
         let acceptanceEpoch: UInt64
+        let terminalMutationEpoch: UInt64
+        let terminalTimerToken: AppliedTerminalToken?
         let operationID: UUID
         let lifecycleGeneration: UInt64
         let reconnectID: UUID?
@@ -251,6 +253,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private var desiredGeneration: UInt64 = 0
     private var desiredWinnerSequence: UInt64?
     private var acceptanceEpoch: UInt64 = 0
+    private var terminalMutationEpoch: UInt64 = 0
     private var lifecycleRequest: UInt64 = 0
     private var lifecycleRequestWaiters: [(UInt64, CheckedContinuation<Void, Never>)] = []
     private var lifecycleTail: MonitoringResultCompletion?
@@ -1176,16 +1179,19 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         if let reconnectID, reconnectOperation?.id == reconnectID {
             reconnectOperation?.phase = .applying
         }
-        throttleOperationStarted = true
-        let outcome = await apply(
-            desired,
+        let commandRequest = PhysicalCommandRequest(
+            desired: desired,
             winner: winner,
             winnerGeneration: winnerGeneration,
             acceptanceEpoch: commandAcceptanceEpoch,
+            terminalMutationEpoch: terminalMutationEpoch,
+            terminalTimerToken: activeTerminalTimerToken(for: winner),
             operationID: id,
-            generation: token,
+            lifecycleGeneration: token,
             reconnectID: reconnectID
         )
+        throttleOperationStarted = true
+        let outcome = await apply(commandRequest)
         throttleOperationStarted = false
         finishThrottle(id: id)
 
@@ -1234,15 +1240,13 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
     }
 
-    private func apply(
-        _ desired: DesiredLightState,
-        winner: AgentEvent,
-        winnerGeneration: UInt64,
-        acceptanceEpoch: UInt64,
-        operationID: UUID,
-        generation token: UInt64,
-        reconnectID: UUID?
-    ) async -> SendOutcome {
+    private func apply(_ commandRequest: PhysicalCommandRequest) async -> SendOutcome {
+        let desired = commandRequest.desired
+        let winner = commandRequest.winner
+        let winnerGeneration = commandRequest.winnerGeneration
+        let operationID = commandRequest.operationID
+        let token = commandRequest.lifecycleGeneration
+        let reconnectID = commandRequest.reconnectID
         var physicallyApplied: DesiredLightState?
         do {
             try await ensureOwnership(generation: token)
@@ -1277,15 +1281,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             }
 
             try await retryPhysicalValue(
-                requestIdentity: PhysicalRequestIdentity(
-                    desired: desired,
-                    winner: winner,
-                    winnerGeneration: winnerGeneration,
-                    acceptanceEpoch: acceptanceEpoch,
-                    operationID: operationID,
-                    lifecycleGeneration: token,
-                    reconnectID: reconnectID
-                ),
+                commandRequest: commandRequest,
                 isStillCurrent: {
                     await self.isCurrent(
                         desired,
@@ -1486,7 +1482,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     private func retryPhysicalValue<T: Sendable>(
-        requestIdentity: PhysicalRequestIdentity? = nil,
+        commandRequest: PhysicalCommandRequest? = nil,
         isStillCurrent: @escaping @Sendable () async -> Bool = { true },
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
@@ -1498,7 +1494,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             do {
                 return try await performPhysicalAttempt(
                     additionalDelay: additionalDelay,
-                    requestIdentity: requestIdentity,
+                    commandRequest: commandRequest,
                     isStillCurrent: isStillCurrent,
                     operation: operation
                 )
@@ -1512,12 +1508,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
 
     private func performPhysicalAttempt<T: Sendable>(
         additionalDelay: Duration,
-        requestIdentity: PhysicalRequestIdentity?,
+        commandRequest: PhysicalCommandRequest?,
         isStillCurrent: @escaping @Sendable () async -> Bool,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         try await validatePhysicalAttemptAsynchronously(
-            requestIdentity: requestIdentity,
+            commandRequest: commandRequest,
             isStillCurrent: isStillCurrent
         )
         if let lastCommandAttempt {
@@ -1528,45 +1524,47 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 try await clock.sleep(for: requiredInterval - elapsed)
             }
             try await validatePhysicalAttemptAsynchronously(
-                requestIdentity: requestIdentity,
+                commandRequest: commandRequest,
                 isStillCurrent: isStillCurrent
             )
         }
         try await validatePhysicalAttemptAsynchronously(
-            requestIdentity: requestIdentity,
+            commandRequest: commandRequest,
             isStillCurrent: isStillCurrent
         )
         let attemptInstant = await clock.now()
-        try validatePhysicalAttemptSynchronously(requestIdentity: requestIdentity)
+        try validatePhysicalAttemptSynchronously(commandRequest: commandRequest)
         lastCommandAttempt = attemptInstant
         return try await operation()
     }
 
     private func validatePhysicalAttemptAsynchronously(
-        requestIdentity: PhysicalRequestIdentity?,
+        commandRequest: PhysicalCommandRequest?,
         isStillCurrent: @escaping @Sendable () async -> Bool
     ) async throws {
-        try validatePhysicalAttemptSynchronously(requestIdentity: requestIdentity)
+        try validatePhysicalAttemptSynchronously(commandRequest: commandRequest)
         guard await isStillCurrent() else { throw CancellationError() }
-        try validatePhysicalAttemptSynchronously(requestIdentity: requestIdentity)
+        try validatePhysicalAttemptSynchronously(commandRequest: commandRequest)
     }
 
     private func validatePhysicalAttemptSynchronously(
-        requestIdentity: PhysicalRequestIdentity?
+        commandRequest: PhysicalCommandRequest?
     ) throws {
         try Task.checkCancellation()
-        guard let requestIdentity else { return }
-        guard requestIdentity.winnerGeneration == desiredGeneration,
-              requestIdentity.acceptanceEpoch == acceptanceEpoch,
-              desiredWinnerSequence == requestIdentity.winner.sequence,
-              latestSessionSequence[requestIdentity.winner.sessionID]
-                == requestIdentity.winner.sequence,
-              snapshot.sessions.first == requestIdentity.winner,
-              requestIdentity.winner.state.color == requestIdentity.desired.color,
+        guard let commandRequest else { return }
+        guard commandRequest.winnerGeneration == desiredGeneration,
+              commandRequest.acceptanceEpoch == acceptanceEpoch,
+              commandRequest.terminalMutationEpoch == terminalMutationEpoch,
+              desiredWinnerSequence == commandRequest.winner.sequence,
+              latestSessionSequence[commandRequest.winner.sessionID]
+                == commandRequest.winner.sequence,
+              snapshot.sessions.first == commandRequest.winner,
+              commandRequest.winner.state.color == commandRequest.desired.color,
+              terminalTimerStateMatches(commandRequest),
               isSendContextCurrent(
-                  operationID: requestIdentity.operationID,
-                  generation: requestIdentity.lifecycleGeneration,
-                  reconnectID: requestIdentity.reconnectID
+                  operationID: commandRequest.operationID,
+                  generation: commandRequest.lifecycleGeneration,
+                  reconnectID: commandRequest.reconnectID
               ) else {
             throw CancellationError()
         }
@@ -1671,6 +1669,10 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
               generation == token.lifecycleGeneration,
               latestSessionSequence[token.sessionID] == token.sequence,
               terminalTasks[token.sessionID]?.token == token else { return }
+        terminalMutationEpoch = Self.requiredNextCounterValue(
+            after: terminalMutationEpoch,
+            name: "terminal mutation epoch"
+        )
         terminalTasks[token.sessionID] = nil
         if lastAppliedTerminalToken == token {
             lastAppliedTerminalToken = nil
@@ -1720,6 +1722,23 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         case .error: .seconds(12)
         default: nil
         }
+    }
+
+    private func activeTerminalTimerToken(for winner: AgentEvent) -> AppliedTerminalToken? {
+        guard terminalHold(for: winner.state) != nil,
+              let token = terminalTasks[winner.sessionID]?.token,
+              token.source == winner.source,
+              token.sessionID == winner.sessionID,
+              token.sequence == winner.sequence else {
+            return nil
+        }
+        return token
+    }
+
+    private func terminalTimerStateMatches(_ request: PhysicalCommandRequest) -> Bool {
+        guard let expected = request.terminalTimerToken else { return true }
+        return terminalTasks[request.winner.sessionID]?.token == expected
+            && lastAppliedTerminalToken == expected
     }
 
     private func canDeduplicate(
