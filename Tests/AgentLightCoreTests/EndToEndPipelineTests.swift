@@ -52,11 +52,17 @@ final class EndToEndPipelineTests: XCTestCase {
             XCTAssertTrue(commandApplied)
             let applied = await light.appliedStates().last
             await server.stop()
-            await orchestrator.stop()
+            let stop = Task { await orchestrator.stop() }
+            await orchestrator.waitForLifecycleRequestNumber(2)
+            await clock.advance(by: .seconds(1))
+            await stop.value
             return applied
         } catch {
             await server.stop()
-            await orchestrator.stop()
+            let stop = Task { await orchestrator.stop() }
+            await orchestrator.waitForLifecycleRequestNumber(2)
+            await clock.advance(by: .seconds(1))
+            await stop.value
             throw error
         }
     }

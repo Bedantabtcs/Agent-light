@@ -1,4 +1,5 @@
 import Foundation
+import AgentLightProtocol
 
 public enum LightConnectionStatus: Equatable, Sendable {
     case connected
@@ -215,8 +216,16 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     private struct TerminalTimer: Sendable {
-        let id: UUID
+        let token: AppliedTerminalToken
         let task: Task<Void, Never>
+    }
+
+    private struct AppliedTerminalToken: Equatable, Sendable {
+        let source: AgentSource
+        let sessionID: String
+        let sequence: UInt64
+        let winnerGeneration: UInt64
+        let lifecycleGeneration: UInt64
     }
 
     private let light: any TuyaLightControlling
@@ -229,6 +238,8 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
 
     private var mode: Mode = .inactive
     private var generation: UInt64 = 0
+    private var desiredGeneration: UInt64 = 0
+    private var desiredWinnerSequence: UInt64?
     private var lifecycleRequest: UInt64 = 0
     private var lifecycleRequestWaiters: [(UInt64, CheckedContinuation<Void, Never>)] = []
     private var lifecycleTail: MonitoringResultCompletion?
@@ -261,6 +272,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private var lifecycleRetryID: UUID?
     private var cancelLifecycleRetry: (@Sendable () -> Void)?
     private var terminalTasks: [String: TerminalTimer] = [:]
+    private var lastCommandAttempt: Duration?
     private var lastApplied: DesiredLightState?
     private var lastAppliedWaiters: [(DesiredLightState, CheckedContinuation<Void, Never>)] = []
     private var connection: LightConnectionStatus = .connected
@@ -371,9 +383,6 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             throttleTask?.cancel()
         }
 
-        if let hold = terminalHold(for: accepted.state) {
-            scheduleTerminalExpiry(for: accepted, after: hold, generation: token)
-        }
         await refreshSnapshot()
         guard mode == .active, generation == token else { return }
 
@@ -1101,9 +1110,11 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             reconnectOperation?.phase = .applying
         }
         throttleOperationStarted = true
+        let winnerGeneration = desiredGeneration
         let outcome = await apply(
             desired,
-            winnerSequence: winner.sequence,
+            winner: winner,
+            winnerGeneration: winnerGeneration,
             operationID: id,
             generation: token,
             reconnectID: reconnectID
@@ -1156,7 +1167,8 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
 
     private func apply(
         _ desired: DesiredLightState,
-        winnerSequence: UInt64,
+        winner: AgentEvent,
+        winnerGeneration: UInt64,
         operationID: UUID,
         generation token: UInt64,
         reconnectID: UUID?
@@ -1166,7 +1178,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             try await ensureOwnership(generation: token)
             guard await isCurrent(
                 desired,
-                winnerSequence: winnerSequence,
+                winnerSequence: winner.sequence,
                 operationID: operationID,
                 generation: token,
                 reconnectID: reconnectID
@@ -1186,7 +1198,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             )
             guard await isCurrent(
                 desired,
-                winnerSequence: winnerSequence,
+                winnerSequence: winner.sequence,
                 operationID: operationID,
                 generation: token,
                 reconnectID: reconnectID
@@ -1194,11 +1206,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 return .superseded
             }
 
-            try await retryValue(
+            try await retryPhysicalValue(
+                expectedDesiredGeneration: winnerGeneration,
                 isStillCurrent: {
                     await self.isCurrent(
                         desired,
-                        winnerSequence: winnerSequence,
+                        winnerSequence: winner.sequence,
                         operationID: operationID,
                         generation: token,
                         reconnectID: reconnectID
@@ -1210,7 +1223,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             physicallyApplied = desired
             let currentAfterApply = await isCurrent(
                 desired,
-                winnerSequence: winnerSequence,
+                winnerSequence: winner.sequence,
                 operationID: operationID,
                 generation: token,
                 reconnectID: reconnectID
@@ -1229,14 +1242,20 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             )
             let currentAfterSave = await isCurrent(
                 desired,
-                winnerSequence: winnerSequence,
+                winnerSequence: winner.sequence,
                 operationID: operationID,
                 generation: token,
                 reconnectID: reconnectID
             )
-            return currentAfterApply && currentAfterSave
-                ? .applied(desired)
-                : .physicallyAppliedButSuperseded(desired)
+            if currentAfterApply && currentAfterSave {
+                scheduleTerminalExpiryIfNeeded(
+                    for: winner,
+                    winnerGeneration: winnerGeneration,
+                    lifecycleGeneration: token
+                )
+                return .applied(desired)
+            }
+            return .physicallyAppliedButSuperseded(desired)
         } catch is CancellationError {
             return physicallyApplied.map(SendOutcome.failed) ?? .superseded
         } catch {
@@ -1323,7 +1342,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         restoreCompletion = completion
         restoreTaskID = id
         do {
-            try await retryValue { try await self.light.restore(expectedBaseline) }
+            try await retryPhysicalValue { try await self.light.restore(expectedBaseline) }
             if restoreTaskID == id {
                 restoreCompletion = nil
                 restoreTaskID = nil
@@ -1387,6 +1406,60 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         throw MonitoringOrchestratorError.operationFailed
     }
 
+    private func retryPhysicalValue<T: Sendable>(
+        expectedDesiredGeneration: UInt64? = nil,
+        isStillCurrent: @escaping @Sendable () async -> Bool = { true },
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let retryBases: [Duration] = [.milliseconds(500), .seconds(1)]
+        for attempt in 0...retryBases.count {
+            let additionalDelay = attempt == 0
+                ? Duration.zero
+                : boundedJitter(for: retryBases[attempt - 1])
+            try await awaitCommandPermit(
+                additionalDelay: additionalDelay,
+                expectedDesiredGeneration: expectedDesiredGeneration,
+                isStillCurrent: isStillCurrent
+            )
+            do {
+                return try await operation()
+            } catch {
+                guard attempt < retryBases.count, isTransient(error) else { throw error }
+                guard await isStillCurrent() else { throw CancellationError() }
+            }
+        }
+        throw MonitoringOrchestratorError.operationFailed
+    }
+
+    private func awaitCommandPermit(
+        additionalDelay: Duration,
+        expectedDesiredGeneration: UInt64?,
+        isStillCurrent: @escaping @Sendable () async -> Bool
+    ) async throws {
+        guard expectedDesiredGeneration == nil
+            || expectedDesiredGeneration == desiredGeneration else {
+            throw CancellationError()
+        }
+        guard await isStillCurrent() else { throw CancellationError() }
+        if let lastCommandAttempt {
+            let current = await clock.now()
+            let elapsed = current - lastCommandAttempt
+            let requiredInterval = Duration.seconds(1) + additionalDelay
+            if elapsed < requiredInterval {
+                try await clock.sleep(for: requiredInterval - elapsed)
+            }
+            guard await isStillCurrent() else { throw CancellationError() }
+        }
+        try Task.checkCancellation()
+        let attemptInstant = await clock.now()
+        try Task.checkCancellation()
+        guard expectedDesiredGeneration == nil
+            || expectedDesiredGeneration == desiredGeneration else {
+            throw CancellationError()
+        }
+        lastCommandAttempt = attemptInstant
+    }
+
     private func retryLifecycle<T: Sendable>(
         request: UInt64,
         operation: @escaping @Sendable () async throws -> T
@@ -1448,13 +1521,21 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         min(max(jitter(base), .zero), .milliseconds(250))
     }
 
-    private func scheduleTerminalExpiry(
+    private func scheduleTerminalExpiryIfNeeded(
         for event: AgentEvent,
-        after hold: Duration,
-        generation token: UInt64
+        winnerGeneration: UInt64,
+        lifecycleGeneration: UInt64
     ) {
+        guard let hold = terminalHold(for: event.state) else { return }
         let sessionID = event.sessionID
-        let id = UUID()
+        let token = AppliedTerminalToken(
+            source: event.source,
+            sessionID: sessionID,
+            sequence: event.sequence,
+            winnerGeneration: winnerGeneration,
+            lifecycleGeneration: lifecycleGeneration
+        )
+        terminalTasks[sessionID]?.task.cancel()
         let task = Task { [clock, weak self] in
             do {
                 try await clock.sleep(for: hold)
@@ -1463,34 +1544,28 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             }
             guard !Task.isCancelled else { return }
             await self?.expireTerminal(
-                sessionID: sessionID,
-                sequence: event.sequence,
-                timerID: id,
-                generation: token
+                token: token
             )
         }
-        terminalTasks[sessionID] = TerminalTimer(id: id, task: task)
+        terminalTasks[sessionID] = TerminalTimer(token: token, task: task)
     }
 
-    private func expireTerminal(
-        sessionID: String,
-        sequence: UInt64,
-        timerID: UUID,
-        generation token: UInt64
-    ) async {
+    private func expireTerminal(token: AppliedTerminalToken) async {
         guard mode == .active,
-              generation == token,
-              latestSessionSequence[sessionID] == sequence else { return }
-        if terminalTasks[sessionID]?.id == timerID {
-            terminalTasks[sessionID] = nil
-        }
-        await coordinator.expireTerminalState(sessionID: sessionID, sequence: sequence)
-        guard mode == .active, generation == token else { return }
+              generation == token.lifecycleGeneration,
+              latestSessionSequence[token.sessionID] == token.sequence,
+              terminalTasks[token.sessionID]?.token == token else { return }
+        terminalTasks[token.sessionID] = nil
+        await coordinator.expireTerminalState(
+            sessionID: token.sessionID,
+            sequence: token.sequence
+        )
+        guard mode == .active, generation == token.lifecycleGeneration else { return }
         await refreshSnapshot()
         let winnerSnapshot = await stableWinnerSnapshot {
-            mode == .active && generation == token
+            mode == .active && generation == token.lifecycleGeneration
         }
-        guard mode == .active, generation == token else { return }
+        guard mode == .active, generation == token.lifecycleGeneration else { return }
         guard let winnerSnapshot else {
             scheduleThrottleIfNeeded()
             return
@@ -1501,11 +1576,11 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 await cancelReconnectAndWait(id: reconnectID)
             }
             await cancelThrottleAndWait()
-            guard mode == .active, generation == token else { return }
+            guard mode == .active, generation == token.lifecycleGeneration else { return }
             let drainedWinnerSnapshot = await stableWinnerSnapshot {
-                mode == .active && generation == token
+                mode == .active && generation == token.lifecycleGeneration
             }
-            guard mode == .active, generation == token else { return }
+            guard mode == .active, generation == token.lifecycleGeneration else { return }
             guard let drainedWinnerSnapshot else {
                 scheduleThrottleIfNeeded()
                 return
@@ -1531,6 +1606,11 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private func refreshSnapshot() async {
         resumeConnectionWaiters()
         let sessions = await coordinator.snapshots()
+        let nextWinnerSequence = sessions.first?.sequence
+        if nextWinnerSequence != desiredWinnerSequence {
+            desiredWinnerSequence = nextWinnerSequence
+            desiredGeneration &+= 1
+        }
         snapshot = MonitoringSnapshot(
             state: sessions.first?.state ?? .idle,
             sessions: sessions,

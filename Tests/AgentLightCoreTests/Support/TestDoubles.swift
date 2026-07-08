@@ -67,6 +67,14 @@ actor ManualClock: AgentLightClock {
         }
     }
 
+    func currentNanoseconds() -> Int64 {
+        nowNanoseconds
+    }
+
+    func now() -> Duration {
+        .nanoseconds(nowNanoseconds)
+    }
+
     func sleeperCount() -> Int {
         sleepers.count
     }
@@ -148,6 +156,7 @@ actor RecordingLightController: TuyaLightControlling {
     }
 
     private let baseline: BulbBaseline
+    private let attemptClock: ManualClock?
     private var captureResults: [Result<BulbBaseline, TestLightError>]
     private var applyResults: [Result<Void, TestLightError>]
     private var restoreResults: [Result<Void, TestLightError>]
@@ -170,16 +179,19 @@ actor RecordingLightController: TuyaLightControlling {
     private var matchCancellationWaiters: [UUID: (Int, CheckedContinuation<Void, Never>)] = [:]
     private(set) var operations: [Operation] = []
     private(set) var physicalPhases: [PhysicalPhase] = []
+    private(set) var commandAttemptNanoseconds: [Int64] = []
     private var operationWaiters: [UUID: (Int, CheckedContinuation<Void, Never>)] = [:]
 
     init(
         baseline: BulbBaseline = .testBaseline,
+        attemptClock: ManualClock? = nil,
         captureResults: [Result<BulbBaseline, TestLightError>] = [],
         applyResults: [Result<Void, TestLightError>] = [],
         restoreResults: [Result<Void, TestLightError>] = [],
         matchResults: [Result<Bool, TestLightError>] = []
     ) {
         self.baseline = baseline
+        self.attemptClock = attemptClock
         self.captureResults = captureResults
         self.applyResults = applyResults
         self.restoreResults = restoreResults
@@ -209,6 +221,9 @@ actor RecordingLightController: TuyaLightControlling {
     }
 
     func apply(_ state: DesiredLightState) async throws {
+        if let attemptClock {
+            commandAttemptNanoseconds.append(await attemptClock.currentNanoseconds())
+        }
         operations.append(.apply(state))
         physicalPhases.append(.applyStarted(state))
         resumeOperationWaiters()
@@ -256,6 +271,9 @@ actor RecordingLightController: TuyaLightControlling {
     }
 
     func restore(_ baseline: BulbBaseline) async throws {
+        if let attemptClock {
+            commandAttemptNanoseconds.append(await attemptClock.currentNanoseconds())
+        }
         operations.append(.restore(baseline))
         physicalPhases.append(.restoreStarted(baseline))
         resumeOperationWaiters()
