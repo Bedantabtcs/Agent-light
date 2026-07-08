@@ -78,11 +78,61 @@ final class AgentAdapterTests: XCTestCase {
             try CursorAdapter().map(envelope(source: .cursor, event: "stop", status: "completed"), sequence: 3).state,
             .completed
         )
-        for status in ["aborted", "error"] {
+        XCTAssertEqual(
+            try CursorAdapter().map(envelope(source: .cursor, event: "stop", status: "error"), sequence: 4).state,
+            .error
+        )
+    }
+
+    func testToolStartUsesSanitizedActivityCategory() throws {
+        let cases: [(RelayActivity?, AgentState)] = [
+            (.reading, .reading), (.editing, .editing), (.testing, .testing),
+            (.working, .working), (nil, .working)
+        ]
+        for (activity, expected) in cases {
             XCTAssertEqual(
-                try CursorAdapter().map(envelope(source: .cursor, event: "stop", status: status), sequence: 4).state,
-                .error
+                try CodexAdapter().map(
+                    envelope(source: .codex, event: "PreToolUse", activity: activity),
+                    sequence: 1
+                ).state,
+                expected
             )
+            XCTAssertEqual(
+                try ClaudeCodeAdapter().map(
+                    envelope(source: .claudeCode, event: "PreToolUse", activity: activity),
+                    sequence: 1
+                ).state,
+                expected
+            )
+        }
+    }
+
+    func testCursorDistinguishesCancelledFromError() throws {
+        XCTAssertEqual(
+            try CursorAdapter().map(envelope(source: .cursor, event: "stop", status: "aborted"), sequence: 1).state,
+            .cancelled
+        )
+        XCTAssertEqual(
+            try CursorAdapter().map(envelope(source: .cursor, event: "stop", status: "error"), sequence: 2).state,
+            .error
+        )
+    }
+
+    func testCursorToolStartsUseSanitizedActivityCategory() throws {
+        let cases: [(RelayActivity?, AgentState)] = [
+            (.reading, .reading), (.editing, .editing), (.testing, .testing),
+            (.working, .working), (nil, .working)
+        ]
+        for event in ["preToolUse", "beforeShellExecution"] {
+            for (activity, expected) in cases {
+                XCTAssertEqual(
+                    try CursorAdapter().map(
+                        envelope(source: .cursor, event: event, activity: activity),
+                        sequence: 1
+                    ).state,
+                    expected
+                )
+            }
         }
     }
 
@@ -127,7 +177,12 @@ final class AgentAdapterTests: XCTestCase {
         }
     }
 
-    private func envelope(source: AgentSource, event: String, status: String? = nil) -> RelayEnvelope {
+    private func envelope(
+        source: AgentSource,
+        event: String,
+        status: String? = nil,
+        activity: RelayActivity? = nil
+    ) -> RelayEnvelope {
         RelayEnvelope(
             version: 1,
             integrationID: AppIdentity.integrationIdentifier,
@@ -136,7 +191,8 @@ final class AgentAdapterTests: XCTestCase {
             sessionID: "session",
             workspace: "Workspace",
             status: status,
-            emittedAtMilliseconds: 1
+            emittedAtMilliseconds: 1,
+            activity: activity
         )
     }
 

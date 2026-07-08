@@ -7,7 +7,6 @@ public struct ClaudeCodeAdapter: AgentEventAdapter {
         guard envelope.source == .claudeCode else { throw AdapterError.wrongSource }
         let states: [String: AgentState] = [
             "UserPromptSubmit": .thinking,
-            "PreToolUse": .working,
             "PostToolUse": .thinking,
             "PermissionRequest": .needsYou,
             "Stop": .completed,
@@ -15,7 +14,9 @@ public struct ClaudeCodeAdapter: AgentEventAdapter {
             "SessionEnd": .idle
         ]
         let state: AgentState?
-        if envelope.event == "Notification" {
+        if envelope.event == "PreToolUse" {
+            state = agentState(for: envelope.activity)
+        } else if envelope.event == "Notification" {
             state = switch envelope.status {
             case "agent_needs_input": .needsYou
             case "agent_completed": .completed

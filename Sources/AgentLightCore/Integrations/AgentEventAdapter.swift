@@ -9,6 +9,15 @@ public enum AdapterError: Error, Equatable {
     case unsupportedEvent(String)
 }
 
+func agentState(for activity: RelayActivity?) -> AgentState {
+    switch activity {
+    case .reading: .reading
+    case .editing: .editing
+    case .testing: .testing
+    case .working, nil: .working
+    }
+}
+
 func makeAgentEvent(from envelope: RelayEnvelope, state: AgentState, sequence: UInt64) -> AgentEvent {
     AgentEvent(
         source: envelope.source,

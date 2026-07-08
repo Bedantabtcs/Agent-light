@@ -64,8 +64,12 @@ public struct AmbientBulbView: View {
 
     private var symbolName: String {
         switch state {
+        case .reading: "book.closed.fill"
+        case .editing: "pencil"
+        case .testing: "checkmark.seal.fill"
         case .needsYou: "lightbulb.led.fill"
         case .completed: "checkmark.circle.fill"
+        case .cancelled: "xmark.octagon.fill"
         case .error: "exclamationmark.triangle.fill"
         case .idle: "lightbulb.slash"
         case .thinking, .working: "lightbulb.led.fill"
@@ -78,8 +82,12 @@ extension AgentState {
         switch self {
         case .thinking: "Thinking"
         case .working: "Working"
+        case .reading: "Reading"
+        case .editing: "Editing"
+        case .testing: "Testing"
         case .needsYou: "Needs You"
         case .completed: "Completed"
+        case .cancelled: "Cancelled"
         case .error: "Error"
         case .idle: "Idle"
         }

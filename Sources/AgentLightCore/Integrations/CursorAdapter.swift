@@ -7,17 +7,18 @@ public struct CursorAdapter: AgentEventAdapter {
         guard envelope.source == .cursor else { throw AdapterError.wrongSource }
         let states: [String: AgentState] = [
             "beforeSubmitPrompt": .thinking,
-            "preToolUse": .working,
-            "beforeShellExecution": .working,
             "postToolUse": .thinking,
             "afterShellExecution": .thinking,
             "sessionEnd": .idle
         ]
         let state: AgentState?
-        if envelope.event == "stop" {
+        if envelope.event == "preToolUse" || envelope.event == "beforeShellExecution" {
+            state = agentState(for: envelope.activity)
+        } else if envelope.event == "stop" {
             state = switch envelope.status {
             case "completed": .completed
-            case "aborted", "error": .error
+            case "aborted": .cancelled
+            case "error": .error
             default: nil
             }
         } else {
