@@ -2,6 +2,19 @@ import XCTest
 @testable import AgentLightCore
 
 final class JSONNumberTests: XCTestCase {
+    func testExactIntegerAcceptsPlatformIntegerLimits() throws {
+        XCTAssertEqual(try JSONNumber(lexeme: String(Int.max)).exactInteger, Int.max)
+        XCTAssertEqual(try JSONNumber(lexeme: String(Int.min)).exactInteger, Int.min)
+    }
+
+    func testExactIntegerRejectsImmediatelyAdjacentPlatformOverflow() throws {
+        let aboveMaximum = String(UInt(Int.max) + 1)
+        let belowMinimum = "-" + String(UInt(Int.max) + 2)
+
+        XCTAssertNil(try JSONNumber(lexeme: aboveMaximum).exactInteger)
+        XCTAssertNil(try JSONNumber(lexeme: belowMinimum).exactInteger)
+    }
+
     func testExactIntegerAcceptsMathematicallyIntegralLexemes() throws {
         let cases: [(String, Int)] = [
             ("0", 0),

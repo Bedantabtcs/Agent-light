@@ -102,7 +102,7 @@ final class RelayDeadlineTests: XCTestCase {
         XCTAssertEqual(oversizedSystem.snapshot().openCount, 0)
     }
 
-    func testRelayProcessMissingSocketIsSilentFastAndFailOpen() throws {
+    func testRelayProcessMissingSocketIsSilentAndFailOpen() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -110,15 +110,12 @@ final class RelayDeadlineTests: XCTestCase {
         let executable = packageRoot.appending(path: ".build/debug/AgentLightRelay")
         let fixedHome = FileManager.default.temporaryDirectory
             .appending(path: UUID().uuidString, directoryHint: .isDirectory)
-        let timingFile = fixedHome.appending(path: "relay-time.txt")
         try FileManager.default.createDirectory(at: fixedHome, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: fixedHome) }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/time")
+        process.executableURL = executable
         process.arguments = [
-            "-p", "-o", timingFile.path,
-            executable.path,
             "--integration-id", AppIdentity.integrationIdentifier,
             "--source", "codex",
             "--event", "UserPromptSubmit"
@@ -137,15 +134,8 @@ final class RelayDeadlineTests: XCTestCase {
         try inputPipe.fileHandleForWriting.write(contentsOf: Data(#"{"thread_id":"deadline-test"}"#.utf8))
         try inputPipe.fileHandleForWriting.close()
         process.waitUntilExit()
-        let timing = try String(contentsOf: timingFile, encoding: .utf8)
-        let realSeconds = try XCTUnwrap(
-            timing.split(separator: "\n")
-                .first(where: { $0.hasPrefix("real ") })
-                .flatMap { Double($0.dropFirst("real ".count)) }
-        )
 
         XCTAssertEqual(process.terminationStatus, 0)
-        XCTAssertLessThan(realSeconds, 0.2)
         XCTAssertEqual(outputPipe.fileHandleForReading.readDataToEndOfFile(), Data())
         XCTAssertEqual(errorPipe.fileHandleForReading.readDataToEndOfFile(), Data())
     }

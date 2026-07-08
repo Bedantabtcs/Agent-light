@@ -4,8 +4,9 @@ public protocol TuyaHTTPTransport: Sendable {
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse)
 }
 
-public enum TuyaHTTPTransportError: Error, Sendable {
+public enum TuyaTransportError: Error, Equatable, Sendable {
     case invalidResponse
+    case invalidResponseOrigin
 }
 
 enum TuyaRedirectPolicy {
@@ -38,6 +39,14 @@ enum TuyaRedirectPolicy {
 }
 
 private final class TuyaRedirectRejectingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    typealias DecisionObserver = @Sendable (URLRequest, URLRequest?) -> Void
+
+    private let decisionObserver: DecisionObserver?
+
+    init(decisionObserver: DecisionObserver? = nil) {
+        self.decisionObserver = decisionObserver
+    }
+
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -45,7 +54,12 @@ private final class TuyaRedirectRejectingDelegate: NSObject, URLSessionTaskDeleg
         newRequest request: URLRequest,
         completionHandler: @escaping @Sendable (URLRequest?) -> Void
     ) {
-        completionHandler(TuyaRedirectPolicy.redirectedRequest(from: task.originalRequest ?? request, to: request))
+        let redirectedRequest = TuyaRedirectPolicy.redirectedRequest(
+            from: task.originalRequest ?? request,
+            to: request
+        )
+        decisionObserver?(request, redirectedRequest)
+        completionHandler(redirectedRequest)
     }
 }
 
@@ -60,13 +74,26 @@ public struct URLSessionTuyaHTTPTransport: TuyaHTTPTransport {
         )
     }
 
+    init(
+        configuration: URLSessionConfiguration,
+        redirectDecisionObserver: @escaping @Sendable (URLRequest, URLRequest?) -> Void
+    ) {
+        session = URLSession(
+            configuration: configuration,
+            delegate: TuyaRedirectRejectingDelegate(decisionObserver: redirectDecisionObserver),
+            delegateQueue: nil
+        )
+    }
+
     public func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let (data, response) = try await session.data(for: request)
-        guard let response = response as? HTTPURLResponse,
-              let requestURL = request.url,
+        guard let response = response as? HTTPURLResponse else {
+            throw TuyaTransportError.invalidResponse
+        }
+        guard let requestURL = request.url,
               let responseURL = response.url,
               TuyaRedirectPolicy.hasSameOrigin(requestURL, responseURL) else {
-            throw TuyaHTTPTransportError.invalidResponse
+            throw TuyaTransportError.invalidResponseOrigin
         }
         return (data, response)
     }

@@ -1102,6 +1102,52 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(registeredReceipt?.login.rawValue, "registered")
     }
 
+    func testNewPendingApprovalIsCompensatedWhenMonitoringFails() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        harness.loginItem.registerResult = .requiresApproval
+        await harness.monitor.setStartError(TuyaClientError.transport)
+        await harness.viewModel.connect(using: harness.validDraft)
+
+        await harness.viewModel.approveIntegrations()
+
+        XCTAssertEqual(harness.viewModel.phase, .integrationReview)
+        XCTAssertEqual(harness.viewModel.presentedError, .bulbOffline)
+        XCTAssertEqual(harness.loginItem.currentStatus, .notRegistered)
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
+        XCTAssertNil(harness.credentials.storedCredentials())
+        let compensatedReceipt = try await store.load()
+        XCTAssertNil(compensatedReceipt)
+        let integrationCounts = await harness.integrations.counts()
+        XCTAssertEqual(integrationCounts.uninstall, 1)
+    }
+
+    func testCodexConfirmationDoesNotMutateReceiptAndFreshViewModelRequiresTrust() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        let currentReceipt = await store.current()
+        let receiptBeforeConfirmation = try XCTUnwrap(currentReceipt)
+        let writesBeforeConfirmation = await store.writes()
+
+        harness.viewModel.confirmCodexTrust()
+
+        let receiptAfterConfirmation = await store.current()
+        let writesAfterConfirmation = await store.writes()
+        XCTAssertEqual(harness.viewModel.codexTrustStatus, .userConfirmed)
+        XCTAssertEqual(receiptAfterConfirmation, receiptBeforeConfirmation)
+        XCTAssertEqual(writesAfterConfirmation, writesBeforeConfirmation)
+
+        let freshHarness = ViewModelHarness(ownershipStore: store)
+        freshHarness.credentials.seed(try XCTUnwrap(harness.credentials.storedCredentials()))
+        freshHarness.loginItem.currentStatus = .enabled
+        await freshHarness.viewModel.synchronizeOwnership()
+
+        let receiptAfterRelaunch = await store.current()
+        XCTAssertEqual(freshHarness.viewModel.codexTrustStatus, .required)
+        XCTAssertEqual(receiptAfterRelaunch, receiptBeforeConfirmation)
+    }
+
     func testExplicitDisconnectCanRemoveVerifiedPendingRegistration() async throws {
         let harness = ViewModelHarness()
         harness.loginItem.registerResult = .requiresApproval

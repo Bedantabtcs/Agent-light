@@ -32,6 +32,37 @@ public struct RelayEnvelope: Codable, Equatable, Sendable {
         self.emittedAtMilliseconds = emittedAtMilliseconds
     }
 
+    public static func decodeValidated(from data: Data) throws -> Self {
+        guard data.count <= maximumEncodedBytes else {
+            throw RelayValidationError.payloadTooLarge
+        }
+        do {
+            return try JSONDecoder().decode(Self.self, from: data).validated()
+        } catch let error as RelayValidationError {
+            throw error
+        } catch let error as DecodingError where isSourceDecodingError(error) {
+            throw RelayValidationError.invalidSource
+        } catch {
+            throw RelayValidationError.invalidPayload
+        }
+    }
+
+    private static func isSourceDecodingError(_ error: DecodingError) -> Bool {
+        let codingPath: [any CodingKey]
+        switch error {
+        case let .dataCorrupted(context),
+             let .typeMismatch(_, context),
+             let .valueNotFound(_, context):
+            codingPath = context.codingPath
+        case let .keyNotFound(key, context):
+            if key.stringValue == "source" { return true }
+            codingPath = context.codingPath
+        @unknown default:
+            return false
+        }
+        return codingPath.contains { $0.stringValue == "source" }
+    }
+
     public func validated() throws -> Self {
         guard version == 1 else { throw RelayValidationError.unsupportedVersion }
         guard integrationID == AppIdentity.integrationIdentifier else { throw RelayValidationError.invalidIntegration }
@@ -44,8 +75,11 @@ public struct RelayEnvelope: Codable, Equatable, Sendable {
 }
 
 public enum RelayValidationError: Error, Equatable {
+    case payloadTooLarge
+    case invalidPayload
     case unsupportedVersion
     case invalidIntegration
+    case invalidSource
     case invalidEvent
     case invalidSession
     case invalidWorkspace

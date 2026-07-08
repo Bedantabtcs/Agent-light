@@ -10,9 +10,7 @@ public actor RelayEventCoordinator {
     }
 
     public func accept(_ data: Data) async {
-        guard data.count <= RelayEnvelope.maximumEncodedBytes,
-              let decoded = try? JSONDecoder().decode(RelayEnvelope.self, from: data),
-              let envelope = try? decoded.validated() else { return }
+        guard let envelope = try? RelayEnvelope.decodeValidated(from: data) else { return }
         let next = sequence &+ 1
         guard let event = try? adapter(for: envelope.source).map(envelope, sequence: next) else { return }
         sequence = next

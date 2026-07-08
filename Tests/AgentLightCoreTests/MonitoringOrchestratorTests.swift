@@ -235,7 +235,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncEqual(await light.restoreCount(), 1)
     }
 
-    func testSupersededLateTerminalCommitCannotExpireNewerSourceEvent() async throws {
+    func testSupersededLateTerminalCommitPreservesNewerSourceThenFallsBackByIdentity() async throws {
         let clock = ManualClock()
         let light = RecordingLightController(attemptClock: clock)
         let store = MemoryRecoveryStore()
@@ -259,7 +259,23 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .error)
         await XCTAssertAsyncEqual(await light.restoreCount(), 0)
         await clock.advance(by: .seconds(4))
+        let fellBackToOlderIdentity = await eventually {
+            let state = await orchestrator.currentSnapshot().state
+            let sleepCount = await clock.sleepRequestCount()
+            return state == .completed && sleepCount >= 4
+        }
+        XCTAssertTrue(fellBackToOlderIdentity)
+        guard fellBackToOlderIdentity else { return }
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .completed)
+        await XCTAssertAsyncEqual(await light.restoreCount(), 0)
+        await clock.advance(by: .seconds(1))
         await light.waitForOperationCount(4)
+        await orchestrator.waitForLastApplied(desired(.completed))
+        await clock.waitForSleepCount(5)
+        await clock.advance(by: .seconds(8))
+        await XCTAssertAsyncTrue(await eventually {
+            await light.restoreCount() == 1
+        })
         await XCTAssertAsyncEqual(await light.restoreCount(), 1)
     }
 

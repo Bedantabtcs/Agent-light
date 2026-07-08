@@ -568,8 +568,12 @@ actor BlockingSessionCoordinator: SessionCoordinating {
         await underlying.accept(event)
     }
 
-    func expireTerminalState(sessionID: String, sequence: UInt64) async {
-        await underlying.expireTerminalState(sessionID: sessionID, sequence: sequence)
+    func expireTerminalState(source: AgentSource, sessionID: String, sequence: UInt64) async {
+        await underlying.expireTerminalState(
+            source: source,
+            sessionID: sessionID,
+            sequence: sequence
+        )
     }
 
     func currentWinner() async -> AgentEvent? {
@@ -670,7 +674,7 @@ actor SnapshotBlockingSessionCoordinator: SessionCoordinating {
         await underlying.accept(event)
     }
 
-    func expireTerminalState(sessionID: String, sequence: UInt64) async {
+    func expireTerminalState(source: AgentSource, sessionID: String, sequence: UInt64) async {
         if shouldBlockNextTerminalExpiry {
             shouldBlockNextTerminalExpiry = false
             let waiters = terminalExpiryBlockedWaiters
@@ -680,7 +684,11 @@ actor SnapshotBlockingSessionCoordinator: SessionCoordinating {
                 blockedTerminalExpiry = continuation
             }
         }
-        await underlying.expireTerminalState(sessionID: sessionID, sequence: sequence)
+        await underlying.expireTerminalState(
+            source: source,
+            sessionID: sessionID,
+            sequence: sequence
+        )
     }
 
     func currentWinner() async -> AgentEvent? {

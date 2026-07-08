@@ -71,13 +71,19 @@ Agent Light records only that the user confirmed this step; it cannot verify or 
 - Signed Tuya requests can go only to an allowlisted regional HTTPS origin. The Access Secret is used for local request signing and is not sent as a request field.
 - Hook input is reduced to source, event, session identifier, workspace basename, status, and emission time. Prompt text, response text, reasoning, tool arguments, and source code are neither persisted nor sent by Agent Light.
 - The relay accepts at most 1 MiB of hook input and emits a validated envelope of at most 2,048 bytes.
+- Relay delivery uses a nonblocking Unix datagram send with a 100 ms monotonic transport budget. Missing, refused, or overloaded sockets fail open; process launch, scheduling, and bounded input parsing are outside that transport-only budget and remain part of the manual end-to-end 200 ms check.
 - The local Unix datagram socket is created with mode `0600` inside `~/Library/Application Support/Agent Light`.
 - If the app or socket is unavailable, the relay exits successfully so the source agent is not blocked.
 - The recovery record contains bulb state and command metadata, not credentials. Its directory is restricted to the current user.
+- Outbound Tuya command attempts, including retries and baseline restoration, share one gate and begin no less than one second apart. Obsolete retries are discarded when a newer desired state wins.
+- Monitoring recovery is bounded to the active record, one previous record, one tombstone, one lock, and a transient fixed staging slot. Unknown files in the directory are not removed.
+
+Agent Light stores a durable, non-secret ownership receipt at `~/Library/Application Support/Agent Light/setup-ownership-v1.json`. It records only setup ownership, integration fingerprints, login registration state, and repair obligations. It contains no Tuya credentials or prior credential values; credentials and any rollback backup remain in Keychain.
 
 ## Recovery and maintenance
 
-- **Pause Monitoring** or quit Agent Light to request restoration of the captured pre-monitoring bulb state.
+- **Pause Monitoring** or ordinary **Quit** requests restoration of the captured pre-monitoring bulb state. Quit is non-destructive: it retains Keychain credentials, verified integration ownership, the durable receipt, and an owned login registration for the next launch.
+- **Disconnect** (including the Replace Device removal flow) is the explicit destructive action. It restores the bulb when safe and removes only credentials, hooks, and login registration that the durable receipt and current files still prove Agent Light owns.
 - **Reconnect Light** retries health checks and applies only the newest desired state; it does not replay old events.
 - **Replace Device** stops monitoring, restores the owned baseline when safe, and returns to onboarding.
 - **Preview Repair** shows proposed hook changes before **Confirm Repair** writes them.
@@ -85,6 +91,7 @@ Agent Light records only that the user confirmed this step; it cannot verify or 
 - After an unclean exit, relaunch the app. It restores the recorded baseline only if the bulb still matches Agent Light's last command; an external bulb change is preserved as the new baseline.
 - If startup reports that invalid stored credentials could not be reset, resolve Keychain access and use **Reset & Retry**. If integration repair fails, inspect the reported path and permissions before retrying; do not delete unrelated hooks.
 - If Tuya or the bulb is offline, leave the bulb untouched, restore connectivity, and use **Reconnect Light**.
+- If launch-at-login shows approval pending, open **System Settings > General > Login Items**, allow Agent Light, then use **Retry Status**. The pending registration is retained for recovery and is not repeatedly registered; explicit Disconnect can remove it when ownership is still verified.
 
 ## Manual acceptance checklist
 
@@ -99,6 +106,7 @@ These checks intentionally are not performed by build or test scripts because th
 7. Close the app and invoke every installed hook. Each must exit successfully within 200 ms.
 8. Inspect all three config files and confirm unrelated hooks remain semantically unchanged after install, repair, and uninstall.
 9. Confirm launch at login is enabled only after approved setup and that relaunch resumes monitoring.
+10. If macOS requires login-item approval, complete it in System Settings, select **Retry Status**, and confirm the app transitions from pending approval without registering a second item.
 
 Expected failure modes:
 

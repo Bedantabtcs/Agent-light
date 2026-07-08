@@ -274,7 +274,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private var lifecycleTransitionPriorModes: [UUID: Mode] = [:]
     private var lifecycleWaiterCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var nextSequence: UInt64 = 0
-    private var latestSessionSequence: [String: UInt64] = [:]
+    private var latestSessionSequence: [TerminalIdentityKey: UInt64] = [:]
     private var eventMutationRevision: UInt64 = 0
     private var inFlightAcceptCount = 0
     private var baseline: BulbBaseline?
@@ -292,7 +292,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private var reconnectHealthTask: Task<ReconnectHealthOutcome, Never>?
     private var lifecycleRetryID: UUID?
     private var cancelLifecycleRetry: (@Sendable () -> Void)?
-    private var terminalTasks: [String: TerminalTimer] = [:]
+    private var terminalTasks: [TerminalIdentityKey: TerminalTimer] = [:]
     private var lastAppliedTerminalToken: AppliedTerminalToken?
     private var lastCommandAttempt: Duration?
     private var lastApplied: DesiredLightState?
@@ -394,13 +394,17 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             state: event.state,
             sequence: nextSequence
         )
-        latestSessionSequence[accepted.sessionID] = accepted.sequence
-        if let cancelledToken = terminalTasks[accepted.sessionID]?.token,
+        let acceptedIdentity = TerminalIdentityKey(
+            source: accepted.source,
+            sessionID: accepted.sessionID
+        )
+        latestSessionSequence[acceptedIdentity] = accepted.sequence
+        if let cancelledToken = terminalTasks[acceptedIdentity]?.token,
            lastAppliedTerminalToken == cancelledToken {
             lastAppliedTerminalToken = nil
         }
-        terminalTasks[accepted.sessionID]?.task.cancel()
-        terminalTasks[accepted.sessionID] = nil
+        terminalTasks[acceptedIdentity]?.task.cancel()
+        terminalTasks[acceptedIdentity] = nil
 
         await coordinator.accept(accepted)
         inFlightAcceptCount -= 1
@@ -410,7 +414,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         )
         guard mode == .active,
               generation == token,
-              latestSessionSequence[accepted.sessionID] == accepted.sequence else {
+              latestSessionSequence[acceptedIdentity] == accepted.sequence else {
             return
         }
 
@@ -426,11 +430,11 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             let winnerSnapshot = await stableWinnerSnapshot {
                 mode == .active
                     && generation == token
-                    && latestSessionSequence[accepted.sessionID] == accepted.sequence
+                    && latestSessionSequence[acceptedIdentity] == accepted.sequence
             }
             guard mode == .active,
                   generation == token,
-                  latestSessionSequence[accepted.sessionID] == accepted.sequence else {
+                  latestSessionSequence[acceptedIdentity] == accepted.sequence else {
                 return
             }
             guard let winnerSnapshot else {
@@ -1393,7 +1397,10 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
         guard let winner = snapshot?.winner,
               winner.sequence == winnerSequence,
-              latestSessionSequence[winner.sessionID] == winnerSequence,
+              latestSessionSequence[TerminalIdentityKey(
+                source: winner.source,
+                sessionID: winner.sessionID
+              )] == winnerSequence,
               winner.state.color == desired.color else {
             return false
         }
@@ -1578,7 +1585,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
               commandRequest.terminalMutationEpoch
                 == terminalMutationEpochs[commandRequest.terminalIdentityKey, default: 0],
               desiredWinnerSequence == commandRequest.winner.sequence,
-              latestSessionSequence[commandRequest.winner.sessionID]
+              latestSessionSequence[commandRequest.terminalIdentityKey]
                 == commandRequest.winner.sequence,
               snapshot.sessions.first == commandRequest.winner,
               commandRequest.winner.state.color == commandRequest.desired.color,
@@ -1662,15 +1669,18 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             lastAppliedTerminalToken = nil
             return
         }
-        let sessionID = event.sessionID
+        let identityKey = TerminalIdentityKey(
+            source: event.source,
+            sessionID: event.sessionID
+        )
         let token = AppliedTerminalToken(
             source: event.source,
-            sessionID: sessionID,
+            sessionID: event.sessionID,
             sequence: event.sequence,
             winnerGeneration: winnerGeneration,
             lifecycleGeneration: lifecycleGeneration
         )
-        terminalTasks[sessionID]?.task.cancel()
+        terminalTasks[identityKey]?.task.cancel()
         let task = Task { [clock, weak self] in
             do {
                 try await clock.sleep(for: hold)
@@ -1682,28 +1692,29 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 token: token
             )
         }
-        terminalTasks[sessionID] = TerminalTimer(token: token, task: task)
+        terminalTasks[identityKey] = TerminalTimer(token: token, task: task)
         lastAppliedTerminalToken = token
     }
 
     private func expireTerminal(token: AppliedTerminalToken) async {
-        guard mode == .active,
-              generation == token.lifecycleGeneration,
-              latestSessionSequence[token.sessionID] == token.sequence,
-              terminalTasks[token.sessionID]?.token == token else { return }
         let identityKey = TerminalIdentityKey(
             source: token.source,
             sessionID: token.sessionID
         )
+        guard mode == .active,
+              generation == token.lifecycleGeneration,
+              latestSessionSequence[identityKey] == token.sequence,
+              terminalTasks[identityKey]?.token == token else { return }
         terminalMutationEpochs[identityKey] = Self.requiredNextCounterValue(
             after: terminalMutationEpochs[identityKey, default: 0],
             name: "terminal mutation epoch"
         )
-        terminalTasks[token.sessionID] = nil
+        terminalTasks[identityKey] = nil
         if lastAppliedTerminalToken == token {
             lastAppliedTerminalToken = nil
         }
         await coordinator.expireTerminalState(
+            source: token.source,
             sessionID: token.sessionID,
             sequence: token.sequence
         )
@@ -1751,8 +1762,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     private func activeTerminalTimerToken(for winner: AgentEvent) -> AppliedTerminalToken? {
+        let identityKey = TerminalIdentityKey(
+            source: winner.source,
+            sessionID: winner.sessionID
+        )
         guard terminalHold(for: winner.state) != nil,
-              let token = terminalTasks[winner.sessionID]?.token,
+              let token = terminalTasks[identityKey]?.token,
               token.source == winner.source,
               token.sessionID == winner.sessionID,
               token.sequence == winner.sequence else {
@@ -1763,7 +1778,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
 
     private func terminalTimerStateMatches(_ request: PhysicalCommandRequest) -> Bool {
         guard let expected = request.terminalTimerToken else { return true }
-        return terminalTasks[request.winner.sessionID]?.token == expected
+        return terminalTasks[request.terminalIdentityKey]?.token == expected
             && lastAppliedTerminalToken == expected
     }
 
@@ -1782,8 +1797,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             winnerGeneration: winnerGeneration,
             lifecycleGeneration: lifecycleGeneration
         )
+        let identityKey = TerminalIdentityKey(
+            source: winner.source,
+            sessionID: winner.sessionID
+        )
         return lastAppliedTerminalToken == token
-            && terminalTasks[winner.sessionID]?.token == token
+            && terminalTasks[identityKey]?.token == token
     }
 
     private func refreshSnapshot() async {

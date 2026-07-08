@@ -2,38 +2,45 @@ import AgentLightProtocol
 
 protocol SessionCoordinating: Sendable {
     func accept(_ event: AgentEvent) async
-    func expireTerminalState(sessionID: String, sequence: UInt64) async
+    func expireTerminalState(source: AgentSource, sessionID: String, sequence: UInt64) async
     func currentWinner() async -> AgentEvent?
     func snapshots() async -> [AgentEvent]
     func reset() async
 }
 
 public actor SessionCoordinator {
-    private var sessions: [String: AgentEvent] = [:]
+    private struct SessionIdentity: Hashable {
+        let source: AgentSource
+        let sessionID: String
+    }
+
+    private var sessions: [SessionIdentity: AgentEvent] = [:]
 
     public init() {}
 
     public func accept(_ event: AgentEvent) {
-        guard event.sequence >= (sessions[event.sessionID]?.sequence ?? 0) else {
+        let identity = SessionIdentity(source: event.source, sessionID: event.sessionID)
+        guard event.sequence >= (sessions[identity]?.sequence ?? 0) else {
             return
         }
 
         if event.state == .idle {
-            sessions.removeValue(forKey: event.sessionID)
+            sessions.removeValue(forKey: identity)
         } else {
-            sessions[event.sessionID] = event
+            sessions[identity] = event
         }
     }
 
-    public func expireTerminalState(sessionID: String, sequence: UInt64) {
-        guard let event = sessions[sessionID], event.sequence == sequence else {
+    public func expireTerminalState(source: AgentSource, sessionID: String, sequence: UInt64) {
+        let identity = SessionIdentity(source: source, sessionID: sessionID)
+        guard let event = sessions[identity], event.sequence == sequence else {
             return
         }
         guard event.state == .completed || event.state == .error else {
             return
         }
 
-        sessions.removeValue(forKey: sessionID)
+        sessions.removeValue(forKey: identity)
     }
 
     public func currentWinner() -> AgentEvent? {

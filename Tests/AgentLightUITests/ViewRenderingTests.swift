@@ -161,7 +161,7 @@ final class ViewRenderingTests: XCTestCase {
         let readme = try String(contentsOf: readmeURL, encoding: .utf8)
 
         XCTAssertTrue(readme.contains("/hooks"))
-        XCTAssertTrue(readme.contains(AppIdentity.integrationIdentifier))
+        XCTAssertTrue(readme.contains("com.bbatchas.agentlight.hook.v1"))
         XCTAssertTrue(readme.localizedCaseInsensitiveContains("untrusted hooks are skipped"))
     }
 

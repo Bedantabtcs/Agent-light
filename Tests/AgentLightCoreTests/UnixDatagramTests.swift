@@ -66,6 +66,30 @@ final class UnixDatagramTests: XCTestCase {
         await replacement.stop()
     }
 
+    func testRunningServerDeinitializationCancelsCallbackOwnershipAndUnlinksSocket() async throws {
+        let path = temporarySocketPath()
+        let tokenBox = WeakHandlerTokenBox()
+        weak var releasedServer: UnixDatagramServer?
+
+        do {
+            let token = HandlerLifetimeToken()
+            tokenBox.store(token)
+            let server = UnixDatagramServer(path: path)
+            releasedServer = server
+            try await server.start { [token] _ in
+                withExtendedLifetime(token) {}
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: path))
+        }
+
+        XCTAssertNil(releasedServer)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+        let releasedCallback = await eventually(attempts: 1_000) {
+            tokenBox.value() == nil
+        }
+        XCTAssertTrue(releasedCallback)
+    }
+
     func testStopWhileReceiveIsBlockedReleasesHandlerTask() async throws {
         let path = temporarySocketPath()
         let server = UnixDatagramServer(path: path)
@@ -263,6 +287,21 @@ final class UnixDatagramTests: XCTestCase {
 }
 
 private final class HandlerLifetimeToken: @unchecked Sendable {}
+
+private final class WeakHandlerTokenBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var token: HandlerLifetimeToken?
+
+    func store(_ token: HandlerLifetimeToken) {
+        lock.withLock {
+            self.token = token
+        }
+    }
+
+    func value() -> HandlerLifetimeToken? {
+        lock.withLock { token }
+    }
+}
 
 private actor HandlerProbe {
     struct Snapshot: Equatable {
