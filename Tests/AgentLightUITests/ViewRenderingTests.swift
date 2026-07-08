@@ -141,7 +141,8 @@ final class ViewRenderingTests: XCTestCase {
     }
 
     func testPendingLoginApprovalRendersExactGuidanceAndStatusOnlyRetryControl() async throws {
-        let harness = ViewModelHarness()
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
         harness.loginItem.registerResult = .requiresApproval
         await harness.viewModel.connect(using: harness.validDraft)
         await harness.viewModel.approveIntegrations()
@@ -153,10 +154,77 @@ final class ViewRenderingTests: XCTestCase {
             "\(rendered)"
         )
         XCTAssertFalse(harness.viewModel.loginDisabledStatePersistenceRetryRequired)
-        _ = try renderedButton("settings.general.retryLoginStatus", in: hosting)
+        let retry = try renderedButton("settings.general.retryLoginStatus", in: hosting)
         XCTAssertNil(descendants(of: hosting).compactMap { $0 as? NSButton }.first {
             $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsRetryDisabledLoginState
         })
+
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+        harness.loginItem.currentStatus = .enabled
+        XCTAssertTrue(try sendRenderedAction(retry))
+        await Task.yield()
+        for _ in 0..<1_000 {
+            if try await store.load()?.login == .registered,
+               harness.viewModel.loginItemStatus == .enabled {
+                break
+            }
+            await nextMainTurn()
+        }
+        await nextMainTurn()
+
+        let receipt = try await store.load()
+        XCTAssertEqual(receipt?.login, .registered)
+        XCTAssertEqual(harness.viewModel.loginItemStatus, .enabled)
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+    }
+
+    func testRenderedPendingPromotionFailureKeepsRetryStatusUntilReceiptRetrySucceeds() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        harness.loginItem.registerResult = .requiresApproval
+        await harness.connectAndApprove()
+        let nextWrite = await store.writes() + 1
+        await store.failSaves([nextWrite])
+        harness.loginItem.currentStatus = .enabled
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+        let hosting = host(SettingsView(viewModel: harness.viewModel))
+
+        let initialRetry = try renderedButton(
+            AmbientAccessibilityID.settingsRetryLoginStatus,
+            in: hosting
+        )
+        XCTAssertTrue(try sendRenderedAction(initialRetry))
+        await Task.yield()
+        for _ in 0..<1_000 where harness.viewModel.phase != .repairRequired {
+            await nextMainTurn()
+        }
+        hosting.layoutSubtreeIfNeeded()
+
+        var receipt = await store.current()
+        XCTAssertEqual(receipt?.login, .pendingApproval)
+        XCTAssertTrue(harness.viewModel.loginStatusReconciliationRequired)
+        let retry = try renderedButton(
+            AmbientAccessibilityID.settingsRetryLoginStatus,
+            in: hosting
+        )
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+
+        XCTAssertTrue(try sendRenderedAction(retry))
+        await Task.yield()
+        for _ in 0..<1_000 {
+            if await store.current()?.login == .registered { break }
+            await nextMainTurn()
+        }
+        hosting.layoutSubtreeIfNeeded()
+
+        receipt = await store.current()
+        XCTAssertEqual(receipt?.login, .registered)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertNil(harness.viewModel.presentedError)
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
     }
 
     func testRenderedLaunchAtLoginToggleDisablesPendingRegistrationAccessibly() async throws {
@@ -490,17 +558,21 @@ final class ViewRenderingTests: XCTestCase {
             in: hosting
         )
         XCTAssertEqual(retry.accessibilityLabel(), "Retry saving disabled login state")
-        retry.performClick(nil)
-        for _ in 0..<1_000 where harness.viewModel.loginDisabledStatePersistenceRetryRequired {
-            await nextMainTurn()
-        }
+        XCTAssertTrue(try sendRenderedAction(retry))
         for _ in 0..<1_000 {
-            if await store.current()?.login == PersistentLoginOwnership.none { break }
+            if await store.writes() > nextWrite,
+               await store.current()?.login == PersistentLoginOwnership.none {
+                break
+            }
             await nextMainTurn()
         }
         hosting.layoutSubtreeIfNeeded()
 
         let receipt = await store.current()
+        let writes = await store.writes()
+        let ledgerSnapshot = await harness.ownershipLedger.snapshot()
+        XCTAssertEqual(writes, nextWrite + 1)
+        XCTAssertEqual(ledgerSnapshot.login, PersistentLoginOwnership.none)
         XCTAssertEqual(receipt?.login, PersistentLoginOwnership.none)
         XCTAssertEqual(harness.viewModel.phase, .monitoring)
         XCTAssertNil(harness.viewModel.presentedError)
@@ -908,6 +980,12 @@ final class ViewRenderingTests: XCTestCase {
                 .first { $0.accessibilityIdentifier() == identifier },
             "Missing rendered button \(identifier)"
         )
+    }
+
+    private func sendRenderedAction(_ button: NSButton) throws -> Bool {
+        let action = try XCTUnwrap(button.action, "Rendered button has no action")
+        let target = try XCTUnwrap(button.target, "Rendered button has no target")
+        return button.sendAction(action, to: target)
     }
 
     private func renderedFontSize(_ identifier: String, in view: NSView) throws -> CGFloat {

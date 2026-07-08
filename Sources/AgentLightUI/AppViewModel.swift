@@ -716,7 +716,18 @@ public final class AppViewModel: AppViewModeling {
               let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
         var snapshot = await ownershipLedger.snapshot()
         let status = loginItem.status()
-        if status == .enabled, snapshot.login != .none {
+        if status == .enabled, snapshot.login == .pendingApproval {
+            do {
+                try await ownershipLedger.update(.login(.registered))
+                snapshot = await ownershipLedger.snapshot()
+            } catch {
+                syncOwnership(await ownershipLedger.snapshot())
+                phase = .repairRequired
+                presentedError = .operationFailed
+                await ownershipLedger.releaseLease(lease)
+                return
+            }
+        } else if status == .enabled, snapshot.login == .registered {
             _ = await ownershipLedger.clearTransientPersistenceRepairForConfirmedLoginOwnership()
             snapshot = await ownershipLedger.snapshot()
         }
@@ -852,7 +863,7 @@ public final class AppViewModel: AppViewModeling {
 
     public func retrySavingDisabledLoginState() async {
         guard loginDisabledStatePersistenceRetryRequired,
-              phase == .repairRequired,
+              phase == .monitoring || phase == .paused || phase == .repairRequired,
               let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
         let current = await ownershipLedger.snapshot()
         syncOwnership(current)
@@ -1261,7 +1272,6 @@ public final class AppViewModel: AppViewModeling {
         switch (snapshot.login, status) {
         case (.none, _),
              (.registered, .enabled),
-             (.pendingApproval, .enabled),
              (.pendingApproval, .requiresApproval):
             loginDisabledStatePersistenceRetryRequired = false
             loginStatusReconciliationRequired = false
@@ -1273,6 +1283,7 @@ public final class AppViewModel: AppViewModeling {
             loginStatusReconciliationRequired = false
         case (.registered, .requiresApproval),
              (.registered, .unknown),
+             (.pendingApproval, .enabled),
              (.pendingApproval, .unknown):
             loginDisabledStatePersistenceRetryRequired = false
             loginStatusReconciliationRequired = true

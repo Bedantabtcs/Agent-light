@@ -109,3 +109,20 @@ The remaining review found two coupling problems: ambiguous **Retry Status** sti
 - Focused: `AppViewModelTests` 161/161, `ViewRenderingTests` 30/30, and AppEnvironment/setup-receipt/login-controller tests 66/66.
 - Stress: status-refresh/ledger cases 20/20 and rendered split-action cases 10/10.
 - Full parallel gate: 614/614 after stabilizing deterministic waits exposed by the first saturated parallel run.
+
+## Pending-approval receipt-promotion correction
+
+The final receipt review found that macOS could report Enabled while durable ownership remained Pending Approval. RED model and hosted-render tests showed that read-only status refresh left the pending receipt unchanged, and an injected promotion-write failure did not expose a retryable reconciliation.
+
+- Read-only status refresh now promotes durable login ownership from Pending Approval to Registered only after macOS reports Enabled. It never calls register or unregister.
+- A failed promotion write retains Pending Approval authority, the transient persistence-repair overlay, and the rendered **Retry Status** action. A later retry writes only the receipt promotion, clears only the transient error, and restores Monitoring or Paused.
+- Relaunch/synchronization treats Pending Approval plus Enabled as unresolved until the promotion commit succeeds. After promotion, later Approval required/Unknown statuses use Registered reconciliation semantics.
+- The prior pending-approval test now exercises status refresh, and hosted Settings tests invoke the rendered button's exact target/action pair while asserting unchanged enable/disable counts.
+- The rendered immediate receipt-retry path also exposed a publication-order race: its retry flag could appear while phase was still Monitoring. The receipt-only retry now accepts Monitoring, Paused, or Repair while still requiring its specific flag and the serialized ownership lease.
+
+### Pending-promotion verification
+
+- Focused: `AppViewModelTests` 163/163, `ViewRenderingTests` 31/31, and AppEnvironment/setup-receipt/login-controller selected tests 41/41.
+- Stress: promotion model cases 20/20; pending-success, promotion-failure, and adjacent immediate-retry rendered cases 10/10.
+- Full gate: `swift test --parallel` 617/617; release build, app-bundle build, strict code-sign verification, plist lint, package dump, shell syntax, diff check, bundle inventory, source security scan, orphan-process check, and remote/upstream scan passed.
+- The bundle remains ad hoc signed with no Team ID. No live app, HOME/login/Keychain/bulb, GitHub remote, Developer ID, notarization, or formal readiness checks were performed.
