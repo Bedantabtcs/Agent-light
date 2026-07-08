@@ -86,29 +86,51 @@ enum RelayActivityClassifier {
         paths: [[String]],
         maximumBytes: Int
     ) -> String? {
-        let values = paths.compactMap { path -> String? in
-            guard
-                let value = value(in: object, path: path) as? String,
-                !value.isEmpty,
-                value.utf8.count <= maximumBytes
-            else {
+        var resolvedValue: String?
+
+        for path in paths {
+            switch resolveValue(in: object, path: path) {
+            case .absent:
+                continue
+            case .invalid:
                 return nil
+            case let .value(value):
+                guard
+                    resolvedValue == nil,
+                    let value = value as? String,
+                    !value.isEmpty,
+                    value.utf8.count <= maximumBytes
+                else {
+                    return nil
+                }
+                resolvedValue = value
             }
-            return value
         }
-        guard values.count == 1 else { return nil }
-        return values[0]
+
+        return resolvedValue
     }
 
-    private static func value(in object: [String: Any], path: [String]) -> Any? {
+    private static func resolveValue(
+        in object: [String: Any],
+        path: [String]
+    ) -> PathResolution {
+        guard !path.isEmpty else { return .invalid }
+
         var current: Any = object
-        for component in path {
-            guard let dictionary = current as? [String: Any], let next = dictionary[component] else {
-                return nil
+        for (index, component) in path.enumerated() {
+            guard let dictionary = current as? [String: Any] else { return .invalid }
+            guard let next = dictionary[component] else {
+                return index == 0 ? .absent : .invalid
             }
             current = next
         }
-        return current
+        return .value(current)
+    }
+
+    private enum PathResolution {
+        case absent
+        case invalid
+        case value(Any)
     }
 
     private static func isReadingTool(_ toolName: String) -> Bool {

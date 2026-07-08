@@ -198,6 +198,52 @@ final class RelayEncodingTests: XCTestCase {
         }
     }
 
+    func testClassifierRejectsValidToolAliasWithInvalidDuplicate() throws {
+        let invalidDuplicates: [Any] = [
+            42,
+            "",
+            String(repeating: "a", count: RelayActivityClassifier.maximumToolNameBytes + 1)
+        ]
+
+        for invalidDuplicate in invalidDuplicates {
+            let input = try JSONSerialization.data(withJSONObject: [
+                "session_id": "session",
+                "toolName": "Read",
+                "tool_name": invalidDuplicate
+            ])
+            let envelope = try RelayInputSanitizer.makeEnvelope(
+                arguments: validArguments(source: "cursor", event: "preToolUse"),
+                input: input,
+                nowMilliseconds: 1
+            )
+
+            XCTAssertEqual(envelope.activity, .working)
+        }
+    }
+
+    func testClassifierRejectsValidCommandAliasWithInvalidDuplicate() throws {
+        let invalidDuplicates: [Any] = [
+            42,
+            "",
+            String(repeating: "a", count: RelayActivityClassifier.maximumCommandBytes + 1)
+        ]
+
+        for invalidDuplicate in invalidDuplicates {
+            let input = try JSONSerialization.data(withJSONObject: [
+                "session_id": "session",
+                "command": "swift test",
+                "toolInput": ["command": invalidDuplicate]
+            ])
+            let envelope = try RelayInputSanitizer.makeEnvelope(
+                arguments: validArguments(source: "cursor", event: "beforeShellExecution"),
+                input: input,
+                nowMilliseconds: 1
+            )
+
+            XCTAssertEqual(envelope.activity, .working)
+        }
+    }
+
     func testSanitizerDoesNotEncodeRawActivityInputs() throws {
         let cases: [(AgentSource, String, [String: Any])] = [
             (
