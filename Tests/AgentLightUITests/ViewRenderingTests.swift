@@ -480,7 +480,7 @@ final class ViewRenderingTests: XCTestCase {
 
         loginSwitch.state = .off
         XCTAssertTrue(loginSwitch.sendAction(loginSwitch.action, to: loginSwitch.target))
-        for _ in 0..<100 where !harness.viewModel.loginDisabledStatePersistenceRetryRequired {
+        for _ in 0..<1_000 where !harness.viewModel.loginDisabledStatePersistenceRetryRequired {
             await nextMainTurn()
         }
         hosting.layoutSubtreeIfNeeded()
@@ -491,7 +491,11 @@ final class ViewRenderingTests: XCTestCase {
         )
         XCTAssertEqual(retry.accessibilityLabel(), "Retry saving disabled login state")
         retry.performClick(nil)
-        for _ in 0..<100 where harness.viewModel.loginDisabledStatePersistenceRetryRequired {
+        for _ in 0..<1_000 where harness.viewModel.loginDisabledStatePersistenceRetryRequired {
+            await nextMainTurn()
+        }
+        for _ in 0..<1_000 {
+            if await store.current()?.login == PersistentLoginOwnership.none { break }
             await nextMainTurn()
         }
         hosting.layoutSubtreeIfNeeded()
@@ -612,6 +616,135 @@ final class ViewRenderingTests: XCTestCase {
         XCTAssertNil(relaunched.presentedError)
         XCTAssertEqual(harness.loginItem.enableCount, counts.0)
         XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+    }
+
+    func testRenderedUnknownToAbsentRefreshShowsReceiptRetryAndSwitchOnExplicitlyEnables() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.currentStatus = .unknown
+        let relaunched = AppViewModel(
+            credentials: harness.credentials,
+            integrations: harness.integrations,
+            monitor: harness.monitor,
+            loginItem: harness.loginItem,
+            verifier: harness.verifier,
+            ownershipLedger: AppOwnershipLedger(store: store)
+        )
+        await relaunched.synchronizeOwnership()
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+        let hosting = host(SettingsView(viewModel: relaunched))
+
+        harness.loginItem.currentStatus = .notRegistered
+        try renderedButton(
+            AmbientAccessibilityID.settingsRetryLoginStatus,
+            in: hosting
+        ).performClick(nil)
+        for _ in 0..<100 where !relaunched.loginDisabledStatePersistenceRetryRequired {
+            await nextMainTurn()
+        }
+        hosting.layoutSubtreeIfNeeded()
+
+        _ = try renderedButton(
+            AmbientAccessibilityID.settingsRetryDisabledLoginState,
+            in: hosting
+        )
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+
+        let loginSwitch = try XCTUnwrap(
+            descendants(of: hosting).compactMap { $0 as? NSSwitch }.first {
+                $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsLaunchAtLogin
+            }
+        )
+        loginSwitch.state = .on
+        XCTAssertTrue(loginSwitch.sendAction(loginSwitch.action, to: loginSwitch.target))
+        for _ in 0..<100 where harness.loginItem.enableCount == counts.0 {
+            await nextMainTurn()
+        }
+        for _ in 0..<100 where relaunched.phase == .repairRequired {
+            await nextMainTurn()
+        }
+
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0 + 1)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+        XCTAssertEqual(relaunched.phase, .monitoring)
+    }
+
+    func testRenderedRequiresApprovalToAbsentRefreshShowsReceiptRetryWithoutMutation() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.currentStatus = .requiresApproval
+        let relaunched = AppViewModel(
+            credentials: harness.credentials,
+            integrations: harness.integrations,
+            monitor: harness.monitor,
+            loginItem: harness.loginItem,
+            verifier: harness.verifier,
+            ownershipLedger: AppOwnershipLedger(store: store)
+        )
+        await relaunched.synchronizeOwnership()
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+        let hosting = host(SettingsView(viewModel: relaunched))
+
+        harness.loginItem.currentStatus = .notFound
+        try renderedButton(
+            AmbientAccessibilityID.settingsRetryLoginStatus,
+            in: hosting
+        ).performClick(nil)
+        for _ in 0..<100 where !relaunched.loginDisabledStatePersistenceRetryRequired {
+            await nextMainTurn()
+        }
+        hosting.layoutSubtreeIfNeeded()
+
+        _ = try renderedButton(
+            AmbientAccessibilityID.settingsRetryDisabledLoginState,
+            in: hosting
+        )
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+    }
+
+    func testRenderedCompensationStatusRefreshClearsTransientRepairWithoutLoginMutation() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.registerResult = .unknown
+        let nextWrite = await store.writes() + 1
+        await store.failSaves([nextWrite])
+        let hosting = host(SettingsView(viewModel: harness.viewModel))
+        let loginSwitch = try XCTUnwrap(
+            descendants(of: hosting).compactMap { $0 as? NSSwitch }.first {
+                $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsLaunchAtLogin
+            }
+        )
+        loginSwitch.state = .off
+        XCTAssertTrue(loginSwitch.sendAction(loginSwitch.action, to: loginSwitch.target))
+        for _ in 0..<100 where !harness.viewModel.loginStatusReconciliationRequired {
+            await nextMainTurn()
+        }
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+        harness.loginItem.currentStatus = .enabled
+        hosting.layoutSubtreeIfNeeded()
+
+        try renderedButton(
+            AmbientAccessibilityID.settingsRetryLoginStatus,
+            in: hosting
+        ).performClick(nil)
+        for _ in 0..<100 where harness.viewModel.loginStatusReconciliationRequired {
+            await nextMainTurn()
+        }
+        hosting.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertNil(harness.viewModel.presentedError)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.isEmpty)
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+        XCTAssertFalse(renderedText(in: hosting).contains {
+            $0.contains("Ownership state could not be read or saved")
+        })
     }
 
     func testRenderedPrimaryControlsHaveStableAccessibilityIdentifiers() async {

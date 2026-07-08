@@ -186,7 +186,7 @@ public struct SettingsView: View {
                             title: "Retry Status",
                             accessibilityIdentifier: AmbientAccessibilityID.settingsRetryLoginStatus
                         ) {
-                            Task { await viewModel.requestLaunchAtLogin() }
+                            Task { await viewModel.refreshLaunchAtLoginStatus() }
                         }
                     } else if viewModel.loginItemStatus == .requiresApproval {
                         NativeWrappingText(
@@ -198,7 +198,7 @@ public struct SettingsView: View {
                             title: "Retry Status",
                             accessibilityIdentifier: AmbientAccessibilityID.settingsRetryLoginStatus
                         ) {
-                            Task { await viewModel.requestLaunchAtLogin() }
+                            Task { await viewModel.refreshLaunchAtLoginStatus() }
                         }
                     }
                     NativeWrappingText(

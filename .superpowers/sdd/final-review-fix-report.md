@@ -93,3 +93,19 @@ The last review found that the reconciliation flag could remain latched after ma
 - Focused: `AppViewModelTests` 156/156, `ViewRenderingTests` 27/27, and AppEnvironment/setup-receipt/login-controller tests 64/64.
 - Added model and rendered target/action coverage for Unknown-to-Enabled, Approval-required-to-Enabled, Paused restoration, pending approval, disconnect/new setup cleanup, button absence, and zero login mutations.
 - Stress: derived-state model cases 20/20 and rendered action-selection cases 10/10. Full parallel gate: 604/604.
+
+## Read-only status and guarded transient-repair correction
+
+The remaining review found two coupling problems: ambiguous **Retry Status** still shared the explicit-enable API, and later Enabled compensation relied on an unconstrained transient-flag clear. RED tests failed on the missing read-only refresh boundary.
+
+- `refreshLaunchAtLoginStatus()` now reads current macOS status, recomputes reconciliation, and performs no login registration mutation. Both rendered **Retry Status** controls use it; switch On remains the separate explicit enable action.
+- Unknown/Approval-required changing to Not registered/Not found now swaps the rendered status action for **Retry saving disabled login state**, with unchanged register/unregister counts and durable authority retained until that receipt retry succeeds.
+- The ownership ledger clears its memory-only persistence-repair overlay only when an authenticated durable receipt still owns a registered/pending login item and status is confirmed Enabled. The operation performs no receipt write/delete.
+- Durable/manual repair obligations and unsafe/reset-eligible ownership failures remain untouched. If status becomes absent, the transient marker remains until the receipt-only persistence update commits.
+- Later Enabled status clears the transient repair/error and restores Monitoring or Paused without login mutations; rendered and model tests cover both compensation outcomes and explicit switch enablement.
+
+### Read-only/guarded-clear verification
+
+- Focused: `AppViewModelTests` 161/161, `ViewRenderingTests` 30/30, and AppEnvironment/setup-receipt/login-controller tests 66/66.
+- Stress: status-refresh/ledger cases 20/20 and rendered split-action cases 10/10.
+- Full parallel gate: 614/614 after stabilizing deterministic waits exposed by the first saturated parallel run.

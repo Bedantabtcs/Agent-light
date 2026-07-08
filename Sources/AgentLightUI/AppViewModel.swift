@@ -35,6 +35,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     func disconnect() async
     func observeMonitoring() async
     func synchronizeOwnership() async
+    func refreshLaunchAtLoginStatus() async
     func requestLaunchAtLogin() async
     func setLaunchAtLoginEnabled(_ enabled: Bool) async
     func retrySavingDisabledLoginState() async
@@ -49,6 +50,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
 
 public extension AppViewModeling {
     func synchronizeOwnership() async {}
+    func refreshLaunchAtLoginStatus() async {}
     var loginItemStatus: LoginItemStatus { .unknown }
     func requestLaunchAtLogin() async {}
     func setLaunchAtLoginEnabled(_ enabled: Bool) async {}
@@ -709,6 +711,27 @@ public final class AppViewModel: AppViewModeling {
         await operation.wait()
     }
 
+    public func refreshLaunchAtLoginStatus() async {
+        guard phase == .monitoring || phase == .paused || phase == .repairRequired,
+              let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        var snapshot = await ownershipLedger.snapshot()
+        let status = loginItem.status()
+        if status == .enabled, snapshot.login != .none {
+            _ = await ownershipLedger.clearTransientPersistenceRepairForConfirmedLoginOwnership()
+            snapshot = await ownershipLedger.snapshot()
+        }
+        syncOwnership(snapshot)
+        if hasLoginReconciliation {
+            phase = .repairRequired
+            presentedError = .operationFailed
+        } else if snapshot.login == .pendingApproval, loginItemStatus == .requiresApproval {
+            presentedError = .loginApprovalRequired
+        } else if loginItemStatus == .enabled, presentedError == .loginApprovalRequired {
+            presentedError = nil
+        }
+        await ownershipLedger.releaseLease(lease)
+    }
+
     public func requestLaunchAtLogin() async {
         guard phase == .monitoring || phase == .paused || phase == .repairRequired,
               let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
@@ -843,8 +866,6 @@ public final class AppViewModel: AppViewModeling {
         do {
             if current.login != .none {
                 try await ownershipLedger.update(.login(.none))
-            } else {
-                await ownershipLedger.clearTransientPersistenceRepair()
             }
             finishDisabledLoginPersistence(await ownershipLedger.snapshot())
         } catch {
@@ -862,7 +883,7 @@ public final class AppViewModel: AppViewModeling {
             loginItemStatus = loginItem.status()
         }
         if loginItemStatus == .enabled {
-            await ownershipLedger.clearTransientPersistenceRepair()
+            _ = await ownershipLedger.clearTransientPersistenceRepairForConfirmedLoginOwnership()
             let restored = await ownershipLedger.snapshot()
             syncOwnership(restored)
             if restored.obligations.isEmpty {
@@ -2629,8 +2650,15 @@ public actor AppOwnershipLedger {
         return snapshot
     }
 
-    func clearTransientPersistenceRepair() {
+    func clearTransientPersistenceRepairForConfirmedLoginOwnership() -> Bool {
+        guard transientPersistenceRepair,
+              authenticatedDurableReceipt,
+              hydrationFailure == nil,
+              value.login != .none else {
+            return false
+        }
         transientPersistenceRepair = false
+        return true
     }
 
     public func update(_ mutation: OwnershipMutation) async throws {

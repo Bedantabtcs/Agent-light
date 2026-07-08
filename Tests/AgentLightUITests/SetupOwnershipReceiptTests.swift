@@ -325,6 +325,58 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         XCTAssertFalse(snapshot.ownershipReceiptResetEligible)
     }
 
+    func testConfirmedOwnedLoginClearsOnlyTransientRepairWithoutWritingReceipt() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let ledger = AppOwnershipLedger(store: store)
+        try await ledger.hydrate()
+        try await ledger.update(.login(.registered))
+        await store.failEveryWrite()
+        do {
+            try await ledger.update(.login(.none))
+            XCTFail("Expected persistence failure")
+        } catch let error as SetupOwnershipStoreError {
+            XCTAssertEqual(error, .writeFailed)
+        }
+        let writesBeforeClear = await store.writes()
+
+        let cleared = await ledger.clearTransientPersistenceRepairForConfirmedLoginOwnership()
+
+        let writesAfterClear = await store.writes()
+        let snapshot = await ledger.snapshot()
+        XCTAssertTrue(cleared)
+        XCTAssertEqual(snapshot.login, .registered)
+        XCTAssertTrue(snapshot.obligations.isEmpty)
+        XCTAssertEqual(writesAfterClear, writesBeforeClear)
+    }
+
+    func testConfirmedOwnedLoginClearNeverRemovesDurableOrUnsafeRepairObligation() async throws {
+        let durable = MemorySetupOwnershipStore(
+            receipt: SetupOwnershipReceipt(
+                login: .registered,
+                obligations: [.ownershipReceiptRepair]
+            )
+        )
+        let durableLedger = AppOwnershipLedger(store: durable)
+        try await durableLedger.hydrate()
+
+        let durableCleared = await durableLedger
+            .clearTransientPersistenceRepairForConfirmedLoginOwnership()
+        XCTAssertFalse(durableCleared)
+        var snapshot = await durableLedger.snapshot()
+        XCTAssertEqual(snapshot.obligations, [.ownershipReceiptRepair])
+
+        let unsafeLedger = AppOwnershipLedger(
+            store: FailingSetupOwnershipStore(loadError: .unsafeReceipt)
+        )
+        do { try await unsafeLedger.hydrate() } catch {}
+        let unsafeCleared = await unsafeLedger
+            .clearTransientPersistenceRepairForConfirmedLoginOwnership()
+        XCTAssertFalse(unsafeCleared)
+        snapshot = await unsafeLedger.snapshot()
+        XCTAssertEqual(snapshot.obligations, [.ownershipReceiptRepair])
+        XCTAssertFalse(snapshot.ownershipReceiptResetEligible)
+    }
+
     func testLedgerAdoptsCommittedSaveEvenWhenCleanupRemainsPending() async throws {
         let original = makeReceipt()
         let store = CommittedCleanupSetupOwnershipStore(stored: original)
