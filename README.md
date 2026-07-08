@@ -28,11 +28,13 @@ Build an ad-hoc-signed debug app at `build/Agent Light.app`:
 
 The build script accepts only `debug` or `release`, compiles both `AgentLight` and `AgentLightRelay`, replaces the previous local bundle, and signs it ad hoc. It does not read Tuya credentials or modify agent configuration.
 
-To build a release bundle, copy it to `~/Applications`, and open it:
+For local use, build and install the canonical runtime:
 
 ```bash
 ./scripts/install-local.sh
 ```
+
+Agent Light runs from `~/Applications/Agent Light.app`. The installer quits the prior instance, verifies a staged release bundle, safely replaces the canonical bundle, and opens only that location. On startup, receipt-verified reconciliation updates only Agent Light-owned hook commands when a prior development bundle used a different relay path. Matching hook paths cause no hook or ownership-receipt writes.
 
 The installer does not register a login item. Agent Light enables launch at login only after the user verifies the bulb and approves the in-app integration review. Settings can disable launch at login without disconnecting the bulb, removing hooks, or stopping monitoring.
 
@@ -120,7 +122,7 @@ Agent Light stores a durable, non-secret ownership receipt at `~/Library/Applica
 
 These checks intentionally are not performed by build or test scripts because they modify user configuration, access local credentials, launch the app, or operate a real bulb.
 
-1. Open `build/Agent Light.app` and confirm it appears only in the menu bar.
+1. Run `./scripts/install-local.sh`, then confirm `~/Applications/Agent Light.app` appears only in the menu bar.
 2. Enter deliberately invalid Tuya credentials and confirm nothing is saved.
 3. Verify valid credentials, record the discovered power, mode, and color DP codes without recording credentials, review all hook changes, and approve installation.
 4. Start local Codex, Claude Code, and Cursor sessions and confirm the newest accepted event controls the bulb across sources. Within those sessions:
