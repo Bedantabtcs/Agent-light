@@ -16,7 +16,7 @@ enum RelayMain {
             guard encodedEnvelope.count <= RelayEnvelope.maximumEncodedBytes else {
                 exit(EXIT_SUCCESS)
             }
-            try UnixDatagramSender.send(encodedEnvelope, to: AppIdentity.socketPath)
+            _ = UnixDatagramSender(path: AppIdentity.socketPath).sendFailOpen(encodedEnvelope)
         } catch {
             exit(EXIT_SUCCESS)
         }

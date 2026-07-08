@@ -21,7 +21,7 @@ final class UnixDatagramTests: XCTestCase {
         )
         XCTAssertEqual(permissions.intValue & 0o777, 0o600)
 
-        try UnixDatagramSender.send(Data("event".utf8), to: path)
+        XCTAssertTrue(UnixDatagramSender(path: path).sendFailOpen(Data("event".utf8)))
         await fulfillment(of: [received], timeout: 1)
         await server.stop()
 
@@ -39,7 +39,7 @@ final class UnixDatagramTests: XCTestCase {
             XCTAssertFalse(FileManager.default.fileExists(atPath: path))
         }
 
-        XCTAssertThrowsError(try UnixDatagramSender.send(Data(), to: path))
+        XCTAssertFalse(UnixDatagramSender(path: path).sendFailOpen(Data()))
     }
 
     func testStoppedServerDeinitializationDoesNotUnlinkReplacementSocket() async throws {
@@ -61,7 +61,7 @@ final class UnixDatagramTests: XCTestCase {
 
         XCTAssertNil(stoppedServer)
         XCTAssertTrue(FileManager.default.fileExists(atPath: path))
-        try UnixDatagramSender.send(Data("replacement".utf8), to: path)
+        XCTAssertTrue(UnixDatagramSender(path: path).sendFailOpen(Data("replacement".utf8)))
         await fulfillment(of: [received], timeout: 1)
         await replacement.stop()
     }
@@ -116,7 +116,7 @@ final class UnixDatagramTests: XCTestCase {
         }
 
         XCTAssertEqual(RelayEnvelope.maximumEncodedBytes, 2_048)
-        try UnixDatagramSender.send(payload, to: path)
+        XCTAssertTrue(UnixDatagramSender(path: path).sendFailOpen(payload))
         await fulfillment(of: [received], timeout: 1)
         await server.stop()
     }
@@ -132,19 +132,7 @@ final class UnixDatagramTests: XCTestCase {
         }
 
         let payload = Data(repeating: 0x41, count: RelayEnvelope.maximumEncodedBytes + 1)
-        do {
-            try UnixDatagramSender.send(payload, to: path)
-        } catch let error as UnixDatagramError {
-            guard case let .systemCall(name, code) = error else {
-                XCTFail("Unexpected transport error: \(error)")
-                await server.stop()
-                return
-            }
-            XCTAssertEqual(name, "sendto")
-            XCTAssertEqual(code, EMSGSIZE)
-        } catch {
-            XCTFail("Unexpected transport error: \(error)")
-        }
+        XCTAssertFalse(UnixDatagramSender(path: path).sendFailOpen(payload))
         await fulfillment(of: [oversizedReceived], timeout: 1)
         await server.stop()
     }
@@ -164,9 +152,104 @@ final class UnixDatagramTests: XCTestCase {
         await original.stop()
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: path))
-        try UnixDatagramSender.send(Data("replacement".utf8), to: path)
+        XCTAssertTrue(UnixDatagramSender(path: path).sendFailOpen(Data("replacement".utf8)))
         await fulfillment(of: [replacementReceived], timeout: 1)
         await replacement.stop()
+    }
+
+    func testBlockedFirstHandlerDoesNotPreventOwningSecondDatagramInReceiveOrder() async throws {
+        let path = temporarySocketPath()
+        let server = UnixDatagramServer(path: path)
+        let probe = HandlerProbe()
+        let releaseGate = HandlerReleaseGate()
+        let firstStarted = expectation(description: "first handler started")
+
+        try await server.start { data in
+            await probe.recordStarted()
+            if data == Data("first".utf8) {
+                firstStarted.fulfill()
+                await releaseGate.wait()
+            }
+            await probe.recordCompleted()
+        }
+
+        XCTAssertTrue(UnixDatagramSender(path: path).sendFailOpen(Data("first".utf8)))
+        await fulfillment(of: [firstStarted], timeout: 1)
+        XCTAssertTrue(UnixDatagramSender(path: path).sendFailOpen(Data("second".utf8)))
+        let ownsBothDatagrams = await eventually {
+            await server.outstandingHandlerTaskCount() == 2
+        }
+        XCTAssertTrue(ownsBothDatagrams)
+        await Task.yield()
+        let blockedSnapshot = await probe.snapshot()
+        XCTAssertEqual(blockedSnapshot.started, 1)
+
+        await releaseGate.release()
+        let handledInOrder = await eventually {
+            await probe.snapshot().completed == 2
+        }
+        XCTAssertTrue(handledInOrder)
+        await server.stop()
+    }
+
+    func testStopCancelsAndAwaitsEveryOwnedHandlerBeforeReturning() async throws {
+        let path = temporarySocketPath()
+        let server = UnixDatagramServer(path: path)
+        let probe = HandlerProbe()
+        let started = expectation(description: "handler started")
+        let cancelled = expectation(description: "handler cancelled")
+
+        try await server.start { _ in
+            await probe.recordStarted()
+            started.fulfill()
+            do {
+                try await Task.sleep(for: .seconds(30))
+            } catch is CancellationError {
+                cancelled.fulfill()
+            } catch {
+                XCTFail("Unexpected handler error: \(error)")
+            }
+            await probe.recordCompleted()
+        }
+
+        XCTAssertTrue(UnixDatagramSender(path: path).sendFailOpen(Data("blocked".utf8)))
+        await fulfillment(of: [started], timeout: 1)
+        await server.stop()
+        await fulfillment(of: [cancelled], timeout: 0.1)
+        let snapshotAfterStop = await probe.snapshot()
+        await Task.yield()
+
+        XCTAssertEqual(snapshotAfterStop.started, 1)
+        XCTAssertEqual(snapshotAfterStop.completed, 1)
+        let snapshotAfterYield = await probe.snapshot()
+        XCTAssertEqual(snapshotAfterYield, snapshotAfterStop)
+    }
+
+    func testHandlerTaskRegistryBoundsOutstandingBurstWork() async throws {
+        let path = temporarySocketPath()
+        let server = UnixDatagramServer(path: path, maximumHandlerTasks: 4)
+        let probe = HandlerProbe()
+
+        try await server.start { _ in
+            await probe.recordStarted()
+            try? await Task.sleep(for: .seconds(30))
+            await probe.recordCompleted()
+        }
+
+        let sender = UnixDatagramSender(path: path)
+        for byte in UInt8(0)..<UInt8(40) {
+            _ = sender.sendFailOpen(Data([byte]))
+        }
+        let reachedBound = await eventually(attempts: 1_000) {
+            await server.outstandingHandlerTaskCount() == 4
+        }
+        XCTAssertTrue(reachedBound)
+        try? await Task.sleep(for: .milliseconds(50))
+        let snapshotBeforeStop = await probe.snapshot()
+        XCTAssertEqual(snapshotBeforeStop.started, 1)
+        await server.stop()
+        let snapshotAfterBoundedStop = await probe.snapshot()
+        XCTAssertEqual(snapshotAfterBoundedStop.completed, 1)
     }
 
     private func temporarySocketPath() -> String {
@@ -180,3 +263,46 @@ final class UnixDatagramTests: XCTestCase {
 }
 
 private final class HandlerLifetimeToken: @unchecked Sendable {}
+
+private actor HandlerProbe {
+    struct Snapshot: Equatable {
+        let started: Int
+        let completed: Int
+    }
+
+    private var started = 0
+    private var completed = 0
+
+    func recordStarted() {
+        started += 1
+    }
+
+    func recordCompleted() {
+        completed += 1
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(started: started, completed: completed)
+    }
+}
+
+private actor HandlerReleaseGate {
+    private var isReleased = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isReleased { return }
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func release() {
+        isReleased = true
+        let waiting = continuations
+        continuations.removeAll()
+        for continuation in waiting {
+            continuation.resume()
+        }
+    }
+}

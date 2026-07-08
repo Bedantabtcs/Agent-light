@@ -43,7 +43,7 @@ final class EndToEndPipelineTests: XCTestCase {
                 await coordinator.accept(data)
                 delivered.fulfill()
             }
-            try UnixDatagramSender.send(fixture, to: path)
+            XCTAssertTrue(UnixDatagramSender(path: path).sendFailOpen(fixture))
             await fulfillment(of: [delivered], timeout: 1)
             let sleepScheduled = await eventually { await clock.sleepRequestCount() >= 1 }
             XCTAssertTrue(sleepScheduled)

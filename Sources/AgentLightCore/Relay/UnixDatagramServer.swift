@@ -6,16 +6,26 @@ public actor UnixDatagramServer {
     public typealias Handler = @Sendable (Data) async -> Void
 
     private let path: String
+    private let maximumHandlerTasks: Int
     private var descriptor: Int32?
     private var readTask: Task<Void, Never>?
+    private var handlerTaskRegistry: HandlerTaskRegistry?
     private var socketIdentity: SocketIdentity?
 
     public init(path: String) {
         self.path = path
+        maximumHandlerTasks = 64
+    }
+
+    init(path: String, maximumHandlerTasks: Int) {
+        precondition(maximumHandlerTasks > 0)
+        self.path = path
+        self.maximumHandlerTasks = maximumHandlerTasks
     }
 
     deinit {
         readTask?.cancel()
+        handlerTaskRegistry?.cancelAll()
         if let socketIdentity {
             removeSocketIfOwned(path: path, identity: socketIdentity)
         }
@@ -65,11 +75,14 @@ public actor UnixDatagramServer {
         didStart = true
         descriptor = socketDescriptor
         socketIdentity = boundIdentity
+        let taskRegistry = HandlerTaskRegistry(maximumTaskCount: maximumHandlerTasks)
+        handlerTaskRegistry = taskRegistry
         let maximumDatagramBytes = RelayEnvelope.maximumEncodedBytes
         readTask = Task.detached(priority: .userInitiated) {
             await Self.readDatagrams(
                 from: socketDescriptor,
                 maximumDatagramBytes: maximumDatagramBytes,
+                taskRegistry: taskRegistry,
                 handler: handler
             )
         }
@@ -80,17 +93,26 @@ public actor UnixDatagramServer {
             readTask.cancel()
             await readTask.value
         }
+        if let handlerTaskRegistry {
+            await handlerTaskRegistry.cancelAndWait()
+        }
         if let socketIdentity {
             removeSocketIfOwned(path: path, identity: socketIdentity)
         }
         descriptor = nil
         readTask = nil
+        handlerTaskRegistry = nil
         socketIdentity = nil
+    }
+
+    func outstandingHandlerTaskCount() -> Int {
+        handlerTaskRegistry?.taskCount ?? 0
     }
 
     private nonisolated static func readDatagrams(
         from descriptor: Int32,
         maximumDatagramBytes: Int,
+        taskRegistry: HandlerTaskRegistry,
         handler: @escaping Handler
     ) async {
         defer {
@@ -117,7 +139,7 @@ public actor UnixDatagramServer {
             switch receiveDatagram(from: descriptor, into: &buffer) {
             case let .data(data):
                 guard !Task.isCancelled else { return }
-                await handler(data)
+                taskRegistry.submit(data: data, handler: handler)
             case .retry, .truncated:
                 continue
             case .failed:
@@ -127,39 +149,94 @@ public actor UnixDatagramServer {
     }
 }
 
-public enum UnixDatagramSender {
-    public static func send(_ data: Data, to path: String) throws {
-        var address = try unixDatagramAddress(for: path)
-        let descriptor = Darwin.socket(AF_UNIX, SOCK_DGRAM, 0)
-        guard descriptor >= 0 else {
-            throw UnixDatagramError.systemCall(name: "socket", code: errno)
+enum DatagramSendResult: Equatable, Sendable {
+    case sent(Int)
+    case wouldBlock
+}
+
+protocol DatagramSendingSystem: Sendable {
+    func openNonblockingDatagramSocket() throws -> Int32
+    func send(_ data: Data, descriptor: Int32, address: sockaddr_un) throws -> DatagramSendResult
+    func waitUntilWritable(_ descriptor: Int32, deadline: ContinuousClock.Instant) throws -> Bool
+    func close(_ descriptor: Int32)
+}
+
+public struct UnixDatagramSender: Sendable {
+    public static let deliveryBudget: Duration = .milliseconds(100)
+
+    private let path: String
+    private let system: any DatagramSendingSystem
+    private let now: @Sendable () -> ContinuousClock.Instant
+
+    public init(path: String) {
+        self.path = path
+        system = DarwinDatagramSendingSystem()
+        now = { ContinuousClock().now }
+    }
+
+    init(
+        path: String,
+        system: any DatagramSendingSystem,
+        now: @escaping @Sendable () -> ContinuousClock.Instant
+    ) {
+        self.path = path
+        self.system = system
+        self.now = now
+    }
+
+    public func sendFailOpen(_ data: Data) -> Bool {
+        guard data.count <= RelayEnvelope.maximumEncodedBytes,
+              let address = try? unixDatagramAddress(for: path) else {
+            return false
+        }
+
+        let deadline = now().advanced(by: Self.deliveryBudget)
+        let descriptor: Int32
+        do {
+            descriptor = try system.openNonblockingDatagramSocket()
+        } catch {
+            return false
         }
         defer {
-            Darwin.close(descriptor)
+            system.close(descriptor)
         }
 
-        let addressLength = socklen_t(address.sun_len)
-        let sentByteCount = try data.withUnsafeBytes { bytes in
-            let result = withUnsafePointer(to: &address) { pointer in
-                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                    Darwin.sendto(
-                        descriptor,
-                        bytes.baseAddress,
-                        bytes.count,
-                        0,
-                        socketAddress,
-                        addressLength
-                    )
+        let firstResult: DatagramSendResult
+        do {
+            firstResult = try system.send(data, descriptor: descriptor, address: address)
+        } catch {
+            return false
+        }
+        switch firstResult {
+        case let .sent(byteCount):
+            return byteCount == data.count
+        case .wouldBlock:
+            break
+        }
+
+        while true {
+            do {
+                guard try system.waitUntilWritable(descriptor, deadline: deadline) else {
+                    return false
                 }
+                break
+            } catch let UnixDatagramError.systemCall(name, code)
+                where name == "poll" && code == EINTR {
+                continue
+            } catch {
+                return false
             }
-            guard result >= 0 else {
-                throw UnixDatagramError.systemCall(name: "sendto", code: errno)
-            }
-            return result
         }
 
-        guard sentByteCount == data.count else {
-            throw UnixDatagramError.incompleteSend
+        do {
+            switch try system.send(data, descriptor: descriptor, address: address) {
+            case let .sent(byteCount):
+                return byteCount == data.count
+            case .wouldBlock:
+                return false
+            }
+        } catch {
+            return false
         }
     }
 }
@@ -211,6 +288,174 @@ private enum DatagramReceiveResult {
     case retry
     case truncated
     case failed
+}
+
+private final class HandlerTaskRegistry: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maximumTaskCount: Int
+    private var acceptsTasks = true
+    private var nextID: UInt64 = 0
+    private var tasks: [UInt64: Task<Void, Never>] = [:]
+    private var taskTail: Task<Void, Never>?
+
+    init(maximumTaskCount: Int) {
+        self.maximumTaskCount = maximumTaskCount
+    }
+
+    func submit(data: Data, handler: @escaping UnixDatagramServer.Handler) {
+        lock.withLock {
+            guard acceptsTasks, tasks.count < maximumTaskCount else { return }
+
+            let id = nextID
+            nextID &+= 1
+            let previousTask = taskTail
+            let task = Task(priority: .userInitiated) { [weak self] in
+                if let previousTask {
+                    await previousTask.value
+                }
+                guard !Task.isCancelled else {
+                    self?.removeTask(id: id)
+                    return
+                }
+                await handler(data)
+                self?.removeTask(id: id)
+            }
+            tasks[id] = task
+            taskTail = task
+        }
+    }
+
+    var taskCount: Int {
+        lock.withLock { tasks.count }
+    }
+
+    func cancelAll() {
+        let runningTasks = lock.withLock {
+            acceptsTasks = false
+            return Array(tasks.values)
+        }
+        for task in runningTasks {
+            task.cancel()
+        }
+    }
+
+    func cancelAndWait() async {
+        let runningTasks = lock.withLock {
+            acceptsTasks = false
+            return Array(tasks.values)
+        }
+        for task in runningTasks {
+            task.cancel()
+        }
+        for task in runningTasks {
+            await task.value
+        }
+        lock.withLock {
+            tasks.removeAll(keepingCapacity: false)
+            taskTail = nil
+        }
+    }
+
+    private func removeTask(id: UInt64) {
+        lock.withLock {
+            tasks[id] = nil
+        }
+    }
+}
+
+private struct DarwinDatagramSendingSystem: DatagramSendingSystem {
+    func openNonblockingDatagramSocket() throws -> Int32 {
+        let descriptor = Darwin.socket(AF_UNIX, SOCK_DGRAM, 0)
+        guard descriptor >= 0 else {
+            throw UnixDatagramError.systemCall(name: "socket", code: errno)
+        }
+
+        let existingFlags = Darwin.fcntl(descriptor, F_GETFL)
+        guard existingFlags >= 0 else {
+            let code = errno
+            Darwin.close(descriptor)
+            throw UnixDatagramError.systemCall(name: "fcntl", code: code)
+        }
+        guard Darwin.fcntl(descriptor, F_SETFL, existingFlags | O_NONBLOCK) == 0 else {
+            let code = errno
+            Darwin.close(descriptor)
+            throw UnixDatagramError.systemCall(name: "fcntl", code: code)
+        }
+        return descriptor
+    }
+
+    func send(
+        _ data: Data,
+        descriptor: Int32,
+        address: sockaddr_un
+    ) throws -> DatagramSendResult {
+        var address = address
+        let addressLength = socklen_t(address.sun_len)
+        return try data.withUnsafeBytes { bytes in
+            let result = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+                    Darwin.sendto(
+                        descriptor,
+                        bytes.baseAddress,
+                        bytes.count,
+                        0,
+                        socketAddress,
+                        addressLength
+                    )
+                }
+            }
+            if result >= 0 {
+                return .sent(result)
+            }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                return .wouldBlock
+            }
+            throw UnixDatagramError.systemCall(name: "sendto", code: errno)
+        }
+    }
+
+    func waitUntilWritable(
+        _ descriptor: Int32,
+        deadline: ContinuousClock.Instant
+    ) throws -> Bool {
+        let clock = ContinuousClock()
+        let current = clock.now
+        guard current < deadline else { return false }
+
+        var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+        let result = Darwin.poll(
+            &pollDescriptor,
+            1,
+            pollTimeoutMilliseconds(for: current.duration(to: deadline))
+        )
+        if result < 0 {
+            throw UnixDatagramError.systemCall(name: "poll", code: errno)
+        }
+        guard result > 0, clock.now <= deadline else { return false }
+        guard pollDescriptor.revents & Int16(POLLOUT) != 0 else { return false }
+        return true
+    }
+
+    func close(_ descriptor: Int32) {
+        Darwin.close(descriptor)
+    }
+}
+
+private func pollTimeoutMilliseconds(for duration: Duration) -> Int32 {
+    let components = duration.components
+    let millisecondsPerSecond: Int64 = 1_000
+    let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
+    let secondsMilliseconds = components.seconds.multipliedReportingOverflow(
+        by: millisecondsPerSecond
+    )
+    guard !secondsMilliseconds.overflow else { return Int32.max }
+
+    let fractionalMilliseconds = components.attoseconds / attosecondsPerMillisecond
+    let hasFraction = components.attoseconds % attosecondsPerMillisecond != 0
+    let roundedFraction = fractionalMilliseconds + (hasFraction ? 1 : 0)
+    let total = secondsMilliseconds.partialValue.addingReportingOverflow(roundedFraction)
+    guard !total.overflow else { return Int32.max }
+    return Int32(clamping: max(1, total.partialValue))
 }
 
 private func receiveDatagram(
