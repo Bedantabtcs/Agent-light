@@ -833,6 +833,11 @@ public struct IntegrationInstaller: IntegrationInstalling {
         let prepared = try verifiedChanges(using: receipt) { editor, data in
             try editor.install(into: data)
         }
+        guard prepared.contains(where: { change, _ in
+            change.before.data != change.after
+        }) else {
+            return receipt
+        }
         let updatedReceipt = IntegrationInstallReceipt(
             sources: try prepared.map { change, sourceReceipt in
                 let editor = IntegrationConfigEditor(source: sourceReceipt.source, relayPath: relayPath)

@@ -141,6 +141,58 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertEqual(after, before)
     }
 
+    func testVerifiedRepairMigratesOwnedRelayPathThenPerformsNoWrites() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let oldInstaller = IntegrationInstaller(
+            relayPath: "/old/AgentLightRelay",
+            paths: paths
+        )
+        let oldReceipt = try await oldInstaller.installWithReceipt()
+
+        var claude = try JSONValue.decode(Data(contentsOf: paths.claudeCode))
+        guard case var .object(claudeRoot) = claude else {
+            return XCTFail("Expected Claude settings object")
+        }
+        claudeRoot["unrelated"] = .string("preserved")
+        claude = .object(claudeRoot)
+        try write(claude.encodedData(), to: paths.claudeCode, mode: 0o640)
+
+        let canonicalRelay = "/Users/test/Applications/Agent Light.app/Contents/MacOS/AgentLightRelay"
+        let currentInstaller = IntegrationInstaller(
+            relayPath: canonicalRelay,
+            paths: paths
+        )
+        let currentReceipt = try await currentInstaller.repair(using: oldReceipt)
+
+        XCTAssertNotEqual(currentReceipt, oldReceipt)
+        for url in paths.all.map(\.url) {
+            let content = String(decoding: try Data(contentsOf: url), as: UTF8.self)
+            XCTAssertTrue(content.contains(canonicalRelay), url.path)
+            XCTAssertFalse(content.contains("/old/AgentLightRelay"), url.path)
+        }
+        XCTAssertEqual(try mode(at: paths.claudeCode), mode_t(0o640))
+        guard case let .object(repairedClaude) = try JSONValue.decode(
+            Data(contentsOf: paths.claudeCode)
+        ) else {
+            return XCTFail("Expected repaired Claude settings object")
+        }
+        XCTAssertEqual(repairedClaude["unrelated"], .string("preserved"))
+
+        let noWriteOperations = FaultInjectingFileOperations(
+            failFirstStagedWriteAfterSuccess: true
+        )
+        let noOpInstaller = IntegrationInstaller(
+            relayPath: canonicalRelay,
+            paths: paths,
+            fileOperations: noWriteOperations
+        )
+
+        let noOpReceipt = try await noOpInstaller.repair(using: currentReceipt)
+        XCTAssertEqual(noOpReceipt, currentReceipt)
+    }
+
     func testLegacyCommittedCleanupErrorRemainsConstructible() {
         let error = IntegrationError.committedWithCleanupFailure(["CANARY_ARTIFACT"])
 
