@@ -34,7 +34,7 @@ To build a release bundle, copy it to `~/Applications`, and open it:
 ./scripts/install-local.sh
 ```
 
-The installer does not register a login item. Agent Light enables launch at login only after the user verifies the bulb and approves the in-app integration review.
+The installer does not register a login item. Agent Light enables launch at login only after the user verifies the bulb and approves the in-app integration review. Settings can disable launch at login without disconnecting the bulb, removing hooks, or stopping monitoring.
 
 ## Tuya setup
 
@@ -75,7 +75,8 @@ Agent Light records only that the user confirmed this step; it cannot verify or 
 - The local Unix datagram socket is created with mode `0600` inside `~/Library/Application Support/Agent Light`.
 - If the app or socket is unavailable, the relay exits successfully so the source agent is not blocked.
 - The recovery record contains bulb state and command metadata, not credentials. Its directory is restricted to the current user.
-- Outbound Tuya command attempts, including retries and baseline restoration, share one gate and begin no less than one second apart. Obsolete retries are discarded when a newer desired state wins.
+- Completed/Error recovery metadata contains only the physical apply timestamp and deadline. Their 8/12-second countdown begins when the bulb command succeeds; slow or failed persistence cannot extend it.
+- Outbound Tuya command attempts, including retries, authentication-retry command POSTs, and baseline restoration, begin no less than one second apart. Token requests are exempt. Obsolete retries are discarded when a newer desired state wins.
 - Monitoring recovery is bounded to the active record, one previous record, one tombstone, one lock, and a transient fixed staging slot. Unknown files in the directory are not removed.
 
 Agent Light stores a durable, non-secret ownership receipt at `~/Library/Application Support/Agent Light/setup-ownership-v1.json`. It records only setup ownership, integration fingerprints, login registration state, and repair obligations. It contains no Tuya credentials or prior credential values; credentials and any rollback backup remain in Keychain.
@@ -88,7 +89,9 @@ Agent Light stores a durable, non-secret ownership receipt at `~/Library/Applica
 - **Replace Device** stops monitoring, restores the owned baseline when safe, and returns to onboarding.
 - **Preview Repair** shows proposed hook changes before **Confirm Repair** writes them.
 - **Uninstall Integrations** removes only Agent Light-owned hook commands.
+- Turning **Launch at login** off unregisters the login item and updates its ownership receipt while retaining credentials, hooks, the selected device, and monitoring. A failed disable remains retryable.
 - After an unclean exit, relaunch the app. It restores the recorded baseline only if the bulb still matches Agent Light's last command; an external bulb change is preserved as the new baseline.
+- Stored Keychain credentials without a valid durable ownership receipt may be verified to rebuild the integration preview, but Agent Light does not install hooks or register login automatically. Approval remains explicit.
 - If startup reports that invalid stored credentials could not be reset, resolve Keychain access and use **Reset & Retry**. If integration repair fails, inspect the reported path and permissions before retrying; do not delete unrelated hooks.
 - If Tuya or the bulb is offline, leave the bulb untouched, restore connectivity, and use **Reconnect Light**.
 - If launch-at-login shows approval pending, open **System Settings > General > Login Items**, allow Agent Light, then use **Retry Status**. The pending registration is retained for recovery and is not repeatedly registered; explicit Disconnect can remove it when ownership is still verified.
@@ -107,6 +110,8 @@ These checks intentionally are not performed by build or test scripts because th
 8. Inspect all three config files and confirm unrelated hooks remain semantically unchanged after install, repair, and uninstall.
 9. Confirm launch at login is enabled only after approved setup and that relaunch resumes monitoring.
 10. If macOS requires login-item approval, complete it in System Settings, select **Retry Status**, and confirm the app transitions from pending approval without registering a second item.
+11. Turn **Launch at login** off from both Enabled and Approval required states; confirm monitoring, credentials, device selection, and hooks remain intact, then re-enable it explicitly.
+12. Quit and relaunch after approved setup; confirm masked Access ID and Device ID appear without another interactive connection attempt.
 
 Expected failure modes:
 

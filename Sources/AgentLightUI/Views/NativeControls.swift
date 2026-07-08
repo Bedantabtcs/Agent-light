@@ -138,6 +138,7 @@ struct NativeMonitoringToggle: NSViewRepresentable {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let isOn: Bool
     let accessibilityIdentifier: String
+    var accessibilityLabel = "Monitoring"
     let onChange: (Bool) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -151,13 +152,14 @@ struct NativeMonitoringToggle: NSViewRepresentable {
         configureAccessibility(
             monitoringSwitch,
             identifier: accessibilityIdentifier,
-            label: "Monitoring",
+            label: accessibilityLabel,
             role: .checkBox
         )
         monitoringSwitch.font = NativeDynamicType.font(
             for: dynamicTypeSize,
             baseSize: NSFont.systemFontSize
         )
+        monitoringSwitch.setAccessibilityLabel(accessibilityLabel)
         monitoringSwitch.state = isOn ? .on : .off
         return monitoringSwitch
     }

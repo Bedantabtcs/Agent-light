@@ -250,6 +250,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private let recoveryStore: any MonitoringRecoveryStoring
     private let coordinator: any SessionCoordinating
     private let clock: any AgentLightClock
+    private let wallNow: @Sendable () -> Date
     private let jitter: Jitter
     private let isTransient: TransientErrorClassifier
     private let subscribers = MonitoringSubscriberRegistry()
@@ -310,6 +311,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             recoveryStore: recoveryStore,
             coordinator: SessionCoordinator(),
             clock: ContinuousAgentLightClock(),
+            wallNow: { Date() },
             jitter: {
                 MonitoringOrchestrator.productionJitter(
                     for: $0,
@@ -325,6 +327,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         recoveryStore: any MonitoringRecoveryStoring,
         coordinator: any SessionCoordinating = SessionCoordinator(),
         clock: any AgentLightClock = ContinuousAgentLightClock(),
+        wallNow: @escaping @Sendable () -> Date = { Date() },
         jitter: @escaping Jitter = {
             MonitoringOrchestrator.productionJitter(
                 for: $0,
@@ -337,6 +340,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         self.recoveryStore = recoveryStore
         self.coordinator = coordinator
         self.clock = clock
+        self.wallNow = wallNow
         self.jitter = jitter
         self.isTransient = isTransient
     }
@@ -1072,6 +1076,31 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             }
             guard lifecycleRequest == request else { throw CancellationError() }
             if matches {
+                if command == record.lastCommand,
+                   let remaining = remainingTerminalHold(for: record, now: wallNow()) {
+                    try await clock.sleep(for: remaining)
+                    guard lifecycleRequest == request else { throw CancellationError() }
+                    let stillMatches = try await retryLifecycle(request: request) {
+                        try await light.currentStateMatches(command)
+                    }
+                    guard stillMatches else {
+                        let external = try await retryLifecycle(request: request) {
+                            try await light.captureBaseline()
+                        }
+                        let replacement = MonitoringRecoveryRecord(baseline: external)
+                        let revision = try await recoveryStore.save(replacement)
+                        adoptedBaseline = external
+                        storedRecovery = StoredMonitoringRecovery(
+                            record: replacement,
+                            revision: revision
+                        )
+                        clearPending = true
+                        guard await retryPendingClear(), lifecycleRequest == request else {
+                            throw MonitoringOrchestratorError.operationFailed
+                        }
+                        return
+                    }
+                }
                 baseline = record.baseline
                 storedRecovery = stored
                 guard await restoreCurrentOwnership(), lifecycleRequest == request else {
@@ -1316,6 +1345,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 try await self.light.apply(desired)
             }
             physicallyApplied = desired
+            let appliedAt = wallNow()
+            let appliedTerminalToken = scheduleTerminalExpiryIfNeeded(
+                for: winner,
+                winnerGeneration: winnerGeneration,
+                lifecycleGeneration: token
+            )
             let currentAfterApply = await isCurrent(
                 desired,
                 winnerSequence: winner.sequence,
@@ -1323,18 +1358,36 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 generation: token,
                 reconnectID: reconnectID
             )
+            if !currentAfterApply, let appliedTerminalToken {
+                cancelTerminalToken(appliedTerminalToken)
+            }
+            let terminalRecovery = currentAfterApply
+                ? terminalHoldInterval(for: winner.state).map { hold in
+                    MonitoringTerminalRecovery(
+                        appliedAt: appliedAt,
+                        deadline: appliedAt.addingTimeInterval(hold)
+                    )
+                }
+                : nil
             let committed = MonitoringRecoveryRecord(
                 baseline: pending.baseline,
-                lastCommand: desired
+                lastCommand: desired,
+                terminal: terminalRecovery
             )
             let recoveryStore = self.recoveryStore
             let committedRevision = try await Task {
                 try await recoveryStore.save(committed)
             }.value
-            storedRecovery = StoredMonitoringRecovery(
+            let committedStored = StoredMonitoringRecovery(
                 record: committed,
                 revision: committedRevision
             )
+            if let appliedTerminalToken,
+               !isTerminalTokenCurrent(appliedTerminalToken) {
+                try? await recoveryStore.clear(expecting: committedStored)
+                return .physicallyAppliedButSuperseded(desired)
+            }
+            storedRecovery = committedStored
             let currentAfterSave = await isCurrent(
                 desired,
                 winnerSequence: winner.sequence,
@@ -1343,11 +1396,6 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
                 reconnectID: reconnectID
             )
             if currentAfterApply && currentAfterSave {
-                scheduleTerminalExpiryIfNeeded(
-                    for: winner,
-                    winnerGeneration: winnerGeneration,
-                    lifecycleGeneration: token
-                )
                 return .applied(desired)
             }
             return .physicallyAppliedButSuperseded(desired)
@@ -1660,14 +1708,15 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         min(max(jitter(base), .zero), .milliseconds(250))
     }
 
+    @discardableResult
     private func scheduleTerminalExpiryIfNeeded(
         for event: AgentEvent,
         winnerGeneration: UInt64,
         lifecycleGeneration: UInt64
-    ) {
+    ) -> AppliedTerminalToken? {
         guard let hold = terminalHold(for: event.state) else {
             lastAppliedTerminalToken = nil
-            return
+            return nil
         }
         let identityKey = TerminalIdentityKey(
             source: event.source,
@@ -1694,6 +1743,34 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
         terminalTasks[identityKey] = TerminalTimer(token: token, task: task)
         lastAppliedTerminalToken = token
+        return token
+    }
+
+    private func isTerminalTokenCurrent(_ token: AppliedTerminalToken) -> Bool {
+        let identityKey = TerminalIdentityKey(source: token.source, sessionID: token.sessionID)
+        return terminalTasks[identityKey]?.token == token
+    }
+
+    private func cancelTerminalToken(_ token: AppliedTerminalToken) {
+        let identityKey = TerminalIdentityKey(source: token.source, sessionID: token.sessionID)
+        guard terminalTasks[identityKey]?.token == token else { return }
+        terminalTasks[identityKey]?.task.cancel()
+        terminalTasks[identityKey] = nil
+        if lastAppliedTerminalToken == token {
+            lastAppliedTerminalToken = nil
+        }
+    }
+
+    private func remainingTerminalHold(
+        for record: MonitoringRecoveryRecord,
+        now: Date
+    ) -> Duration? {
+        guard let terminal = record.terminal else { return nil }
+        let total = terminal.deadline.timeIntervalSince(terminal.appliedAt)
+        guard total >= 0, total <= 12 else { return nil }
+        let remaining = terminal.deadline.timeIntervalSince(now)
+        guard remaining > 0 else { return nil }
+        return .milliseconds(Int64((remaining * 1_000).rounded(.up)))
     }
 
     private func expireTerminal(token: AppliedTerminalToken) async {
@@ -1731,9 +1808,9 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         if winnerSnapshot.winner == nil {
             let reconnectID = reconnectOperation?.id
             if let reconnectID {
-                await cancelReconnectAndWait(id: reconnectID)
+                requestReconnectTerminal(id: reconnectID, terminal: .lifecycleCancelled)
             }
-            await cancelThrottleAndWait()
+            detachThrottleForTerminalExpiry()
             guard mode == .active, generation == token.lifecycleGeneration else { return }
             let drainedWinnerSnapshot = await stableWinnerSnapshot {
                 mode == .active && generation == token.lifecycleGeneration
@@ -1761,6 +1838,14 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
     }
 
+    private func terminalHoldInterval(for state: AgentState) -> TimeInterval? {
+        switch state {
+        case .completed: 8
+        case .error: 12
+        default: nil
+        }
+    }
+
     private func activeTerminalTimerToken(for winner: AgentEvent) -> AppliedTerminalToken? {
         let identityKey = TerminalIdentityKey(
             source: winner.source,
@@ -1768,6 +1853,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         )
         guard terminalHold(for: winner.state) != nil,
               let token = terminalTasks[identityKey]?.token,
+              lastAppliedTerminalToken == token,
               token.source == winner.source,
               token.sessionID == winner.sessionID,
               token.sequence == winner.sequence else {
@@ -2077,6 +2163,13 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         if let id {
             finishThrottle(id: id)
         }
+    }
+
+    private func detachThrottleForTerminalExpiry() {
+        throttleTask?.cancel()
+        throttleTask = nil
+        throttleID = nil
+        throttleOperationStarted = false
     }
 
     private func cancelTerminalTasks() {

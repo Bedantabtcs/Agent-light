@@ -40,19 +40,32 @@ public struct StoredMonitoringRecovery: Equatable, Sendable {
     }
 }
 
+public struct MonitoringTerminalRecovery: Codable, Equatable, Sendable {
+    public let appliedAt: Date
+    public let deadline: Date
+
+    public init(appliedAt: Date, deadline: Date) {
+        self.appliedAt = appliedAt
+        self.deadline = deadline
+    }
+}
+
 public struct MonitoringRecoveryRecord: Codable, Equatable, Sendable {
     public let baseline: BulbBaseline
     public let lastCommand: DesiredLightState?
     public let pendingCommand: DesiredLightState?
+    public let terminal: MonitoringTerminalRecovery?
 
     public init(
         baseline: BulbBaseline,
         lastCommand: DesiredLightState? = nil,
-        pendingCommand: DesiredLightState? = nil
+        pendingCommand: DesiredLightState? = nil,
+        terminal: MonitoringTerminalRecovery? = nil
     ) {
         self.baseline = baseline
         self.lastCommand = lastCommand
         self.pendingCommand = pendingCommand
+        self.terminal = terminal
     }
 }
 

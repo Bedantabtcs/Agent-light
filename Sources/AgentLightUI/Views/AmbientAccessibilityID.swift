@@ -21,6 +21,7 @@ enum AmbientAccessibilityID {
     static let settingsResetOwnershipReceipt = "settings.integrations.resetOwnershipReceipt"
     static let settingsEnableLogin = "settings.general.enableLogin"
     static let settingsRetryLoginStatus = "settings.general.retryLoginStatus"
+    static let settingsLaunchAtLogin = "settings.general.launchAtLogin"
     static let settingsMonitoring = "settings.general.monitoring"
 
     static let interactive: [String] = [
@@ -45,6 +46,7 @@ enum AmbientAccessibilityID {
         settingsConfirmCodexTrust,
         settingsResetOwnershipReceipt,
         settingsMonitoring,
+        settingsLaunchAtLogin,
         settingsEnableLogin,
         settingsRetryLoginStatus
     ]

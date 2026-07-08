@@ -65,6 +65,92 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         XCTAssertEqual(names, [url.lastPathComponent])
     }
 
+    func testCommittedSaveCleanupSyncFailureKeepsNewAuthorityAndBoundedArtifact() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let url = root.appending(path: "setup-ownership-v1.json")
+        var original = makeReceipt()
+        original.obligations = [.credentialDelete]
+        var replacement = makeReceipt()
+        replacement.obligations = [.integrationUninstallRetry]
+        try await FileSetupOwnershipStore(url: url).save(original)
+        let store = FileSetupOwnershipStore(
+            url: url,
+            synchronizeDirectory: cleanupFailingSynchronizer()
+        )
+
+        let outcome = try await store.saveCommitted(replacement)
+
+        let loaded = try await store.load()
+        XCTAssertEqual(outcome, .committedCleanupPending)
+        XCTAssertEqual(loaded, replacement)
+        let names = Set(try FileManager.default.contentsOfDirectory(atPath: root.path))
+        XCTAssertEqual(names, ["setup-ownership-v1.json", ".setup-ownership-v1.json.agent-light-cleanup"])
+        let relaunched = try await FileSetupOwnershipStore(url: url).load()
+        XCTAssertEqual(relaunched, replacement)
+    }
+
+    func testCommittedDeleteCleanupSyncFailureKeepsAuthorityAbsentAcrossRelaunch() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let url = root.appending(path: "setup-ownership-v1.json")
+        try await FileSetupOwnershipStore(url: url).save(makeReceipt())
+        let store = FileSetupOwnershipStore(
+            url: url,
+            synchronizeDirectory: cleanupFailingSynchronizer()
+        )
+
+        let outcome = try await store.deleteCommitted()
+
+        let loaded = try await store.load()
+        XCTAssertEqual(outcome, .committedCleanupPending)
+        XCTAssertNil(loaded)
+        let names = Set(try FileManager.default.contentsOfDirectory(atPath: root.path))
+        XCTAssertEqual(names, [".setup-ownership-v1.json.agent-light-cleanup"])
+        let relaunched = try await FileSetupOwnershipStore(url: url).load()
+        XCTAssertNil(relaunched)
+    }
+
+    func testCommittedSaveFinalSyncFailureNeverRestoresOldAuthority() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let url = root.appending(path: "setup-ownership-v1.json")
+        var replacement = makeReceipt()
+        replacement.obligations = [.credentialRestore]
+        try await FileSetupOwnershipStore(url: url).save(makeReceipt())
+        let store = FileSetupOwnershipStore(
+            url: url,
+            synchronizeDirectory: cleanupFailingSynchronizer(failingCall: 2)
+        )
+
+        let outcome = try await store.saveCommitted(replacement)
+
+        let relaunched = try await FileSetupOwnershipStore(url: url).load()
+        XCTAssertEqual(outcome, .committedCleanupPending)
+        XCTAssertEqual(relaunched, replacement)
+    }
+
+    func testCommittedDeleteFinalSyncFailureNeverRestoresRemovedAuthority() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let url = root.appending(path: "setup-ownership-v1.json")
+        try await FileSetupOwnershipStore(url: url).save(makeReceipt())
+        let store = FileSetupOwnershipStore(
+            url: url,
+            synchronizeDirectory: cleanupFailingSynchronizer(failingCall: 2)
+        )
+
+        let outcome = try await store.deleteCommitted()
+
+        let relaunched = try await FileSetupOwnershipStore(url: url).load()
+        XCTAssertEqual(outcome, .committedCleanupPending)
+        XCTAssertNil(relaunched)
+    }
+
     func testLoadRejectsSymlinkUnsafeModeMalformedAndUnsupportedReceipts() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -155,6 +241,43 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         XCTAssertFalse(snapshot.ownershipReceiptResetEligible)
         let stored = await store.current()
         XCTAssertEqual(stored, durable)
+    }
+
+    func testLedgerAdoptsCommittedSaveEvenWhenCleanupRemainsPending() async throws {
+        let original = makeReceipt()
+        let store = CommittedCleanupSetupOwnershipStore(stored: original)
+        let ledger = AppOwnershipLedger(store: store)
+        try await ledger.hydrate()
+
+        try await ledger.update(.credentials(.created))
+
+        let snapshot = await ledger.snapshot()
+        XCTAssertEqual(snapshot.credentials, .created)
+        let relaunched = AppOwnershipLedger(store: store)
+        try await relaunched.hydrate()
+        let relaunchedSnapshot = await relaunched.snapshot()
+        let cleanupPending = await store.cleanupPending()
+        XCTAssertEqual(relaunchedSnapshot.credentials, .created)
+        XCTAssertTrue(cleanupPending)
+    }
+
+    func testLedgerAdoptsCommittedDeleteEvenWhenCleanupRemainsPending() async throws {
+        let store = CommittedCleanupSetupOwnershipStore(
+            stored: SetupOwnershipReceipt(credential: .created)
+        )
+        let ledger = AppOwnershipLedger(store: store)
+        try await ledger.hydrate()
+
+        try await ledger.update(.credentials(.none))
+
+        let snapshot = await ledger.snapshot()
+        XCTAssertEqual(snapshot.credentials, .none)
+        let relaunched = AppOwnershipLedger(store: store)
+        try await relaunched.hydrate()
+        let relaunchedSnapshot = await relaunched.snapshot()
+        let cleanupPending = await store.cleanupPending()
+        XCTAssertEqual(relaunchedSnapshot.credentials, .none)
+        XCTAssertTrue(cleanupPending)
     }
 
     func testCorruptReceiptFailsClosedWithoutUninstallAuthority() async {
@@ -361,6 +484,18 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     }
 
+    private func cleanupFailingSynchronizer(
+        failingCall: Int = 1
+    ) -> FileSetupOwnershipStore.DirectorySynchronizer {
+        let fault = DirectorySyncFault(failingCall: failingCall)
+        return { descriptor, point in
+            guard fsync(descriptor) == 0 else { throw SetupOwnershipStoreError.writeFailed }
+            if point == .cleanup, fault.shouldFail() {
+                throw SetupOwnershipStoreError.writeFailed
+            }
+        }
+    }
+
     private func assertStoreError(
         _ expected: SetupOwnershipStoreError,
         operation: () async throws -> some Any
@@ -373,6 +508,23 @@ final class SetupOwnershipReceiptTests: XCTestCase {
             XCTAssertFalse(String(describing: error).contains("CANARY_PRIVATE_BYTES"))
         } catch {
             XCTFail("Unexpected error: \(error)")
+        }
+    }
+}
+
+private final class DirectorySyncFault: @unchecked Sendable {
+    private let lock = NSLock()
+    private let failingCall: Int
+    private var calls = 0
+
+    init(failingCall: Int) {
+        self.failingCall = failingCall
+    }
+
+    func shouldFail() -> Bool {
+        lock.withLock {
+            calls += 1
+            return calls == failingCall
         }
     }
 }
@@ -440,4 +592,37 @@ private actor ReentrantSetupOwnershipStore: SetupOwnershipStoring {
         firstSaveRelease?.resume()
         firstSaveRelease = nil
     }
+}
+
+private actor CommittedCleanupSetupOwnershipStore: SetupOwnershipStoring {
+    private var stored: SetupOwnershipReceipt?
+    private var pending = false
+
+    init(stored: SetupOwnershipReceipt?) {
+        self.stored = stored
+    }
+
+    func load() -> SetupOwnershipReceipt? { stored }
+
+    func save(_ receipt: SetupOwnershipReceipt) {
+        stored = receipt
+    }
+
+    func delete() {
+        stored = nil
+    }
+
+    func saveCommitted(_ receipt: SetupOwnershipReceipt) -> SetupOwnershipMutationOutcome {
+        stored = receipt
+        pending = true
+        return .committedCleanupPending
+    }
+
+    func deleteCommitted() -> SetupOwnershipMutationOutcome {
+        stored = nil
+        pending = true
+        return .committedCleanupPending
+    }
+
+    func cleanupPending() -> Bool { pending }
 }

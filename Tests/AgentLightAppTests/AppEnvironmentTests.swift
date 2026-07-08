@@ -68,6 +68,19 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertEqual(composition.viewModel.phase, .onboarding)
     }
 
+    func testApplicationLaunchStartsWithoutMenuPresentationAndCannotStartTwice() {
+        var starts = 0
+        let launch = ApplicationLaunchController {
+            starts += 1
+        }
+
+        XCTAssertEqual(starts, 1)
+
+        launch.startIfNeeded()
+
+        XCTAssertEqual(starts, 1)
+    }
+
     func testApplicationSupportPreparationRejectsSymlinkAndNonprivateExistingDirectory() async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "agent-light-app-support-tests-\(UUID().uuidString)")
@@ -149,7 +162,7 @@ final class AppEnvironmentTests: XCTestCase {
         )
     }
 
-    func testStoredCredentialsHydrateThroughApprovedViewModelFlowBeforeRelayStarts() async throws {
+    func testStoredCredentialsWithoutDurableOwnershipStopAtIntegrationReview() async throws {
         let recorder = EnvironmentRecorder()
         let stored = TuyaCredentials(
             endpoint: try XCTUnwrap(URL(string: "https://openapi.tuyaus.com")),
@@ -171,9 +184,26 @@ final class AppEnvironmentTests: XCTestCase {
 
         XCTAssertEqual(
             recorder.values,
-            [.prepare, .recover, .synchronize, .loadCredentials, .connect, .approve, .relayStart]
+            [.prepare, .recover, .synchronize, .loadCredentials, .connect, .relayStart]
         )
+        XCTAssertEqual(viewModel.phase, .integrationReview)
+        XCTAssertFalse(recorder.values.contains(.approve))
         XCTAssertEqual(viewModel.lastDraft?.accessSecret, "CANARY_ACCESS_SECRET")
+    }
+
+    func testStoredCredentialsWithoutReceiptNeverInstallHooksOrRegisterLogin() async throws {
+        let fixture = try PathLifecycleFixture(seededSetup: false)
+        let environment = fixture.makeEnvironment()
+
+        await environment.start()
+
+        let metrics = await fixture.metrics()
+        XCTAssertEqual(metrics.credentialSaves, 0)
+        XCTAssertEqual(metrics.integrationInstalls, 0)
+        XCTAssertEqual(metrics.loginRegisters, 0)
+        XCTAssertEqual(fixture.viewModel.phase, .integrationReview)
+        let receipt = try await fixture.receiptStore.load()
+        XCTAssertNil(receipt)
     }
 
     func testStopClosesRelayBeforeNonDestructiveMonitoringShutdown() async {
@@ -262,7 +292,10 @@ final class AppEnvironmentTests: XCTestCase {
 
     func testStopClaimsShutdownBeforeCancelingBlockedApproval() async throws {
         let recorder = EnvironmentRecorder()
-        let viewModel = EnvironmentViewModel(recorder: recorder)
+        let viewModel = EnvironmentViewModel(
+            recorder: recorder,
+            automaticSetupResumeAuthorized: true
+        )
         await viewModel.blockApproval()
         let stored = TuyaCredentials(
             endpoint: try XCTUnwrap(URL(string: "https://openapi.tuyain.com")),
@@ -296,7 +329,10 @@ final class AppEnvironmentTests: XCTestCase {
         let recorder = EnvironmentRecorder()
         let approvalEntryGate = EnvironmentGate()
         await approvalEntryGate.block()
-        let viewModel = EnvironmentViewModel(recorder: recorder)
+        let viewModel = EnvironmentViewModel(
+            recorder: recorder,
+            automaticSetupResumeAuthorized: true
+        )
         let stored = TuyaCredentials(
             endpoint: try XCTUnwrap(URL(string: "https://openapi.tuyain.com")),
             accessID: "CANARY_ACCESS_ID",
@@ -789,13 +825,14 @@ final class AppEnvironmentTests: XCTestCase {
         XCTAssertEqual(receipt, fixture.seededReceipt)
     }
 
-    func testRealQuitWaitsForCanceledApprovalCompensationBeforeTermination() async throws {
+    func testRealQuitWaitsForCommittedApprovalThenRetainsSetup() async throws {
         let fixture = try PathLifecycleFixture(seededSetup: false)
-        await fixture.monitor.blockSnapshot()
         let environment = fixture.makeEnvironment(
             terminateApplication: { fixture.recorder.append(.terminate) }
         )
-        environment.requestStart()
+        await environment.start()
+        await fixture.monitor.blockSnapshot()
+        let approval = Task { await fixture.viewModel.approveIntegrations() }
         await fixture.monitor.waitForSnapshot()
 
         environment.requestQuit()
@@ -804,29 +841,33 @@ final class AppEnvironmentTests: XCTestCase {
 
         await fixture.monitor.releaseSnapshot()
         await spinMainActor(until: { fixture.recorder.values.contains(.terminate) })
+        await approval.value
 
         let metrics = await fixture.metrics()
         let receipt = try await fixture.receiptStore.load()
-        XCTAssertEqual(metrics, .compensatedAfterSingleRestore)
-        XCTAssertNil(receipt)
+        XCTAssertEqual(
+            metrics,
+            PathLifecycleMetrics(
+                credentialSaves: 1,
+                credentialDeletes: 0,
+                integrationInstalls: 1,
+                integrationUninstalls: 0,
+                loginRegisters: 1,
+                loginUnregisters: 0,
+                monitorStarts: 1,
+                monitorStops: 1
+            )
+        )
+        XCTAssertNotNil(receipt)
     }
 
-    func testRealStopBeforeApprovalEntryPreventsSetupMutation() async throws {
+    func testRealStopFromUnapprovedIntegrationReviewPreventsSetupMutation() async throws {
         let fixture = try PathLifecycleFixture(seededSetup: false)
-        let approvalEntryGate = EnvironmentGate()
-        await approvalEntryGate.block()
-        let environment = fixture.makeEnvironment(
-            beforeApproval: { await approvalEntryGate.enter() }
-        )
-        environment.requestStart()
-        await approvalEntryGate.waitForEntry()
+        let environment = fixture.makeEnvironment()
+        await environment.start()
+        XCTAssertEqual(fixture.viewModel.phase, .integrationReview)
 
-        let stopping = Task { await environment.stop() }
-        await spinMainActor(until: { fixture.recorder.values.contains(.relayStop) })
-        XCTAssertFalse(fixture.recorder.values.contains(.relayStart))
-
-        await approvalEntryGate.release()
-        await stopping.value
+        await environment.stop()
 
         let metrics = await fixture.metrics()
         let receipt = try await fixture.receiptStore.load()
@@ -1074,8 +1115,15 @@ private final class EnvironmentViewModel: AppViewModeling {
     var integrationPreviews: [IntegrationPreview] = []
     var presentedError: PresentationError?
     var outstandingObligations: Set<OutstandingObligation> = []
+    let automaticSetupResumeAuthorized: Bool
     private(set) var lastDraft: ConnectionDraft?
-    init(recorder: EnvironmentRecorder) { self.recorder = recorder }
+    init(
+        recorder: EnvironmentRecorder,
+        automaticSetupResumeAuthorized: Bool = false
+    ) {
+        self.recorder = recorder
+        self.automaticSetupResumeAuthorized = automaticSetupResumeAuthorized
+    }
     func connect(using draft: ConnectionDraft) async {
         lastDraft = draft
         recorder.append(.connect)

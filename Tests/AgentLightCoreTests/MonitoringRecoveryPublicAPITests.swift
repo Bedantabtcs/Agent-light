@@ -2,6 +2,32 @@ import AgentLightCore
 import XCTest
 
 final class MonitoringRecoveryPublicAPITests: XCTestCase {
+    func testTerminalTimingMetadataRoundTripsAndLegacyRecordsDecodeWithoutIt() throws {
+        let applied = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = MonitoringRecoveryRecord(
+            baseline: BulbBaseline(values: [:]),
+            lastCommand: DesiredLightState(color: RGBColor(hex: 0x22C55E)),
+            terminal: MonitoringTerminalRecovery(
+                appliedAt: applied,
+                deadline: applied.addingTimeInterval(8)
+            )
+        )
+
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                MonitoringRecoveryRecord.self,
+                from: JSONEncoder().encode(record)
+            ),
+            record
+        )
+
+        let legacy = try JSONEncoder().encode(
+            ["baseline": BulbBaseline(values: [:])]
+        )
+        let decodedLegacy = try JSONDecoder().decode(MonitoringRecoveryRecord.self, from: legacy)
+        XCTAssertNil(decodedLegacy.terminal)
+    }
+
     func testExternalStoreCanCreateOpaqueRevisionAndConformToProtocol() async throws {
         let store: any MonitoringRecoveryStoring = ExternalMemoryRecoveryStore()
         let record = MonitoringRecoveryRecord(baseline: BulbBaseline(values: [:]))

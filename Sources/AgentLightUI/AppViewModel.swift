@@ -23,6 +23,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     var integrationStatus: IntegrationInstallationStatus { get }
     var codexTrustStatus: IntegrationTrustStatus { get }
     var monitoringActive: Bool { get }
+    var automaticSetupResumeAuthorized: Bool { get }
     func connect(using draft: ConnectionDraft) async
     func approveIntegrations() async
     func pause() async
@@ -33,6 +34,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     func observeMonitoring() async
     func synchronizeOwnership() async
     func requestLaunchAtLogin() async
+    func setLaunchAtLoginEnabled(_ enabled: Bool) async
     func confirmCodexTrust()
     func reconnect() async
     func previewIntegrationRepair() async
@@ -46,6 +48,7 @@ public extension AppViewModeling {
     func synchronizeOwnership() async {}
     var loginItemStatus: LoginItemStatus { .unknown }
     func requestLaunchAtLogin() async {}
+    func setLaunchAtLoginEnabled(_ enabled: Bool) async {}
     func confirmCodexTrust() {}
     var maskedAccessID: String? { nil }
     var maskedDeviceID: String? { nil }
@@ -54,6 +57,7 @@ public extension AppViewModeling {
     var integrationStatus: IntegrationInstallationStatus { .notInstalled }
     var codexTrustStatus: IntegrationTrustStatus { .notRequired }
     var monitoringActive: Bool { false }
+    var automaticSetupResumeAuthorized: Bool { false }
     func reconnect() async {}
     func previewIntegrationRepair() async {}
     func uninstallIntegrations() async {}
@@ -142,6 +146,7 @@ public final class AppViewModel: AppViewModeling {
     public private(set) var integrationStatus: IntegrationInstallationStatus = .notInstalled
     public private(set) var codexTrustStatus: IntegrationTrustStatus = .notRequired
     public private(set) var monitoringActive = false
+    public private(set) var automaticSetupResumeAuthorized = false
     public private(set) var canResetOwnershipReceipt = false
 
     @ObservationIgnored private let credentials: any CredentialStoring
@@ -753,6 +758,47 @@ public final class AppViewModel: AppViewModeling {
         await ownershipLedger.releaseLease(lease)
     }
 
+    public func setLaunchAtLoginEnabled(_ enabled: Bool) async {
+        if enabled {
+            await requestLaunchAtLogin()
+            return
+        }
+        guard phase == .monitoring || phase == .paused || phase == .repairRequired,
+              let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        do {
+            let transition = try loginItem.setEnabled(false)
+            loginItemStatus = transition.current
+            guard transition.current == .notRegistered || transition.current == .notFound else {
+                presentedError = .operationFailed
+                await ownershipLedger.releaseLease(lease)
+                return
+            }
+            let snapshot = await ownershipLedger.snapshot()
+            if snapshot.login != .none {
+                try await ownershipLedger.update(.login(.none))
+                let updated = await ownershipLedger.snapshot()
+                syncOwnership(updated)
+                if !updated.obligations.isEmpty {
+                    phase = .repairRequired
+                    presentedError = .operationFailed
+                }
+            }
+            loginRegistrationOwned = false
+            if outstandingObligations.isEmpty {
+                presentedError = nil
+            }
+        } catch {
+            loginItemStatus = loginItem.status()
+            let snapshot = await ownershipLedger.snapshot()
+            syncOwnership(snapshot)
+            if !snapshot.obligations.isEmpty {
+                phase = .repairRequired
+            }
+            presentedError = .operationFailed
+        }
+        await ownershipLedger.releaseLease(lease)
+    }
+
     public func confirmCodexTrust() {
         guard codexTrustStatus == .required else { return }
         codexTrustStatus = .userConfirmed
@@ -974,6 +1020,7 @@ public final class AppViewModel: AppViewModeling {
             return
         }
         syncOwnership(snapshot)
+        hydrateMaskedIdentifiersIfOwned(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
         if snapshot.canResumeMonitoringAfterRelaunch {
             do {
@@ -1586,6 +1633,14 @@ public final class AppViewModel: AppViewModeling {
         loginRegistrationOwned = snapshot.loginRegistrationOwned
         outstandingObligations = snapshot.obligations
         canResetOwnershipReceipt = snapshot.ownershipReceiptResetEligible
+        automaticSetupResumeAuthorized = snapshot.canAutomaticallyResumeApprovedSetup
+    }
+
+    private func hydrateMaskedIdentifiersIfOwned(_ snapshot: OwnershipSnapshot) {
+        guard snapshot.credentials != .none else { return }
+        guard let stored = try? credentials.load() else { return }
+        maskedAccessID = Self.maskedIdentifier(stored.accessID)
+        maskedDeviceID = Self.maskedIdentifier(stored.deviceID)
     }
 
     private func finishDisconnect(_ snapshot: OwnershipSnapshot) {
@@ -2216,6 +2271,7 @@ public struct OwnershipSnapshot: Equatable, Sendable {
     public var obligations: Set<OutstandingObligation>
     public var ownershipReceiptResetEligible: Bool
     public var emergencyIntegrationRecovery: EmergencyIntegrationRecovery?
+    public var authenticatedDurableReceipt: Bool
 
     public init(
         integration: PersistentIntegrationOwnership = .none,
@@ -2224,7 +2280,8 @@ public struct OwnershipSnapshot: Equatable, Sendable {
         monitoringOwned: Bool = false,
         obligations: Set<OutstandingObligation> = [],
         ownershipReceiptResetEligible: Bool = false,
-        emergencyIntegrationRecovery: EmergencyIntegrationRecovery? = nil
+        emergencyIntegrationRecovery: EmergencyIntegrationRecovery? = nil,
+        authenticatedDurableReceipt: Bool = false
     ) {
         self.integration = integration
         self.credentials = credentials
@@ -2233,6 +2290,7 @@ public struct OwnershipSnapshot: Equatable, Sendable {
         self.obligations = obligations
         self.ownershipReceiptResetEligible = ownershipReceiptResetEligible
         self.emergencyIntegrationRecovery = emergencyIntegrationRecovery
+        self.authenticatedDurableReceipt = authenticatedDurableReceipt
     }
 
     var loginRegistrationOwned: Bool { login != .none }
@@ -2257,6 +2315,10 @@ public struct OwnershipSnapshot: Equatable, Sendable {
         case .none, .mixed, .uncertain:
             return false
         }
+    }
+
+    var canAutomaticallyResumeApprovedSetup: Bool {
+        authenticatedDurableReceipt && canResumeMonitoringAfterRelaunch
     }
 }
 
@@ -2317,6 +2379,7 @@ public actor AppOwnershipLedger {
     private var hydrated = false
     private var hydrationFailure: SetupOwnershipStoreError?
     private var ownershipReceiptResetEligible = false
+    private var authenticatedDurableReceipt = false
     private var emergencyIntegrationRecovery: EmergencyIntegrationRecovery?
     private var persistenceBusy = false
     private var persistenceWaiters: [CheckedContinuation<Void, Never>] = []
@@ -2357,22 +2420,27 @@ public actor AppOwnershipLedger {
                     integration: receipt.integration,
                     credentials: receipt.credential,
                     login: receipt.login,
-                    obligations: receipt.obligations
+                    obligations: receipt.obligations,
+                    authenticatedDurableReceipt: true
                 )
+                authenticatedDurableReceipt = true
             } else {
                 value = OwnershipSnapshot()
+                authenticatedDurableReceipt = false
             }
             hydrated = true
             hydrationFailure = nil
             ownershipReceiptResetEligible = false
         } catch let error as SetupOwnershipStoreError {
             value = OwnershipSnapshot(obligations: [.ownershipReceiptRepair])
+            authenticatedDurableReceipt = false
             hydrated = true
             hydrationFailure = error
             ownershipReceiptResetEligible = Self.isResetEligible(error)
             throw error
         } catch {
             value = OwnershipSnapshot(obligations: [.ownershipReceiptRepair])
+            authenticatedDurableReceipt = false
             hydrated = true
             hydrationFailure = .readFailed
             ownershipReceiptResetEligible = false
@@ -2384,6 +2452,7 @@ public actor AppOwnershipLedger {
         var snapshot = value
         snapshot.ownershipReceiptResetEligible = ownershipReceiptResetEligible
         snapshot.emergencyIntegrationRecovery = emergencyIntegrationRecovery
+        snapshot.authenticatedDurableReceipt = authenticatedDurableReceipt
         if let emergencyIntegrationRecovery {
             snapshot.obligations.insert(emergencyIntegrationRecovery.obligation)
         }
@@ -2417,11 +2486,12 @@ public actor AppOwnershipLedger {
         )
         do {
             if receipt.isEmpty {
-                try await store.delete()
+                _ = try await store.deleteCommitted()
             } else {
-                try await store.save(receipt)
+                _ = try await store.saveCommitted(receipt)
             }
             value = proposed
+            authenticatedDurableReceipt = !receipt.isEmpty
             hydrationFailure = nil
             ownershipReceiptResetEligible = false
         } catch let error as SetupOwnershipStoreError {
@@ -2444,6 +2514,7 @@ public actor AppOwnershipLedger {
         }
         try await store.resetInvalidReceipt()
         value = OwnershipSnapshot()
+        authenticatedDurableReceipt = false
         hydrated = true
         hydrationFailure = nil
         ownershipReceiptResetEligible = false

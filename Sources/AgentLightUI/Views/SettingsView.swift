@@ -150,8 +150,19 @@ public struct SettingsView: View {
                 }
 
                 Section("General") {
-                    LabeledContent("Launch at login", value: loginStatusTitle)
-                        .accessibilityIdentifier("settings.general.loginStatus")
+                    LabeledContent("Launch at login") {
+                        NativeMonitoringToggle(
+                            isOn: launchAtLoginBinding.wrappedValue,
+                            accessibilityIdentifier: AmbientAccessibilityID.settingsLaunchAtLogin,
+                            accessibilityLabel: "Launch at login",
+                            onChange: { launchAtLoginBinding.wrappedValue = $0 }
+                        )
+                    }
+                    NativeWrappingText(
+                        text: loginStatusTitle,
+                        accessibilityIdentifier: "settings.general.loginStatus",
+                        isSelectable: false
+                    )
                     if viewModel.loginItemStatus == .requiresApproval {
                         NativeWrappingText(
                             text: "Open System Settings > General > Login Items, then allow Agent Light.",
@@ -161,13 +172,6 @@ public struct SettingsView: View {
                         NativeActionButton(
                             title: "Retry Status",
                             accessibilityIdentifier: AmbientAccessibilityID.settingsRetryLoginStatus
-                        ) {
-                            Task { await viewModel.requestLaunchAtLogin() }
-                        }
-                    } else if viewModel.loginItemStatus != .enabled {
-                        NativeActionButton(
-                            title: "Enable Launch at Login",
-                            accessibilityIdentifier: AmbientAccessibilityID.settingsEnableLogin
                         ) {
                             Task { await viewModel.requestLaunchAtLogin() }
                         }
@@ -225,6 +229,18 @@ public struct SettingsView: View {
             get: { viewModel.monitoringActive },
             set: { enabled in
                 Task { await viewModel.setMonitoringEnabled(enabled) }
+            }
+        )
+    }
+
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: {
+                viewModel.loginItemStatus == .enabled
+                    || viewModel.loginItemStatus == .requiresApproval
+            },
+            set: { enabled in
+                Task { await viewModel.setLaunchAtLoginEnabled(enabled) }
             }
         )
     }

@@ -80,3 +80,9 @@ Manual acceptance still requires:
 - The bundle is ad-hoc signed and unnotarized.
 - Automated fake-Tuya coverage does not establish live Wipro cloud/device readiness.
 - Explicit `stop()` provides the server task-await guarantee; running-server deinit is best-effort cancellation and ownership cleanup only.
+
+## Whole-branch review correction
+
+The follow-up correction from `b81c8c586797` closes fail-closed stored-credential startup, app-launch startup ownership, Tuya authentication-retry command spacing, physical terminal deadline persistence/recovery, committed setup-receipt cleanup outcomes, non-destructive launch-at-login opt-out, masked identifier relaunch hydration, and committed whitespace findings. Detailed RED/GREEN evidence is in `final-review-fix-report.md`.
+
+Fresh verification completed 584/584 parallel tests, the release build, release app bundle, strict ad-hoc signature validation, plist/package/shell checks, whole-range diff validation, and security/artifact/remote scans. Independent re-review and all previously listed manual checks remain outstanding.

@@ -1,5 +1,24 @@
 import Foundation
 
+private actor TuyaCommandRequestGate {
+    private let clock: any AgentLightClock
+    private var nextAllowedStart: Duration?
+
+    init(clock: any AgentLightClock) {
+        self.clock = clock
+    }
+
+    func awaitPermit() async throws {
+        let current = await clock.now()
+        let reservedStart = max(current, nextAllowedStart ?? current)
+        nextAllowedStart = reservedStart + .seconds(1)
+        if reservedStart > current {
+            try await clock.sleep(for: reservedStart - current)
+        }
+        try Task.checkCancellation()
+    }
+}
+
 public actor TuyaClient {
     private struct CachedToken: Sendable {
         let value: String
@@ -26,6 +45,7 @@ public actor TuyaClient {
     private let transport: any TuyaHTTPTransport
     private let now: @Sendable () async -> Date
     private let nonce: @Sendable () async -> String
+    private let commandRequestGate: TuyaCommandRequestGate
     private var cachedToken: CachedToken?
     private var tokenAcquisition: TokenAcquisition?
     private var nextTokenGeneration: UInt64 = 0
@@ -34,12 +54,14 @@ public actor TuyaClient {
         credentials: TuyaCredentials,
         transport: any TuyaHTTPTransport = URLSessionTuyaHTTPTransport(),
         now: @escaping @Sendable () async -> Date = { Date() },
-        nonce: @escaping @Sendable () async -> String = { UUID().uuidString }
+        nonce: @escaping @Sendable () async -> String = { UUID().uuidString },
+        commandClock: any AgentLightClock = ContinuousAgentLightClock()
     ) {
         self.credentials = credentials
         self.transport = transport
         self.now = now
         self.nonce = nonce
+        commandRequestGate = TuyaCommandRequestGate(clock: commandClock)
     }
 
     public func verify() async throws {
@@ -210,6 +232,9 @@ public actor TuyaClient {
         body: Data,
         token: String?
     ) async throws -> JSONValue {
+        if method == "POST", pathComponents.last == "commands" {
+            try await commandRequestGate.awaitPermit()
+        }
         let builtRequest = try await makeRequest(
             method: method,
             pathComponents: pathComponents,

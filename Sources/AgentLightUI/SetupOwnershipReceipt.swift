@@ -105,10 +105,29 @@ public protocol SetupOwnershipStoring: Sendable {
     func load() async throws -> SetupOwnershipReceipt?
     func save(_ receipt: SetupOwnershipReceipt) async throws
     func delete() async throws
+    func saveCommitted(_ receipt: SetupOwnershipReceipt) async throws -> SetupOwnershipMutationOutcome
+    func deleteCommitted() async throws -> SetupOwnershipMutationOutcome
     func resetInvalidReceipt() async throws
 }
 
+public enum SetupOwnershipMutationOutcome: Equatable, Sendable {
+    case complete
+    case committedCleanupPending
+}
+
 public extension SetupOwnershipStoring {
+    func saveCommitted(
+        _ receipt: SetupOwnershipReceipt
+    ) async throws -> SetupOwnershipMutationOutcome {
+        try await save(receipt)
+        return .complete
+    }
+
+    func deleteCommitted() async throws -> SetupOwnershipMutationOutcome {
+        try await delete()
+        return .complete
+    }
+
     func resetInvalidReceipt() async throws {
         throw SetupOwnershipStoreError.resetNotRequired
     }
@@ -161,11 +180,27 @@ public actor MemorySetupOwnershipStore: SetupOwnershipStoring {
 }
 
 public actor FileSetupOwnershipStore: SetupOwnershipStoring {
+    enum DirectorySyncPoint: Sendable {
+        case authoritativeCommit
+        case cleanup
+    }
+
+    typealias DirectorySynchronizer = @Sendable (Int32, DirectorySyncPoint) throws -> Void
+
     private static let maximumEncodedSize = 64 * 1024
     private let url: URL
+    private let synchronizeDirectory: DirectorySynchronizer
 
     public init(url: URL) {
         self.url = url
+        synchronizeDirectory = { descriptor, _ in
+            guard fsync(descriptor) == 0 else { throw SetupOwnershipStoreError.writeFailed }
+        }
+    }
+
+    init(url: URL, synchronizeDirectory: @escaping DirectorySynchronizer) {
+        self.url = url
+        self.synchronizeDirectory = synchronizeDirectory
     }
 
     public func load() async throws -> SetupOwnershipReceipt? {
@@ -218,6 +253,12 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
     }
 
     public func save(_ receipt: SetupOwnershipReceipt) async throws {
+        _ = try await saveCommitted(receipt)
+    }
+
+    public func saveCommitted(
+        _ receipt: SetupOwnershipReceipt
+    ) async throws -> SetupOwnershipMutationOutcome {
         guard receipt.isValid else {
             throw receipt.version == SetupOwnershipReceipt.currentVersion
                 ? SetupOwnershipStoreError.malformedReceipt
@@ -238,7 +279,14 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
         let directory = try openDirectory()
         defer { _ = close(directory) }
         let name = url.lastPathComponent
+        let cleanup = ".\(name).agent-light-cleanup"
         let existing = try authenticatedReceipt(name: name, in: directory)?.identity
+        if try authenticatedReceipt(name: cleanup, in: directory) != nil {
+            guard unlinkat(directory, cleanup, 0) == 0 else {
+                throw SetupOwnershipStoreError.writeFailed
+            }
+            try synchronizeDirectory(directory, .cleanup)
+        }
         let temporary = ".\(name).agent-light-\(UUID().uuidString)"
         let descriptor = openat(
             directory,
@@ -289,11 +337,7 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
                     throw SetupOwnershipStoreError.unsafeReceipt
                 }
                 do {
-                    try sync(directory)
-                    guard unlinkat(directory, temporary, 0) == 0 else {
-                        throw SetupOwnershipStoreError.writeFailed
-                    }
-                    temporaryIsOwned = false
+                    try synchronizeDirectory(directory, .authoritativeCommit)
                 } catch {
                     if renameatx_np(
                         directory,
@@ -307,7 +351,19 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
                     }
                     throw SetupOwnershipStoreError.writeFailed
                 }
-                try sync(directory)
+                guard renameat(directory, temporary, directory, cleanup) == 0 else {
+                    return .committedCleanupPending
+                }
+                temporaryIsOwned = false
+                do {
+                    try synchronizeDirectory(directory, .cleanup)
+                    guard unlinkat(directory, cleanup, 0) == 0 else {
+                        return .committedCleanupPending
+                    }
+                    try synchronizeDirectory(directory, .cleanup)
+                } catch {
+                    return .committedCleanupPending
+                }
             } else {
                 guard renameatx_np(
                     directory,
@@ -320,7 +376,13 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
                     throw SetupOwnershipStoreError.writeFailed
                 }
                 temporaryIsOwned = false
-                try sync(directory)
+                do {
+                    try synchronizeDirectory(directory, .authoritativeCommit)
+                } catch {
+                    _ = renameat(directory, name, directory, temporary)
+                    temporaryIsOwned = true
+                    throw SetupOwnershipStoreError.writeFailed
+                }
             }
             _ = try inspectRequired(name: name, in: directory)
         } catch let error as SetupOwnershipStoreError {
@@ -328,14 +390,27 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
         } catch {
             throw SetupOwnershipStoreError.writeFailed
         }
+        return .complete
     }
 
     public func delete() async throws {
+        _ = try await deleteCommitted()
+    }
+
+    public func deleteCommitted() async throws -> SetupOwnershipMutationOutcome {
         let directory = try openDirectory()
         defer { _ = close(directory) }
         let name = url.lastPathComponent
-        guard let existing = try authenticatedReceipt(name: name, in: directory)?.identity else { return }
-        let quarantine = ".\(name).agent-light-removal-\(UUID().uuidString)"
+        let quarantine = ".\(name).agent-light-cleanup"
+        if try authenticatedReceipt(name: quarantine, in: directory) != nil {
+            guard unlinkat(directory, quarantine, 0) == 0 else {
+                throw SetupOwnershipStoreError.writeFailed
+            }
+            try synchronizeDirectory(directory, .cleanup)
+        }
+        guard let existing = try authenticatedReceipt(name: name, in: directory)?.identity else {
+            return .complete
+        }
         guard renameatx_np(
             directory,
             name,
@@ -350,12 +425,29 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
         guard try inspectRequired(name: quarantine, in: directory) == existing else {
             throw SetupOwnershipStoreError.unsafeReceipt
         }
-        try sync(directory)
-        guard unlinkat(directory, quarantine, 0) == 0 else {
+        do {
+            try synchronizeDirectory(directory, .authoritativeCommit)
+        } catch {
+            _ = renameat(directory, quarantine, directory, name)
             throw SetupOwnershipStoreError.writeFailed
         }
+        do {
+            try synchronizeDirectory(directory, .cleanup)
+        } catch {
+            quarantineExists = false
+            return .committedCleanupPending
+        }
+        guard unlinkat(directory, quarantine, 0) == 0 else {
+            quarantineExists = false
+            return .committedCleanupPending
+        }
         quarantineExists = false
-        try sync(directory)
+        do {
+            try synchronizeDirectory(directory, .cleanup)
+        } catch {
+            return .committedCleanupPending
+        }
+        return .complete
     }
 
     public func resetInvalidReceipt() async throws {

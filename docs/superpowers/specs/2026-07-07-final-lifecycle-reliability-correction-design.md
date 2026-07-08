@@ -1,7 +1,7 @@
 # Agent Light Final Lifecycle and Reliability Correction Design
 
-**Date:** 2026-07-07  
-**Status:** Approved approach; written-spec review pending  
+**Date:** 2026-07-07
+**Status:** Approved approach; written-spec review pending
 **Scope:** Correct the Critical and Important findings from the branch-wide review before live credentials, hook installation, login registration, or bulb acceptance testing.
 
 ## Goals

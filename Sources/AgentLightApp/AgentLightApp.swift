@@ -5,11 +5,15 @@ import AgentLightUI
 struct AgentLightApp: App {
     @State private var environment: AppEnvironment
     @State private var viewModel: AppViewModel
+    @State private var launchController: ApplicationLaunchController
 
     init() {
         let composition = ProductionAppComposition.make()
         _environment = State(initialValue: composition.environment)
         _viewModel = State(initialValue: composition.viewModel)
+        _launchController = State(initialValue: ApplicationLaunchController {
+            composition.environment.requestStart()
+        })
     }
 
     var body: some Scene {
@@ -28,9 +32,25 @@ struct AgentLightApp: App {
                     )
                 }
             }
-            .onAppear { environment.requestStart() }
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+@MainActor
+final class ApplicationLaunchController {
+    private var started = false
+    private let start: @MainActor () -> Void
+
+    init(start: @escaping @MainActor () -> Void) {
+        self.start = start
+        startIfNeeded()
+    }
+
+    func startIfNeeded() {
+        guard !started else { return }
+        started = true
+        start()
     }
 }
 

@@ -4,6 +4,51 @@ import XCTest
 @testable import AgentLightCore
 
 final class TuyaClientTests: XCTestCase {
+    func testAuthenticationRetryCommandPOSTWaitsOneSecondWhileTokenRefreshIsExempt() async throws {
+        let clock = ManualClock()
+        let transport = TimedAuthenticationRetryTransport(clock: clock)
+        let client = makeClient(transport: transport, commandClock: clock)
+
+        let sending = Task {
+            try await client.send(commands: [TuyaCommand(code: "switch_led", value: .bool(true))])
+        }
+        await clock.waitForSleepCount(1)
+
+        let beforePermit = await transport.events()
+        XCTAssertEqual(beforePermit.map(\.kind), [.token, .command, .token])
+        XCTAssertEqual(beforePermit.map(\.instant), [.zero, .zero, .zero])
+
+        await clock.advance(by: .milliseconds(999))
+        let commandCountBeforePermit = await transport.commandCount()
+        XCTAssertEqual(commandCountBeforePermit, 1)
+        await clock.advance(by: .milliseconds(1))
+        try await sending.value
+
+        let commands = await transport.events().filter { $0.kind == .command }
+        XCTAssertEqual(commands.map(\.instant), [.zero, .seconds(1)])
+    }
+
+    func testLongCommandResponseDoesNotAddDelayAfterOneSecondHasElapsed() async throws {
+        let clock = ManualClock()
+        let transport = BlockingFirstCommandTransport(clock: clock)
+        let client = makeClient(transport: transport, commandClock: clock)
+
+        let first = Task {
+            try await client.send(commands: [TuyaCommand(code: "switch_led", value: .bool(true))])
+        }
+        await transport.waitForFirstCommand()
+        await clock.advance(by: .seconds(2))
+        await transport.releaseFirstCommand()
+        try await first.value
+
+        try await client.send(commands: [TuyaCommand(code: "switch_led", value: .bool(false))])
+
+        let commandInstants = await transport.commandInstants()
+        let sleepCount = await clock.sleepRequestCount()
+        XCTAssertEqual(commandInstants, [.zero, .seconds(2)])
+        XCTAssertEqual(sleepCount, 0)
+    }
+
     func testRejectsEveryNonAllowlistedEndpointBeforeTransportOrSigning() async throws {
         let invalidEndpoints = [
             "https://evil.example",
@@ -515,7 +560,8 @@ private let testEndpoint = URL(string: "https://openapi.tuyaus.com") ?? URL(file
 
 private func makeClient<Transport: TuyaHTTPTransport>(
     transport: Transport,
-    now: @escaping @Sendable () async -> Date = { testDate }
+    now: @escaping @Sendable () async -> Date = { testDate },
+    commandClock: any AgentLightClock = ContinuousAgentLightClock()
 ) -> TuyaClient {
     let nonceSequence = NonceSequence()
     return TuyaClient(
@@ -527,8 +573,95 @@ private func makeClient<Transport: TuyaHTTPTransport>(
         ),
         transport: transport,
         now: now,
-        nonce: { await nonceSequence.next() }
+        nonce: { await nonceSequence.next() },
+        commandClock: commandClock
     )
+}
+
+private struct TimedRequestEvent: Equatable, Sendable {
+    enum Kind: Equatable, Sendable { case token, command }
+    let kind: Kind
+    let instant: Duration
+}
+
+private actor TimedAuthenticationRetryTransport: TuyaHTTPTransport {
+    private let clock: ManualClock
+    private var recorded: [TimedRequestEvent] = []
+    private var tokenCount = 0
+    private var commands = 0
+
+    init(clock: ManualClock) {
+        self.clock = clock
+    }
+
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let instant = await clock.now()
+        if isTokenRequest(request) {
+            tokenCount += 1
+            recorded.append(TimedRequestEvent(kind: .token, instant: instant))
+            return try testResponse(
+                request: request,
+                statusCode: 200,
+                body: tokenJSON("token-\(tokenCount)", expiresIn: 7_200)
+            )
+        }
+        commands += 1
+        recorded.append(TimedRequestEvent(kind: .command, instant: instant))
+        if commands == 1 {
+            return try testResponse(
+                request: request,
+                statusCode: 200,
+                body: businessErrorJSON(code: 1010, message: "expired")
+            )
+        }
+        return try testResponse(request: request, statusCode: 200, body: successJSON(result: "true"))
+    }
+
+    func events() -> [TimedRequestEvent] { recorded }
+    func commandCount() -> Int { commands }
+}
+
+private actor BlockingFirstCommandTransport: TuyaHTTPTransport {
+    private let clock: ManualClock
+    private var commands: [Duration] = []
+    private var firstCommandEntered = false
+    private var firstCommandWaiters: [CheckedContinuation<Void, Never>] = []
+    private var firstCommandRelease: CheckedContinuation<Void, Never>?
+
+    init(clock: ManualClock) {
+        self.clock = clock
+    }
+
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        if isTokenRequest(request) {
+            return try testResponse(
+                request: request,
+                statusCode: 200,
+                body: tokenJSON("token", expiresIn: 7_200)
+            )
+        }
+        commands.append(await clock.now())
+        if commands.count == 1 {
+            firstCommandEntered = true
+            let waiters = firstCommandWaiters
+            firstCommandWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            await withCheckedContinuation { firstCommandRelease = $0 }
+        }
+        return try testResponse(request: request, statusCode: 200, body: successJSON(result: "true"))
+    }
+
+    func waitForFirstCommand() async {
+        if firstCommandEntered { return }
+        await withCheckedContinuation { firstCommandWaiters.append($0) }
+    }
+
+    func releaseFirstCommand() {
+        firstCommandRelease?.resume()
+        firstCommandRelease = nil
+    }
+
+    func commandInstants() -> [Duration] { commands }
 }
 
 private func concurrentStatuses(client: TuyaClient, count: Int) async throws -> [[TuyaStatus]] {

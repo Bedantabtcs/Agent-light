@@ -206,7 +206,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncEqual(await light.restoreCount(), 1)
     }
 
-    func testCompletedHoldStartsOnlyAfterCommittedRecoveryIsDurable() async throws {
+    func testCompletedHoldExpiresFromPhysicalApplyWhileCommitPersistenceIsBlocked() async throws {
         let clock = ManualClock()
         let light = RecordingLightController(attemptClock: clock)
         let store = MemoryRecoveryStore()
@@ -218,24 +218,116 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await clock.advance(by: .seconds(1))
         await light.waitForOperationCount(2)
         await store.waitUntilSaveCallIsBlocked(3)
+        let timerScheduled = await eventually { await clock.sleepRequestCount() >= 2 }
+        XCTAssertTrue(timerScheduled)
 
-        await clock.advance(by: .seconds(20))
+        await clock.advance(by: .milliseconds(7_999))
         await drainScheduledTasks()
         await XCTAssertAsyncEqual(await light.restoreCount(), 0)
         await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .completed)
 
+        await clock.advance(by: .milliseconds(1))
+        let restoredAtDeadline = await eventually { await light.restoreCount() == 1 }
+        XCTAssertTrue(restoredAtDeadline)
+
         await store.releaseSaveCall(3)
-        await orchestrator.waitForLastApplied(desired(.completed))
-        await clock.waitForSleepCount(2)
-        await clock.advance(by: .milliseconds(7_999))
+        await drainScheduledTasks(iterations: 500)
+        await XCTAssertAsyncNil(await store.storedRecord())
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .idle)
+    }
+
+    func testRecoveryHonorsOnlyRemainingUnexpiredPhysicalTerminalHold() async throws {
+        let applied = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = MonitoringRecoveryRecord(
+            baseline: .testBaseline,
+            lastCommand: desired(.completed),
+            terminal: MonitoringTerminalRecovery(
+                appliedAt: applied,
+                deadline: applied.addingTimeInterval(8)
+            )
+        )
+        let light = RecordingLightController(matchResults: [.success(true), .success(true)])
+        let store = MemoryRecoveryStore(record: record)
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(
+            light: light,
+            store: store,
+            clock: clock,
+            wallNow: { applied.addingTimeInterval(3) }
+        )
+
+        let recovery = Task { try await orchestrator.recoverIfNeeded() }
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .milliseconds(4_999))
         await drainScheduledTasks()
         await XCTAssertAsyncEqual(await light.restoreCount(), 0)
         await clock.advance(by: .milliseconds(1))
-        await light.waitForOperationCount(3)
+        try await recovery.value
+
         await XCTAssertAsyncEqual(await light.restoreCount(), 1)
+        await XCTAssertAsyncNil(await store.storedRecord())
     }
 
-    func testSupersededLateTerminalCommitPreservesNewerSourceThenFallsBackByIdentity() async throws {
+    func testRecoveryTreatsExpiredTerminalMetadataAsImmediateRestore() async throws {
+        let applied = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = MonitoringRecoveryRecord(
+            baseline: .testBaseline,
+            lastCommand: desired(.error),
+            terminal: MonitoringTerminalRecovery(
+                appliedAt: applied,
+                deadline: applied.addingTimeInterval(12)
+            )
+        )
+        let light = RecordingLightController(matchResults: [.success(true)])
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(
+            light: light,
+            store: MemoryRecoveryStore(record: record),
+            clock: clock,
+            wallNow: { applied.addingTimeInterval(13) }
+        )
+
+        try await orchestrator.recoverIfNeeded()
+
+        await XCTAssertAsyncEqual(await light.restoreCount(), 1)
+        await XCTAssertAsyncEqual(await clock.sleepRequestCount(), 0)
+    }
+
+    func testRecoveryDoesNotRestoreWhenBulbChangesDuringRemainingTerminalHold() async throws {
+        let applied = Date(timeIntervalSince1970: 1_700_000_000)
+        let external = BulbBaseline(values: ["switch_led": .bool(false)])
+        let record = MonitoringRecoveryRecord(
+            baseline: .testBaseline,
+            lastCommand: desired(.completed),
+            terminal: MonitoringTerminalRecovery(
+                appliedAt: applied,
+                deadline: applied.addingTimeInterval(8)
+            )
+        )
+        let light = RecordingLightController(
+            baseline: external,
+            matchResults: [.success(true), .success(false)]
+        )
+        let store = MemoryRecoveryStore(record: record)
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(
+            light: light,
+            store: store,
+            clock: clock,
+            wallNow: { applied.addingTimeInterval(3) }
+        )
+
+        let recovery = Task { try await orchestrator.recoverIfNeeded() }
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(5))
+        try await recovery.value
+
+        await XCTAssertAsyncEqual(await light.restoreCount(), 0)
+        await XCTAssertAsyncEqual(await light.operations.filter { $0 == .capture }.count, 1)
+        await XCTAssertAsyncNil(await store.storedRecord())
+    }
+
+    func testSupersededLateTerminalCommitCannotExtendOlderPhysicalHold() async throws {
         let clock = ManualClock()
         let light = RecordingLightController(attemptClock: clock)
         let store = MemoryRecoveryStore()
@@ -250,33 +342,20 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
         await orchestrator.accept(makeEvent(source: .cursor, session: "shared", state: .error))
         await store.releaseSaveCall(3)
-        await clock.waitForSleepCount(2)
+        await clock.waitForSleepCount(3)
         await clock.advance(by: .seconds(1))
         await orchestrator.waitForLastApplied(desired(.error))
+        await clock.waitForSleepCount(4)
 
-        await clock.advance(by: .seconds(8))
+        await clock.advance(by: .milliseconds(11_999))
         await drainScheduledTasks()
         await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .error)
         await XCTAssertAsyncEqual(await light.restoreCount(), 0)
-        await clock.advance(by: .seconds(4))
-        let fellBackToOlderIdentity = await eventually {
-            let state = await orchestrator.currentSnapshot().state
-            let sleepCount = await clock.sleepRequestCount()
-            return state == .completed && sleepCount >= 4
-        }
-        XCTAssertTrue(fellBackToOlderIdentity)
-        guard fellBackToOlderIdentity else { return }
-        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .completed)
-        await XCTAssertAsyncEqual(await light.restoreCount(), 0)
-        await clock.advance(by: .seconds(1))
+        await clock.advance(by: .milliseconds(1))
         await light.waitForOperationCount(4)
-        await orchestrator.waitForLastApplied(desired(.completed))
-        await clock.waitForSleepCount(5)
-        await clock.advance(by: .seconds(8))
-        await XCTAssertAsyncTrue(await eventually {
-            await light.restoreCount() == 1
-        })
         await XCTAssertAsyncEqual(await light.restoreCount(), 1)
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .idle)
+        await XCTAssertAsyncEqual(await light.appliedStates(), [desired(.completed), desired(.error)])
     }
 
     func testRepeatedSameSessionCompletedRequiresFreshApplyCommitAndHold() async throws {
@@ -416,7 +495,12 @@ final class MonitoringOrchestratorTests: XCTestCase {
             await orchestrator.reconnect()
             await completions.increment()
         }
-        await clock.waitForSleepCount(2)
+        let healthScheduled = await eventually { await clock.sleepRequestCount() >= 3 }
+        XCTAssertTrue(healthScheduled)
+        guard healthScheduled else {
+            reconnect.cancel()
+            return
+        }
         await clock.advance(by: .seconds(1))
         await drainScheduledTasks(iterations: 5_000)
         guard await completions.value() == 0 else {
@@ -424,17 +508,36 @@ final class MonitoringOrchestratorTests: XCTestCase {
             await reconnect.value
             return
         }
-        await clock.waitForSleepCount(3)
+        let reapplyScheduled = await eventually { await clock.sleepRequestCount() >= 4 }
+        XCTAssertTrue(reapplyScheduled)
+        guard reapplyScheduled else {
+            reconnect.cancel()
+            return
+        }
         await clock.advance(by: .seconds(1))
-        await light.waitForOperationCount(4)
+        let reapplied = await eventually { await light.appliedStates().count == 2 }
+        XCTAssertTrue(reapplied)
+        guard reapplied else {
+            reconnect.cancel()
+            return
+        }
+        let reconnectCompleted = await eventually { await completions.value() == 1 }
+        XCTAssertTrue(reconnectCompleted)
+        guard reconnectCompleted else {
+            reconnect.cancel()
+            return
+        }
         await reconnect.value
-        await clock.waitForSleepCount(4)
+        let holdScheduled = await eventually { await clock.sleepRequestCount() >= 5 }
+        XCTAssertTrue(holdScheduled)
+        guard holdScheduled else { return }
 
         await clock.advance(by: .milliseconds(7_999))
         await drainScheduledTasks()
         await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .completed)
         await clock.advance(by: .milliseconds(1))
-        await light.waitForOperationCount(5)
+        let restored = await eventually { await light.restoreCount() == 1 }
+        XCTAssertTrue(restored)
         await XCTAssertAsyncEqual(await light.appliedStates().count, 2)
     }
 
@@ -2964,12 +3067,14 @@ final class MonitoringOrchestratorTests: XCTestCase {
     private func makeOrchestrator(
         light: RecordingLightController = RecordingLightController(),
         store: MemoryRecoveryStore = MemoryRecoveryStore(),
-        clock: any AgentLightClock = ManualClock()
+        clock: any AgentLightClock = ManualClock(),
+        wallNow: @escaping @Sendable () -> Date = { Date() }
     ) -> MonitoringOrchestrator {
         MonitoringOrchestrator(
             light: light,
             recoveryStore: store,
             clock: clock,
+            wallNow: wallNow,
             jitter: { _ in .zero },
             isTransient: { ($0 as? TestLightError) == .transient }
         )

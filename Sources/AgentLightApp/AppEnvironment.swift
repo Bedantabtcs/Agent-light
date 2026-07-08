@@ -212,7 +212,8 @@ final class AppEnvironment {
                     accessSecret: storedCredentials.accessSecret,
                     deviceID: storedCredentials.deviceID
                 ))
-                if await viewModel.phase == .integrationReview {
+                if await viewModel.phase == .integrationReview,
+                   await viewModel.automaticSetupResumeAuthorized {
                     await beforeApproval()
                     await viewModel.approveIntegrations()
                 }

@@ -155,6 +155,33 @@ final class ViewRenderingTests: XCTestCase {
         _ = try renderedButton("settings.general.retryLoginStatus", in: hosting)
     }
 
+    func testRenderedLaunchAtLoginToggleDisablesPendingRegistrationAccessibly() async throws {
+        let harness = ViewModelHarness()
+        harness.loginItem.registerResult = .requiresApproval
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.viewModel.approveIntegrations()
+        let hosting = host(SettingsView(viewModel: harness.viewModel))
+
+        let loginSwitch = try XCTUnwrap(
+            descendants(of: hosting)
+                .compactMap { $0 as? NSSwitch }
+                .first {
+                    $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsLaunchAtLogin
+                }
+        )
+        XCTAssertEqual(loginSwitch.state, .on)
+        XCTAssertEqual(loginSwitch.accessibilityLabel(), "Launch at login")
+        XCTAssertEqual(loginSwitch.accessibilityRole(), .checkBox)
+        loginSwitch.state = .off
+        XCTAssertTrue(loginSwitch.sendAction(loginSwitch.action, to: loginSwitch.target))
+        for _ in 0..<100 where harness.loginItem.disableCount == 0 {
+            await nextMainTurn()
+        }
+
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
+        XCTAssertEqual(harness.viewModel.loginItemStatus, .notRegistered)
+    }
+
     func testREADMEExplainsManualCodexTrustSequenceAndSkippedHooks() throws {
         let readmeURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appending(path: "README.md")
@@ -422,6 +449,7 @@ final class ViewRenderingTests: XCTestCase {
             (AmbientAccessibilityID.settingsReplaceDevice, "Replace Device", .button),
             (AmbientAccessibilityID.settingsRepair, "Preview Repair", .button),
             (AmbientAccessibilityID.settingsUninstall, "Uninstall Integrations", .button),
+            (AmbientAccessibilityID.settingsLaunchAtLogin, "Launch at login", .checkBox),
             (AmbientAccessibilityID.settingsMonitoring, "Monitoring", .checkBox)
         ]
         for (identifier, label, role) in expected {
