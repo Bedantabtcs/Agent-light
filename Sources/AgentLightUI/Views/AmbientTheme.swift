@@ -43,6 +43,7 @@ enum AmbientTheme {
     }
 
     static let windowWidth: CGFloat = 380
+    static let windowHeight: CGFloat = 540
     static let background = Color(red: 0.025, green: 0.035, blue: 0.075)
     static let surface = Color.white.opacity(0.075)
     static let strongSurface = Color.white.opacity(0.12)

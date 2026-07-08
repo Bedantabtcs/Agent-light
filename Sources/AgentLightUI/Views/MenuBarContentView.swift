@@ -35,7 +35,7 @@ public struct MenuBarContentView: View {
                 phaseContent
             }
         }
-        .frame(width: AmbientTheme.windowWidth)
+        .frame(width: AmbientTheme.windowWidth, height: AmbientTheme.windowHeight)
         .background(AmbientTheme.background)
         .preferredColorScheme(.dark)
     }

@@ -9,6 +9,20 @@ import AgentLightProtocol
 final class ViewRenderingTests: XCTestCase {
     private var windows: [NSWindow] = []
 
+    func testMenuBarContentProvidesStableIntrinsicPanelSize() async {
+        let viewModels = [
+            PreviewViewModel.onboarding(),
+            await PreviewViewModel.integrationReview(),
+            await PreviewViewModel.monitoring(state: .working)
+        ]
+
+        for viewModel in viewModels {
+            let hosting = intrinsicHost(MenuBarContentView(viewModel: viewModel))
+            XCTAssertEqual(hosting.fittingSize.width, 380, accuracy: 1)
+            XCTAssertEqual(hosting.fittingSize.height, 540, accuracy: 1)
+        }
+    }
+
     func testMonitoringViewRendersAtCompactSizeWithLongContent() async {
         let sessions = (0..<14).map { index in
             AgentEvent(
@@ -953,6 +967,12 @@ final class ViewRenderingTests: XCTestCase {
         window.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate()
         windows.append(window)
+        hosting.layoutSubtreeIfNeeded()
+        return hosting
+    }
+
+    private func intrinsicHost<Content: View>(_ content: Content) -> NSHostingView<Content> {
+        let hosting = NSHostingView(rootView: content)
         hosting.layoutSubtreeIfNeeded()
         return hosting
     }
