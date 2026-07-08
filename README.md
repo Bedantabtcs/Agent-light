@@ -95,7 +95,7 @@ Rapid states inside the one-second outbound-command throttle window may collapse
 - The local Unix datagram socket is created with mode `0600` inside `~/Library/Application Support/Agent Light`.
 - If the app or socket is unavailable, the relay exits successfully so the source agent is not blocked.
 - The recovery record contains bulb state and command metadata, not credentials. Its directory is restricted to the current user.
-- Completed/Error recovery metadata contains only the physical apply timestamp and deadline. Their 8/12-second countdown begins when the bulb command succeeds; slow or failed persistence cannot extend it.
+- Completed/Cancelled/Error recovery metadata contains only the physical apply timestamp and deadline. The 8/8/12-second holds begin when the bulb command succeeds; slow or failed persistence cannot extend them.
 - Outbound Tuya command attempts, including retries, authentication-retry command POSTs, and baseline restoration, begin no less than one second apart. Token requests are exempt. Obsolete retries are discarded when a newer desired state wins.
 - Monitoring recovery is bounded to the active record, one previous record, one tombstone, one lock, and a transient fixed staging slot. Unknown files in the directory are not removed.
 
@@ -131,12 +131,13 @@ These checks intentionally are not performed by build or test scripts because th
    - Abort a Cursor run and confirm Cancelled orange; do not expect an explicit Cancelled transition from the current Codex or Claude Code hook event sets.
 5. Trigger supported permission waits, completion, error, pause, quit, and reconnect behavior.
 6. Confirm Completed holds for 8 seconds, Cancelled holds for 8 seconds, Error holds for 12 seconds, and the original bulb state is restored from both powered-on and powered-off baselines.
-7. Close the app and invoke every installed hook. Each must exit successfully within 200 ms.
-8. Inspect all three config files and confirm unrelated hooks remain semantically unchanged after install, repair, and uninstall.
-9. Confirm launch at login is enabled only after approved setup and that relaunch resumes monitoring.
-10. If macOS requires login-item approval, complete it in System Settings, select **Retry Status**, and confirm the app transitions from pending approval without registering a second item.
-11. Turn **Launch at login** off from both Enabled and Approval required states; confirm monitoring, credentials, device selection, and hooks remain intact. If receipt saving fails after unregistering, confirm the switch returns On, an absent item offers **Retry saving disabled login state**, or an ambiguous status offers read-only **Retry Status**; verify both retries avoid register/unregister calls.
-12. Quit and relaunch after approved setup; confirm masked Access ID and Device ID appear without another interactive connection attempt.
+7. Open macOS Accessibility Inspector, select the bulb element `ambientBulb.status`, and for Reading, Editing, Testing, and Cancelled confirm label `Light state` and the matching state name as its accessibility value.
+8. Close the app and invoke every installed hook. Each must exit successfully within 200 ms.
+9. Inspect all three config files and confirm unrelated hooks remain semantically unchanged after install, repair, and uninstall.
+10. Confirm launch at login is enabled only after approved setup and that relaunch resumes monitoring.
+11. If macOS requires login-item approval, complete it in System Settings, select **Retry Status**, and confirm the app transitions from pending approval without registering a second item.
+12. Turn **Launch at login** off from both Enabled and Approval required states; confirm monitoring, credentials, device selection, and hooks remain intact. If receipt saving fails after unregistering, confirm the switch returns On, an absent item offers **Retry saving disabled login state**, or an ambiguous status offers read-only **Retry Status**; verify both retries avoid register/unregister calls.
+13. Quit and relaunch after approved setup; confirm masked Access ID and Device ID appear without another interactive connection attempt.
 
 Expected failure modes:
 

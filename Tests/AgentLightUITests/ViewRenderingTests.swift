@@ -322,6 +322,13 @@ final class ViewRenderingTests: XCTestCase {
         XCTAssertTrue(readme.localizedCaseInsensitiveContains("untrusted hooks are skipped"))
         XCTAssertTrue(readme.contains("All monitoring colors use 80% value/brightness."))
         XCTAssertTrue(readme.contains("Cancelled holds for 8 seconds"))
+        XCTAssertTrue(readme.contains(
+            "Completed/Cancelled/Error recovery metadata contains only the physical apply "
+                + "timestamp and deadline. The 8/8/12-second holds begin when the bulb command "
+                + "succeeds; slow or failed persistence cannot extend them."
+        ))
+        XCTAssertTrue(readme.contains("Accessibility Inspector"))
+        XCTAssertTrue(readme.contains("ambientBulb.status"))
     }
 
     func testVerifyingAndApprovingProgressRender() async {
