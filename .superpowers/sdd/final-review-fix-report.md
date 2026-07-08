@@ -61,3 +61,19 @@ The final independent review identified four additional edge cases. All four wer
 - Stress: Tuya construction/cancellation cases 20/20; backward/excessive recovery, monitoring/paused login retry, and fixed-artifact rename failure cases 10/10 each.
 - Full gate: `swift test --parallel` 593/593; release build, app bundle build, strict code-sign verification, plist lint, package dump, shell syntax, diff check, bundle inventory, and source security scans passed.
 - The bundle remains ad hoc signed with no Team ID. Live app, HOME/login/Keychain/bulb, Developer ID, notarization, and formal readiness checks remain manual and were not performed.
+
+## Final login-reconciliation addendum
+
+The final UX review found that a successful login-item unregister followed by receipt-write failure left the switch Off with no durable relaunch recovery path. Deterministic model and rendered tests first failed on the missing compensation/retry API and accessibility identifier.
+
+- After unregister succeeds but receipt persistence fails, Agent Light now attempts to restore the registration so macOS state again matches the durable receipt. A successful compensation returns the rendered switch to On, keeps Monitoring/Paused and all setup intact, and presents only a sanitized operation error. A second rendered Off action retries the full opt-out.
+- When compensation cannot confirm Enabled, Settings renders an accessible **Retry saving disabled login state** action. It persists login ownership as none only when macOS currently reports Not registered/Not found, never calls unregister/register again, clears only the transient receipt failure on success, and returns to Monitoring/Paused.
+- Ownership synchronization now compares durable login ownership with current macOS status. A fresh view model/ledger derives an actionable repair when the receipt says owned but the item is absent, resumes retained monitoring, and offers the same receipt-only retry without enabling anything automatically.
+- Requires approval and Unknown states fail closed. Retry does not clear durable authority until macOS confirms the item is absent; pending compensation can instead be disabled again through the switch.
+- README recovery guidance and the stable accessibility identifier list now document/expose the reconciliation flow.
+
+### Final login-reconciliation verification
+
+- Focused: `AppViewModelTests` 152/152, `ViewRenderingTests` 25/25, `AppEnvironmentTests` 33/33, and setup-receipt/login-controller tests 31/31.
+- Stress: compensation/retry/relaunch/ambiguous model cases 20/20; rendered switch/button/relaunch target-action cases 10/10.
+- Full gate: `swift test --parallel` 598/598 before the final release and artifact verification pass.

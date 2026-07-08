@@ -21,6 +21,7 @@ enum AmbientAccessibilityID {
     static let settingsResetOwnershipReceipt = "settings.integrations.resetOwnershipReceipt"
     static let settingsEnableLogin = "settings.general.enableLogin"
     static let settingsRetryLoginStatus = "settings.general.retryLoginStatus"
+    static let settingsRetryDisabledLoginState = "settings.general.retryDisabledLoginState"
     static let settingsLaunchAtLogin = "settings.general.launchAtLogin"
     static let settingsMonitoring = "settings.general.monitoring"
 
@@ -48,6 +49,7 @@ enum AmbientAccessibilityID {
         settingsMonitoring,
         settingsLaunchAtLogin,
         settingsEnableLogin,
-        settingsRetryLoginStatus
+        settingsRetryLoginStatus,
+        settingsRetryDisabledLoginState
     ]
 }

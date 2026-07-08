@@ -24,6 +24,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     var codexTrustStatus: IntegrationTrustStatus { get }
     var monitoringActive: Bool { get }
     var automaticSetupResumeAuthorized: Bool { get }
+    var loginDisabledStatePersistenceRetryRequired: Bool { get }
     func connect(using draft: ConnectionDraft) async
     func approveIntegrations() async
     func pause() async
@@ -35,6 +36,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     func synchronizeOwnership() async
     func requestLaunchAtLogin() async
     func setLaunchAtLoginEnabled(_ enabled: Bool) async
+    func retrySavingDisabledLoginState() async
     func confirmCodexTrust()
     func reconnect() async
     func previewIntegrationRepair() async
@@ -49,6 +51,7 @@ public extension AppViewModeling {
     var loginItemStatus: LoginItemStatus { .unknown }
     func requestLaunchAtLogin() async {}
     func setLaunchAtLoginEnabled(_ enabled: Bool) async {}
+    func retrySavingDisabledLoginState() async {}
     func confirmCodexTrust() {}
     var maskedAccessID: String? { nil }
     var maskedDeviceID: String? { nil }
@@ -58,6 +61,7 @@ public extension AppViewModeling {
     var codexTrustStatus: IntegrationTrustStatus { .notRequired }
     var monitoringActive: Bool { false }
     var automaticSetupResumeAuthorized: Bool { false }
+    var loginDisabledStatePersistenceRetryRequired: Bool { false }
     func reconnect() async {}
     func previewIntegrationRepair() async {}
     func uninstallIntegrations() async {}
@@ -148,6 +152,7 @@ public final class AppViewModel: AppViewModeling {
     public private(set) var monitoringActive = false
     public private(set) var automaticSetupResumeAuthorized = false
     public private(set) var canResetOwnershipReceipt = false
+    public private(set) var loginDisabledStatePersistenceRetryRequired = false
 
     @ObservationIgnored private let credentials: any CredentialStoring
     @ObservationIgnored private let integrations: any IntegrationInstalling
@@ -779,18 +784,14 @@ public final class AppViewModel: AppViewModeling {
             }
             let snapshot = await ownershipLedger.snapshot()
             if snapshot.login != .none {
-                try await ownershipLedger.update(.login(.none))
-                let updated = await ownershipLedger.snapshot()
-                syncOwnership(updated)
-                if updated.obligations.isEmpty {
-                    phase = loginOptOutRecoveryPhase
-                        ?? (monitoringActive ? .monitoring : .paused)
-                    loginOptOutRecoveryPhase = nil
-                    presentedError = nil
-                } else {
-                    phase = .repairRequired
-                    presentedError = .operationFailed
+                do {
+                    try await ownershipLedger.update(.login(.none))
+                } catch {
+                    await handleDisabledLoginPersistenceFailure()
+                    await ownershipLedger.releaseLease(lease)
+                    return
                 }
+                finishDisabledLoginPersistence(await ownershipLedger.snapshot())
             }
             loginRegistrationOwned = false
             if outstandingObligations.isEmpty {
@@ -806,6 +807,73 @@ public final class AppViewModel: AppViewModeling {
             presentedError = .operationFailed
         }
         await ownershipLedger.releaseLease(lease)
+    }
+
+    public func retrySavingDisabledLoginState() async {
+        guard loginDisabledStatePersistenceRetryRequired,
+              phase == .repairRequired,
+              let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        loginItemStatus = loginItem.status()
+        guard loginItemStatus == .notRegistered || loginItemStatus == .notFound else {
+            presentedError = .operationFailed
+            await ownershipLedger.releaseLease(lease)
+            return
+        }
+        do {
+            let snapshot = await ownershipLedger.snapshot()
+            if snapshot.login != .none {
+                try await ownershipLedger.update(.login(.none))
+            } else {
+                await ownershipLedger.clearTransientPersistenceRepair()
+            }
+            finishDisabledLoginPersistence(await ownershipLedger.snapshot())
+        } catch {
+            syncOwnership(await ownershipLedger.snapshot())
+            phase = .repairRequired
+            presentedError = .operationFailed
+        }
+        await ownershipLedger.releaseLease(lease)
+    }
+
+    private func handleDisabledLoginPersistenceFailure() async {
+        do {
+            loginItemStatus = try loginItem.setEnabled(true).current
+        } catch {
+            loginItemStatus = loginItem.status()
+        }
+        if loginItemStatus == .enabled {
+            await ownershipLedger.clearTransientPersistenceRepair()
+            let restored = await ownershipLedger.snapshot()
+            syncOwnership(restored)
+            loginDisabledStatePersistenceRetryRequired = false
+            if restored.obligations.isEmpty {
+                phase = loginOptOutRecoveryPhase
+                    ?? (monitoringActive ? .monitoring : .paused)
+                loginOptOutRecoveryPhase = nil
+            } else {
+                phase = .repairRequired
+            }
+        } else {
+            syncOwnership(await ownershipLedger.snapshot())
+            loginDisabledStatePersistenceRetryRequired = true
+            phase = .repairRequired
+        }
+        presentedError = .operationFailed
+    }
+
+    private func finishDisabledLoginPersistence(_ snapshot: OwnershipSnapshot) {
+        syncOwnership(snapshot)
+        loginDisabledStatePersistenceRetryRequired = false
+        loginRegistrationOwned = false
+        if snapshot.obligations.isEmpty {
+            phase = loginOptOutRecoveryPhase
+                ?? (monitoringActive ? .monitoring : .paused)
+            loginOptOutRecoveryPhase = nil
+            presentedError = nil
+        } else {
+            phase = .repairRequired
+            presentedError = .operationFailed
+        }
     }
 
     public func confirmCodexTrust() {
@@ -1028,6 +1096,11 @@ public final class AppViewModel: AppViewModeling {
             await ownershipLedger.releaseLease(lease)
             return
         }
+        loginItemStatus = loginItem.status()
+        let loginReconciliationRequired = refreshLoginPersistenceReconciliation(
+            snapshot: snapshot,
+            status: loginItemStatus
+        )
         syncOwnership(snapshot)
         hydrateMaskedIdentifiersIfOwned(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
@@ -1066,6 +1139,10 @@ public final class AppViewModel: AppViewModeling {
                 phase = .paused
                 presentedError = Self.presentationError(for: error)
             }
+            if loginReconciliationRequired {
+                phase = .repairRequired
+                presentedError = .operationFailed
+            }
             await ownershipLedger.releaseLease(lease)
             return
         }
@@ -1082,6 +1159,10 @@ public final class AppViewModel: AppViewModeling {
             phase = .repairRequired
             presentedError = Self.presentationError(for: snapshot)
         }
+        if loginReconciliationRequired {
+            phase = .repairRequired
+            presentedError = .operationFailed
+        }
         await ownershipLedger.releaseLease(lease)
     }
 
@@ -1094,10 +1175,19 @@ public final class AppViewModel: AppViewModeling {
         guard let lease = await ownershipLedger.acquireLeaseForCaller() else { return false }
         await ownershipLedger.registerPresentationHandle(presentationHandle)
         let snapshot = await ownershipLedger.snapshot()
+        loginItemStatus = loginItem.status()
+        let loginReconciliationRequired = refreshLoginPersistenceReconciliation(
+            snapshot: snapshot,
+            status: loginItemStatus
+        )
         syncOwnership(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
         guard !snapshot.obligations.isEmpty else {
             reconcileEmptyLedgerPresentation(snapshot)
+            if loginReconciliationRequired {
+                phase = .repairRequired
+                presentedError = .operationFailed
+            }
             await ownershipLedger.releaseLease(lease)
             await blockOwnershipHydrationReturnIfNeeded()
             return true
@@ -1106,6 +1196,9 @@ public final class AppViewModel: AppViewModeling {
         connectTask?.cancel()
         phase = .repairRequired
         presentedError = Self.presentationError(for: snapshot)
+        if loginReconciliationRequired {
+            presentedError = .operationFailed
+        }
         await ownershipLedger.releaseLease(lease)
         await blockOwnershipHydrationReturnIfNeeded()
         return true
@@ -1117,6 +1210,28 @@ public final class AppViewModel: AppViewModeling {
         integrationPreviews = []
         phase = .onboarding
         presentedError = nil
+    }
+
+    @discardableResult
+    private func refreshLoginPersistenceReconciliation(
+        snapshot: OwnershipSnapshot,
+        status: LoginItemStatus
+    ) -> Bool {
+        guard snapshot.login != .none else {
+            loginDisabledStatePersistenceRetryRequired = false
+            return false
+        }
+        let required: Bool
+        switch status {
+        case .notRegistered, .notFound, .unknown:
+            required = true
+        case .requiresApproval:
+            required = snapshot.login == .registered
+        case .enabled:
+            required = false
+        }
+        loginDisabledStatePersistenceRetryRequired = required
+        return required
     }
 
     private func claimMonitoringLifecycleEntry() -> UInt64? {
@@ -2473,6 +2588,10 @@ public actor AppOwnershipLedger {
             snapshot.obligations.insert(emergencyIntegrationRecovery.obligation)
         }
         return snapshot
+    }
+
+    func clearTransientPersistenceRepair() {
+        transientPersistenceRepair = false
     }
 
     public func update(_ mutation: OwnershipMutation) async throws {

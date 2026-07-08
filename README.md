@@ -89,7 +89,7 @@ Agent Light stores a durable, non-secret ownership receipt at `~/Library/Applica
 - **Replace Device** stops monitoring, restores the owned baseline when safe, and returns to onboarding.
 - **Preview Repair** shows proposed hook changes before **Confirm Repair** writes them.
 - **Uninstall Integrations** removes only Agent Light-owned hook commands.
-- Turning **Launch at login** off unregisters the login item and updates its ownership receipt while retaining credentials, hooks, the selected device, and monitoring. A failed disable remains retryable.
+- Turning **Launch at login** off unregisters the login item and updates its ownership receipt while retaining credentials, hooks, the selected device, and monitoring. If saving fails, Agent Light first restores the registration; when that is not possible, **Retry saving disabled login state** repairs the receipt without unregistering again. Relaunch also detects a disabled login item whose receipt still says owned and offers the same repair without enabling it automatically.
 - After an unclean exit, relaunch the app. It restores the recorded baseline only if the bulb still matches Agent Light's last command; an external bulb change is preserved as the new baseline.
 - Stored Keychain credentials without a valid durable ownership receipt may be verified to rebuild the integration preview, but Agent Light does not install hooks or register login automatically. Approval remains explicit.
 - If startup reports that invalid stored credentials could not be reset, resolve Keychain access and use **Reset & Retry**. If integration repair fails, inspect the reported path and permissions before retrying; do not delete unrelated hooks.
@@ -110,7 +110,7 @@ These checks intentionally are not performed by build or test scripts because th
 8. Inspect all three config files and confirm unrelated hooks remain semantically unchanged after install, repair, and uninstall.
 9. Confirm launch at login is enabled only after approved setup and that relaunch resumes monitoring.
 10. If macOS requires login-item approval, complete it in System Settings, select **Retry Status**, and confirm the app transitions from pending approval without registering a second item.
-11. Turn **Launch at login** off from both Enabled and Approval required states; confirm monitoring, credentials, device selection, and hooks remain intact, then re-enable it explicitly.
+11. Turn **Launch at login** off from both Enabled and Approval required states; confirm monitoring, credentials, device selection, and hooks remain intact. If receipt saving fails after unregistering, confirm the switch either returns On or **Retry saving disabled login state** appears, then verify retry does not unregister or register again.
 12. Quit and relaunch after approved setup; confirm masked Access ID and Device ID appear without another interactive connection attempt.
 
 Expected failure modes:

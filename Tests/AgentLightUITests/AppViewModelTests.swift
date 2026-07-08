@@ -1142,20 +1142,29 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.loginItem.disableCount, 2)
     }
 
-    func testLaunchAtLoginOptOutPersistenceFailureFailsClosedAndRetries() async throws {
+    func testLaunchAtLoginOptOutPersistenceFailureCompensatesRegistrationThenSwitchRetries() async throws {
         let store = ControllableSetupOwnershipStore()
         let harness = ViewModelHarness(ownershipStore: store)
         await harness.connectAndApprove()
-        await store.failEveryWrite()
+        let nextWrite = await store.writes() + 1
+        await store.failSaves([nextWrite])
 
         await harness.viewModel.setLaunchAtLoginEnabled(false)
 
-        XCTAssertEqual(harness.loginItem.currentStatus, .notRegistered)
-        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        let compensatedReceipt = await store.current()
+        XCTAssertEqual(harness.loginItem.currentStatus, .enabled)
+        XCTAssertEqual(harness.viewModel.loginItemStatus, .enabled)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
         XCTAssertEqual(harness.viewModel.presentedError, .operationFailed)
-        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.ownershipReceiptRepair))
+        XCTAssertTrue(harness.viewModel.outstandingObligations.isEmpty)
+        XCTAssertEqual(compensatedReceipt?.login, .registered)
+        XCTAssertNotEqual(compensatedReceipt?.integration, PersistentIntegrationOwnership.none)
+        XCTAssertNotNil(harness.credentials.storedCredentials())
+        XCTAssertTrue(harness.viewModel.integrationInstalled)
+        XCTAssertTrue(harness.viewModel.monitoringActive)
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
+        XCTAssertEqual(harness.loginItem.enableCount, 2)
 
-        await store.allowWrites()
         await harness.viewModel.setLaunchAtLoginEnabled(false)
 
         let receipt = await store.current()
@@ -1165,6 +1174,8 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertTrue(harness.viewModel.outstandingObligations.isEmpty)
         XCTAssertTrue(harness.viewModel.monitoringActive)
         XCTAssertEqual(receipt?.login, PersistentLoginOwnership.none)
+        XCTAssertEqual(harness.loginItem.disableCount, 2)
+        XCTAssertEqual(harness.loginItem.enableCount, 2)
     }
 
     func testLaunchAtLoginOptOutPersistenceRetryReturnsToPausedState() async throws {
@@ -1173,6 +1184,7 @@ final class AppViewModelTests: XCTestCase {
         await harness.connectAndApprove()
         await harness.viewModel.pause()
         XCTAssertEqual(harness.viewModel.phase, .paused)
+        harness.loginItem.enableError = HarnessSensitiveError("CANARY_LOGIN_COMPENSATION")
         await store.failEveryWrite()
 
         await harness.viewModel.setLaunchAtLoginEnabled(false)
@@ -1181,7 +1193,7 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.ownershipReceiptRepair))
 
         await store.allowWrites()
-        await harness.viewModel.setLaunchAtLoginEnabled(false)
+        await harness.viewModel.retrySavingDisabledLoginState()
 
         let receipt = await store.current()
         XCTAssertEqual(harness.viewModel.phase, .paused)
@@ -1191,6 +1203,88 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(receipt?.login, PersistentLoginOwnership.none)
         XCTAssertNotEqual(receipt?.integration, PersistentIntegrationOwnership.none)
         XCTAssertNotNil(harness.credentials.storedCredentials())
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
+        XCTAssertEqual(harness.loginItem.enableCount, 2)
+    }
+
+    func testRelaunchDerivesDisabledLoginReceiptMismatchAndRetriesWithoutLoginMutation() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.currentStatus = .notRegistered
+        let loginCallsBeforeRelaunch = (
+            enable: harness.loginItem.enableCount,
+            disable: harness.loginItem.disableCount
+        )
+        let relaunched = makeRelaunchedViewModel(using: harness, store: store)
+
+        await relaunched.synchronizeOwnership()
+
+        XCTAssertEqual(relaunched.phase, .repairRequired)
+        XCTAssertTrue(relaunched.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertTrue(relaunched.monitoringActive)
+        XCTAssertEqual(harness.loginItem.enableCount, loginCallsBeforeRelaunch.enable)
+        XCTAssertEqual(harness.loginItem.disableCount, loginCallsBeforeRelaunch.disable)
+
+        await relaunched.retrySavingDisabledLoginState()
+
+        let receipt = try await store.load()
+        XCTAssertEqual(receipt?.login, PersistentLoginOwnership.none)
+        XCTAssertEqual(relaunched.phase, .monitoring)
+        XCTAssertNil(relaunched.presentedError)
+        XCTAssertFalse(relaunched.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertEqual(harness.loginItem.enableCount, loginCallsBeforeRelaunch.enable)
+        XCTAssertEqual(harness.loginItem.disableCount, loginCallsBeforeRelaunch.disable)
+        XCTAssertNotNil(harness.credentials.storedCredentials())
+        XCTAssertTrue(relaunched.integrationInstalled)
+    }
+
+    func testUnknownLoginMismatchFailsClosedWithoutClearingDurableAuthority() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.currentStatus = .unknown
+        let relaunched = makeRelaunchedViewModel(using: harness, store: store)
+
+        await relaunched.synchronizeOwnership()
+        await relaunched.retrySavingDisabledLoginState()
+
+        let receipt = try await store.load()
+        XCTAssertEqual(relaunched.phase, .repairRequired)
+        XCTAssertEqual(relaunched.presentedError, .operationFailed)
+        XCTAssertTrue(relaunched.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertEqual(receipt?.login, .registered)
+        XCTAssertEqual(harness.loginItem.disableCount, 0)
+        XCTAssertEqual(harness.loginItem.enableCount, 1)
+    }
+
+    func testPendingApprovalCompensationKeepsAuthorityUntilAConfirmedDisable() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.registerResult = .requiresApproval
+        let nextWrite = await store.writes() + 1
+        await store.failSaves([nextWrite])
+
+        await harness.viewModel.setLaunchAtLoginEnabled(false)
+        await harness.viewModel.retrySavingDisabledLoginState()
+
+        var receipt = await store.current()
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.loginItemStatus, .requiresApproval)
+        XCTAssertTrue(harness.viewModel.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertEqual(receipt?.login, .registered)
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
+        XCTAssertEqual(harness.loginItem.enableCount, 2)
+
+        await harness.viewModel.setLaunchAtLoginEnabled(false)
+
+        receipt = await store.current()
+        XCTAssertEqual(receipt?.login, PersistentLoginOwnership.none)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertFalse(harness.viewModel.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertEqual(harness.loginItem.disableCount, 2)
+        XCTAssertEqual(harness.loginItem.enableCount, 2)
     }
 
     func testNewPendingApprovalIsCompensatedWhenMonitoringFails() async throws {

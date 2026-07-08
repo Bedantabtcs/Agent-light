@@ -163,6 +163,19 @@ public struct SettingsView: View {
                         accessibilityIdentifier: "settings.general.loginStatus",
                         isSelectable: false
                     )
+                    if viewModel.loginDisabledStatePersistenceRetryRequired {
+                        NativeWrappingText(
+                            text: disabledLoginPersistenceGuidance,
+                            accessibilityIdentifier: "settings.general.disabledLoginPersistenceGuidance",
+                            isSelectable: false
+                        )
+                        NativeActionButton(
+                            title: "Retry saving disabled login state",
+                            accessibilityIdentifier: AmbientAccessibilityID.settingsRetryDisabledLoginState
+                        ) {
+                            Task { await viewModel.retrySavingDisabledLoginState() }
+                        }
+                    }
                     if viewModel.loginItemStatus == .requiresApproval {
                         NativeWrappingText(
                             text: "Open System Settings > General > Login Items, then allow Agent Light.",
@@ -210,6 +223,15 @@ public struct SettingsView: View {
         case .requiresApproval: "Approval required"
         case .notRegistered, .notFound: "Not enabled"
         case .unknown: "Status unavailable"
+        }
+    }
+
+    private var disabledLoginPersistenceGuidance: String {
+        switch viewModel.loginItemStatus {
+        case .notRegistered, .notFound:
+            "The login item is disabled, but saving that state still needs to be retried."
+        case .enabled, .requiresApproval, .unknown:
+            "The login item status does not safely match saved ownership. Retry only after macOS reports Not enabled."
         }
     }
 
