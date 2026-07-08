@@ -98,3 +98,66 @@ Ready-to-paste prompt:
 ```text
 Implement Task 7 from docs/superpowers/plans/2026-07-07-final-lifecycle-reliability-correction.md using strict TDD. Start from the reviewed Task 6 commit, read the final correction design and Tasks 1–6 reports first, remove the known relay wall-clock flake without weakening the deterministic transport budget, complete deferred protocol/JSON boundary coverage and documentation, run the final bounded parallel/release/package/security/artifact/orphan gates, write the final report, and commit locally without pushing. Do not access live bulbs, credentials, HOME configuration, login items, the installed application, browser state, or GitHub.
 ```
+
+---
+
+## Review correction: parent-vnode coordination and final inode authentication
+
+The first bounded implementation still treated the replaceable lock-file inode as the authoritative advisory lock, trusted the installed active/tombstone identity after the directory fsync, used replacing rename when rolling back to an absent destination, and did not distinguish newly created lock files before correcting restrictive-umask permissions.
+
+### Review RED evidence
+
+Three focused regressions were added before the production correction:
+
+```bash
+swift test --filter 'FileMonitoringRecoveryStoreTests/(testSaveRejectsActiveReplacementAfterDirectorySyncWithoutResurrectingPrevious|testClearRejectsTombstoneRemovalAfterDirectorySyncWithoutResurrectingPrevious|testCancelledClearRollbackNeverReplacesConcurrentDestination)'
+```
+
+Result: exit 1; 3 tests ran with 5 failures. Save returned success after active was replaced post-fsync. Clear returned success after tombstone removal and a fresh store resurrected previous. Cancellation rollback overwrote a concurrent active destination and removed the owned tombstone.
+
+The new directory-coordination tests were then verified against a deliberate regression that moved `flock` authority back to the lock-file descriptor:
+
+```bash
+perl -e 'alarm 20; exec @ARGV' swift test --filter 'FileMonitoringRecoveryStoreTests/(testLockReplacementBeforeStageWriteCannotSplitDirectoryCoordination|testLockReplacementDuringRollbackCannotLetNewCommitBeRolledOver)'
+```
+
+Result: exit 1; both tests failed. A second store committed through the replacement lock inode while the first remained blocked, and rollback/concurrent modification displaced the expected final winner.
+
+The restrictive-umask regression was verified with the newly created lock-file `fchmod` deliberately removed:
+
+```bash
+swift test --filter FileMonitoringRecoveryStoreTests/testNewLockFileIsForcedToMode0600UnderRestrictiveUmask
+```
+
+Result: exit 1; the save failed with `unsafeFile`, proving the test detects mode truncation by umask.
+
+### Review correction
+
+- The validated, pinned parent directory descriptor now holds `flock(LOCK_EX)` for the complete operation. Stores using the same directory inode cannot split coordination when `.monitoring-recovery.lock` is replaced.
+- The lock file remains fixed-name validated metadata. Creation uses `O_CREAT | O_EXCL | O_NOFOLLOW`, corrects only the newly created descriptor to `0600`, fsyncs the file and directory, and never chmods a preexisting unsafe file.
+- Parent path identity and lock-file descriptor/path identity are revalidated before stage creation/truncation and immediately before every recovery pathname mutation.
+- Save reopens and validates active after the commit directory fsync and compares it with the pinned candidate descriptor before issuing a revision.
+- Clear reopens and validates tombstone after the commit directory fsync and compares it with the pinned owned generation before returning success.
+- If a committed slot disappears after fsync, previous is moved exclusively to tombstone when needed so a fresh load cannot resurrect a stale generation.
+- Pre-commit save recovery authenticates active/previous before rollback. Restoration to an absent active path uses exclusive no-replace rename; a concurrent destination remains untouched.
+- Clear cancellation and mismatch rollback authenticate the tombstone source and use exclusive no-replace rename. Concurrent destination bytes and the recovery slot are both retained.
+- Lock descriptors are closed on every post-open validation failure; the authoritative directory lock is released only after all mutation/recovery work completes.
+
+### Review verification
+
+- Eight focused review regressions: 8 tests, 0 failures.
+- `swift test --filter FileMonitoringRecoveryStoreTests`: 53 tests, 0 failures.
+- `swift test --filter 'FileMonitoringRecoveryStoreTests|MonitoringOrchestratorTests|MonitoringRecoveryPublicAPITests'`: 166 tests, 0 failures (53 store, 112 orchestrator, 1 public API).
+- Twenty externally bounded runs of eight critical coordination/fsync/rollback/bounded tests: 160/160 tests passed.
+- `swift test --parallel --num-workers 2`: final rerun completed 540/540 tests, exit 0.
+- `swift build -c release`: passed.
+- `./scripts/build-app.sh release`: passed.
+- `codesign --verify --deep --strict "build/Agent Light.app"`: passed.
+- `plutil -lint "build/Agent Light.app/Contents/Info.plist"`: OK.
+- Diff, recovery unlink/random-name, changed-source security, backup/reject artifact, and orphan-process scans: clean.
+
+The first parallel review run hit only the documented Task 3 relay wall-clock assertion at 0.58s versus `<0.2s`. The immediate isolated run passed at 0.075s and the fresh complete two-worker rerun passed.
+
+## Next Step
+
+Next phase: Task 7 — deferred boundary coverage, documentation, and the final automated gate. Use the ready-to-paste Task 7 prompt above in a fresh agent.

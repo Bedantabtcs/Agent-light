@@ -307,7 +307,6 @@ final class DarwinMonitoringRecoveryPOSIXOperations: MonitoringRecoveryPOSIXOper
 public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
     public static let maximumRecordBytes = 64 * 1024
     private static let maximumTemporaryNameAttempts = 8
-    private static let maximumLockAttempts = 8
     private static let previousName = ".monitoring-recovery.previous"
     private static let tombstoneName = ".monitoring-recovery.tombstone"
     private static let lockName = ".monitoring-recovery.lock"
@@ -400,11 +399,7 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         let priorGenerationIDs = try original.map {
             try generationIDs(matching: $0.descriptor)
         } ?? []
-        let staging = try prepareStaging(
-            data,
-            directory: directory.descriptor,
-            location: location
-        )
+        let staging = try prepareStaging(data, directory: directory, location: location)
         var candidatePinnedDescriptor: Int32? = try duplicateOrIO(staging.descriptor)
         defer {
             if let candidatePinnedDescriptor { operations.close(candidatePinnedDescriptor) }
@@ -417,17 +412,20 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
 
         var movedOriginal = false
         var installedCandidate = false
+        var directorySynced = false
         do {
             if let original {
                 if try slotExists(location.tombstoneName, in: directory.descriptor) {
                     try renameReplacing(
-                        directory: directory.descriptor,
+                        directory: directory,
+                        location: location,
                         from: location.tombstoneName,
                         to: location.previousName
                     )
                 }
                 try renameReplacing(
-                    directory: directory.descriptor,
+                    directory: directory,
+                    location: location,
                     from: location.activeName,
                     to: location.previousName
                 )
@@ -439,7 +437,8 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             }
 
             try renameReplacing(
-                directory: directory.descriptor,
+                directory: directory,
+                location: location,
                 from: staging.name,
                 to: location.activeName
             )
@@ -460,14 +459,31 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             if original == nil,
                try slotExists(location.tombstoneName, in: directory.descriptor) {
                 try renameReplacing(
-                    directory: directory.descriptor,
+                    directory: directory,
+                    location: location,
                     from: location.tombstoneName,
                     to: location.previousName
                 )
             }
             try synchronizeDirectory(directory.descriptor)
+            directorySynced = true
             try verifyParent(location.parentPath, matches: directory.metadata)
             try verifyLock(directory, location: location)
+            guard let finalActive = try openExistingFile(
+                directory: directory.descriptor,
+                name: location.activeName
+            ) else {
+                preventPreviousFallbackAfterCommittedMutation(
+                    directory: directory,
+                    location: location,
+                    priorGenerationIDs: priorGenerationIDs
+                )
+                throw MonitoringRecoveryStoreError.concurrentModification
+            }
+            defer { operations.close(finalActive.descriptor) }
+            guard try sameOpenFileOrIO(finalActive.descriptor, pinnedCandidate) else {
+                throw MonitoringRecoveryStoreError.concurrentModification
+            }
             invalidateAllRevisions()
             let revision = issueRevision(
                 pinnedDescriptor: pinnedCandidate,
@@ -477,13 +493,14 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             candidatePinnedDescriptor = nil
             return revision
         } catch {
-            if movedOriginal {
+            if movedOriginal, !directorySynced {
                 recoverFailedSave(
-                    directory: directory.descriptor,
+                    directory: directory,
                     location: location,
                     originalDescriptor: original?.descriptor,
                     priorGenerationIDs: priorGenerationIDs,
-                    installedCandidate: installedCandidate
+                    installedCandidate: installedCandidate,
+                    candidateDescriptor: candidatePinnedDescriptor
                 )
             }
             throw mappedOperationError(error)
@@ -516,7 +533,8 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
 
         if ownership.location != location.tombstoneName {
             try renameReplacing(
-                directory: directory.descriptor,
+                directory: directory,
+                location: location,
                 from: ownership.location,
                 to: location.tombstoneName
             )
@@ -533,7 +551,8 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
                   try sameOpenFileOrIO(moved.descriptor, opened.descriptor),
                   try sameOpenFileOrIO(moved.descriptor, ownership.descriptor) else {
                 restoreUnexpectedClearReplacement(
-                    directory: directory.descriptor,
+                    directory: directory,
+                    location: location,
                     tombstone: location.tombstoneName,
                     destination: ownership.location
                 )
@@ -542,16 +561,18 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
             }
             if Task.isCancelled {
                 rollbackClear(
-                    directory: directory.descriptor,
+                    directory: directory,
+                    location: location,
                     tombstone: location.tombstoneName,
                     destination: ownership.location,
-                    generationID: ownership.generationID
+                    generationID: ownership.generationID,
+                    ownedDescriptor: ownership.descriptor
                 )
                 throw CancellationError()
             }
         }
 
-        try absorbStagingIfPresent(directory: directory.descriptor, location: location)
+        try absorbStagingIfPresent(directory: directory, location: location)
         try commitPendingClear(
             ownership: ownership,
             location: location,
@@ -714,32 +735,48 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
     }
 
     private func recoverFailedSave(
-        directory: Int32,
+        directory: LockedDirectory,
         location: Location,
         originalDescriptor: Int32?,
         priorGenerationIDs: Set<UUID>,
-        installedCandidate: Bool
+        installedCandidate: Bool,
+        candidateDescriptor: Int32?
     ) {
-        if installedCandidate {
-            try? operations.swap(
-                at: directory,
-                location.previousName,
-                location.activeName
-            )
-        } else {
-            try? operations.renameReplacing(
-                at: directory,
-                from: location.previousName,
-                to: location.activeName
-            )
-        }
         guard let originalDescriptor else {
             invalidateGenerations(priorGenerationIDs)
             return
         }
-        if name(location.activeName, in: directory, matches: originalDescriptor) {
+        let previousMatches = name(
+            location.previousName,
+            in: directory.descriptor,
+            matches: originalDescriptor
+        )
+        if previousMatches,
+           installedCandidate,
+           let candidateDescriptor,
+           name(location.activeName, in: directory.descriptor, matches: candidateDescriptor),
+           (try? verifyMutationAuthority(directory, location: location)) != nil {
+            try? operations.swap(
+                at: directory.descriptor,
+                location.previousName,
+                location.activeName
+            )
+        } else if (try? slotExists(location.activeName, in: directory.descriptor)) == false,
+                  (try? slotExists(location.previousName, in: directory.descriptor)) == true,
+                  (try? verifyMutationAuthority(directory, location: location)) != nil {
+            try? operations.renameExclusive(
+                at: directory.descriptor,
+                from: location.previousName,
+                to: location.activeName
+            )
+        }
+        if name(location.activeName, in: directory.descriptor, matches: originalDescriptor) {
             updateLocations(of: priorGenerationIDs, to: location.activeName)
-        } else if name(location.previousName, in: directory, matches: originalDescriptor) {
+        } else if name(
+            location.previousName,
+            in: directory.descriptor,
+            matches: originalDescriptor
+        ) {
             updateLocations(of: priorGenerationIDs, to: location.previousName)
         } else {
             invalidateGenerations(priorGenerationIDs)
@@ -755,34 +792,74 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
     }
 
     private func rollbackClear(
-        directory: Int32,
+        directory: LockedDirectory,
+        location: Location,
         tombstone: String,
         destination: String,
-        generationID: UUID
+        generationID: UUID,
+        ownedDescriptor: Int32
     ) {
+        guard name(tombstone, in: directory.descriptor, matches: ownedDescriptor) else { return }
         do {
-            try operations.renameReplacing(at: directory, from: tombstone, to: destination)
+            try verifyMutationAuthority(directory, location: location)
+            try operations.renameExclusive(
+                at: directory.descriptor,
+                from: tombstone,
+                to: destination
+            )
             updateLocation(of: generationID, to: destination)
         } catch {
         }
     }
 
     private func restoreUnexpectedClearReplacement(
-        directory: Int32,
+        directory: LockedDirectory,
+        location: Location,
         tombstone: String,
         destination: String
     ) {
-        guard (try? slotExists(destination, in: directory)) == false else { return }
-        try? operations.renameReplacing(at: directory, from: tombstone, to: destination)
+        do {
+            try verifyMutationAuthority(directory, location: location)
+            try operations.renameExclusive(
+                at: directory.descriptor,
+                from: tombstone,
+                to: destination
+            )
+        } catch {
+        }
     }
 
-    private func absorbStagingIfPresent(directory: Int32, location: Location) throws {
-        guard try slotExists(location.stagingName, in: directory) else { return }
+    private func absorbStagingIfPresent(directory: LockedDirectory, location: Location) throws {
+        guard try slotExists(location.stagingName, in: directory.descriptor) else { return }
         try renameReplacing(
             directory: directory,
+            location: location,
             from: location.stagingName,
             to: location.previousName
         )
+    }
+
+    private func preventPreviousFallbackAfterCommittedMutation(
+        directory: LockedDirectory,
+        location: Location,
+        priorGenerationIDs: Set<UUID>
+    ) {
+        guard (try? slotExists(location.activeName, in: directory.descriptor)) == false,
+              (try? slotExists(location.tombstoneName, in: directory.descriptor)) == false,
+              (try? slotExists(location.previousName, in: directory.descriptor)) == true else {
+            return
+        }
+        do {
+            try verifyMutationAuthority(directory, location: location)
+            try operations.renameExclusive(
+                at: directory.descriptor,
+                from: location.previousName,
+                to: location.tombstoneName
+            )
+            updateLocations(of: priorGenerationIDs, to: location.tombstoneName)
+            try operations.synchronize(directory.descriptor, kind: .directory)
+        } catch {
+        }
     }
 
     private func commitPendingClear(
@@ -806,6 +883,23 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         try synchronizeDirectory(directory.descriptor)
         try verifyParent(location.parentPath, matches: directory.metadata)
         try verifyLock(directory, location: location)
+        guard let committedTombstone = try openExistingFile(
+            directory: directory.descriptor,
+            name: location.tombstoneName
+        ) else {
+            preventPreviousFallbackAfterCommittedMutation(
+                directory: directory,
+                location: location,
+                priorGenerationIDs: []
+            )
+            invalidateGeneration(ownership.generationID)
+            throw MonitoringRecoveryStoreError.concurrentModification
+        }
+        defer { operations.close(committedTombstone.descriptor) }
+        guard try sameOpenFileOrIO(committedTombstone.descriptor, ownership.descriptor) else {
+            invalidateGeneration(ownership.generationID)
+            throw MonitoringRecoveryStoreError.concurrentModification
+        }
         invalidateGeneration(ownership.generationID)
     }
 
@@ -849,51 +943,78 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
 
     private func openLockedDirectory(_ location: Location) throws -> LockedDirectory {
         let directory = try openValidatedDirectory(location.parentPath)
+        var retainedLockDescriptor: Int32?
         do {
-            for _ in 0..<Self.maximumLockAttempts {
-                let lockDescriptor: Int32
-                do {
-                    lockDescriptor = try operations.openOrCreateWritable(
-                        at: directory.descriptor,
-                        name: location.lockName,
-                        mode: S_IRUSR | S_IWUSR
-                    )
-                } catch {
-                    throw mappedOpenError(error)
-                }
-                do {
-                    try validateFile(try metadataOrIO(lockDescriptor))
-                    try operations.lockExclusive(lockDescriptor)
-                    let locked = LockedDirectory(
-                        descriptor: directory.descriptor,
-                        metadata: directory.metadata,
-                        lockDescriptor: lockDescriptor
-                    )
-                    guard try lockMatchesPath(locked, location: location) else {
-                        operations.unlock(lockDescriptor)
-                        operations.close(lockDescriptor)
-                        continue
-                    }
-                    try validateKnownSlots(location, directory: directory.descriptor)
-                    try Task.checkCancellation()
-                    return locked
-                } catch {
-                    operations.unlock(lockDescriptor)
-                    operations.close(lockDescriptor)
-                    throw error
-                }
+            try operations.lockExclusive(directory.descriptor)
+            try verifyParent(location.parentPath, matches: directory.metadata)
+            let lockDescriptor = try openValidatedLockFile(
+                directory: directory.descriptor,
+                name: location.lockName
+            )
+            retainedLockDescriptor = lockDescriptor
+            let locked = LockedDirectory(
+                descriptor: directory.descriptor,
+                metadata: directory.metadata,
+                lockDescriptor: lockDescriptor
+            )
+            guard try lockMatchesPath(locked, location: location) else {
+                throw MonitoringRecoveryStoreError.concurrentModification
             }
-            throw MonitoringRecoveryStoreError.concurrentModification
+            try validateKnownSlots(location, directory: directory.descriptor)
+            try verifyParent(location.parentPath, matches: directory.metadata)
+            try Task.checkCancellation()
+            return locked
         } catch {
+            if let retainedLockDescriptor { operations.close(retainedLockDescriptor) }
+            operations.unlock(directory.descriptor)
             operations.close(directory.descriptor)
             throw mappedOperationError(error)
         }
     }
 
     private func close(_ directory: LockedDirectory) {
-        operations.unlock(directory.lockDescriptor)
         operations.close(directory.lockDescriptor)
+        operations.unlock(directory.descriptor)
         operations.close(directory.descriptor)
+    }
+
+    private func openValidatedLockFile(directory: Int32, name: String) throws -> Int32 {
+        let descriptor: Int32
+        let created: Bool
+        do {
+            descriptor = try operations.createExclusive(
+                at: directory,
+                name: name,
+                mode: S_IRUSR | S_IWUSR
+            )
+            created = true
+        } catch MonitoringRecoveryPOSIXError.alreadyExists {
+            do {
+                guard let existing = try operations.openExisting(at: directory, name: name) else {
+                    throw MonitoringRecoveryStoreError.concurrentModification
+                }
+                descriptor = existing
+                created = false
+            } catch let error as MonitoringRecoveryStoreError {
+                throw error
+            } catch {
+                throw mappedOpenError(error)
+            }
+        } catch {
+            throw mappedOpenError(error)
+        }
+        do {
+            if created {
+                try operations.setMode(S_IRUSR | S_IWUSR, for: descriptor)
+                try operations.synchronize(descriptor, kind: .file)
+                try operations.synchronize(directory, kind: .directory)
+            }
+            try validateFile(try metadataOrIO(descriptor))
+            return descriptor
+        } catch {
+            operations.close(descriptor)
+            throw error
+        }
     }
 
     private func lockMatchesPath(_ directory: LockedDirectory, location: Location) throws -> Bool {
@@ -991,22 +1112,23 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
 
     private func prepareStaging(
         _ data: Data,
-        directory: Int32,
+        directory: LockedDirectory,
         location: Location
     ) throws -> TemporaryFile {
         for _ in 0..<Self.maximumTemporaryNameAttempts {
             let name = try validatedTemporaryName(location: location)
             let descriptor: Int32
+            try verifyMutationAuthority(directory, location: location)
             do {
                 descriptor = try operations.createExclusive(
-                    at: directory,
+                    at: directory.descriptor,
                     name: name,
                     mode: S_IRUSR | S_IWUSR
                 )
             } catch MonitoringRecoveryPOSIXError.alreadyExists where name == location.stagingName {
                 do {
                     descriptor = try operations.openOrCreateWritable(
-                        at: directory,
+                        at: directory.descriptor,
                         name: name,
                         mode: S_IRUSR | S_IWUSR
                     )
@@ -1020,6 +1142,7 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
                 throw MonitoringRecoveryStoreError.ioFailure
             }
             do {
+                try verifyMutationAuthority(directory, location: location)
                 try operations.truncate(descriptor)
                 try operations.setMode(S_IRUSR | S_IWUSR, for: descriptor)
                 try operations.write(data, to: descriptor)
@@ -1028,6 +1151,8 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
                 return TemporaryFile(descriptor: descriptor, name: name)
             } catch {
                 operations.close(descriptor)
+                if error is CancellationError { throw error }
+                if let error = error as? MonitoringRecoveryStoreError { throw error }
                 throw MonitoringRecoveryStoreError.ioFailure
             }
         }
@@ -1049,9 +1174,19 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
         return value
     }
 
-    private func renameReplacing(directory: Int32, from: String, to: String) throws {
+    private func renameReplacing(
+        directory: LockedDirectory,
+        location: Location,
+        from: String,
+        to: String
+    ) throws {
+        try verifyMutationAuthority(directory, location: location)
         do {
-            try operations.renameReplacing(at: directory, from: from, to: to)
+            try operations.renameReplacing(
+                at: directory.descriptor,
+                from: from,
+                to: to
+            )
         } catch MonitoringRecoveryPOSIXError.notFound {
             throw MonitoringRecoveryStoreError.concurrentModification
         } catch {
@@ -1062,6 +1197,14 @@ public actor FileMonitoringRecoveryStore: MonitoringRecoveryStoring {
     private func synchronizeDirectory(_ descriptor: Int32) throws {
         do { try operations.synchronize(descriptor, kind: .directory) }
         catch { throw MonitoringRecoveryStoreError.ioFailure }
+    }
+
+    private func verifyMutationAuthority(
+        _ directory: LockedDirectory,
+        location: Location
+    ) throws {
+        try verifyParent(location.parentPath, matches: directory.metadata)
+        try verifyLock(directory, location: location)
     }
 
     private func metadataOrIO(_ descriptor: Int32) throws -> MonitoringRecoveryFileMetadata {
