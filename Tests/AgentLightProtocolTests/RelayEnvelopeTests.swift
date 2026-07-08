@@ -13,7 +13,7 @@ final class RelayEnvelopeTests: XCTestCase {
     }
 
     func testDecodeValidatedRejectsPayloadAboveMaximumBeforeDecoding() throws {
-        var payload = try JSONEncoder().encode(makeEnvelope())
+        var payload = try JSONEncoder().encode(makeEnvelope(workspace: "CANARY_PAYLOAD"))
         payload.append(Data(repeating: 0x20, count: RelayEnvelope.maximumEncodedBytes + 1 - payload.count))
 
         XCTAssertEqual(payload.count, 2_049)
@@ -30,7 +30,7 @@ final class RelayEnvelopeTests: XCTestCase {
 
     func testDecodeValidatedMapsUnknownSourceToSanitizedError() {
         let payload = Data(
-            #"{"emittedAtMilliseconds":1,"event":"UserPromptSubmit","integrationID":"com.bbatchas.agentlight.hook.v1","sessionID":"session","source":"unknown-provider","version":1}"#.utf8
+            #"{"emittedAtMilliseconds":1,"event":"UserPromptSubmit","integrationID":"com.bbatchas.agentlight.hook.v1","sessionID":"session","source":"CANARY_SOURCE","version":1}"#.utf8
         )
 
         assertValidationError(.invalidSource) {
@@ -38,19 +38,20 @@ final class RelayEnvelopeTests: XCTestCase {
         }
     }
 
-    func testValidationRejectsEachInvalidScalarBoundary() {
+    func testDecodeValidatedRejectsEachInvalidScalarBoundaryWithTypedSanitizedError() throws {
         let cases: [(RelayValidationError, RelayEnvelope)] = [
-            (.unsupportedVersion, makeEnvelope(version: 2)),
-            (.invalidIntegration, makeEnvelope(integrationID: "invalid-integration")),
-            (.invalidEvent, makeEnvelope(event: String(repeating: "e", count: 129))),
-            (.invalidSession, makeEnvelope(sessionID: "")),
-            (.invalidWorkspace, makeEnvelope(workspace: String(repeating: "w", count: 513))),
-            (.invalidStatus, makeEnvelope(status: String(repeating: "s", count: 65)))
+            (.unsupportedVersion, makeEnvelope(version: 2, workspace: "CANARY_VERSION")),
+            (.invalidIntegration, makeEnvelope(integrationID: "CANARY_INTEGRATION")),
+            (.invalidEvent, makeEnvelope(event: "CANARY_EVENT" + String(repeating: "e", count: 118))),
+            (.invalidEvent, makeEnvelope(event: "", workspace: "CANARY_EMPTY_EVENT")),
+            (.invalidSession, makeEnvelope(sessionID: "", workspace: "CANARY_EMPTY_SESSION")),
+            (.invalidWorkspace, makeEnvelope(workspace: "CANARY_WORKSPACE" + String(repeating: "w", count: 497))),
+            (.invalidStatus, makeEnvelope(status: "CANARY_STATUS" + String(repeating: "s", count: 53)))
         ]
 
         for (expected, envelope) in cases {
             assertValidationError(expected) {
-                try envelope.validated()
+                try RelayEnvelope.decodeValidated(from: JSONEncoder().encode(envelope))
             }
         }
     }

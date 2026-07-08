@@ -92,6 +92,31 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(winner?.sessionID, "a")
     }
 
+    @available(*, deprecated, message: "Compatibility coverage")
+    func testLegacySourceLessExpiryRemovesUniqueExactTerminalIdentity() async {
+        let coordinator = SessionCoordinator()
+        await coordinator.accept(event(source: .codex, session: "legacy", state: .completed, sequence: 4))
+        await coordinator.accept(event(source: .cursor, session: "other", state: .working, sequence: 5))
+
+        await coordinator.expireTerminalState(sessionID: "legacy", sequence: 4)
+
+        let snapshots = await coordinator.snapshots()
+        XCTAssertEqual(snapshots.map(\.sessionID), ["other"])
+    }
+
+    @available(*, deprecated, message: "Compatibility coverage")
+    func testLegacySourceLessExpiryFailsClosedForAmbiguousProviderIdentity() async {
+        let coordinator = SessionCoordinator()
+        await coordinator.accept(event(source: .codex, session: "shared", state: .completed, sequence: 7))
+        await coordinator.accept(event(source: .claudeCode, session: "shared", state: .error, sequence: 7))
+
+        await coordinator.expireTerminalState(sessionID: "shared", sequence: 7)
+
+        let snapshots = await coordinator.snapshots()
+        XCTAssertEqual(snapshots.count, 2)
+        XCTAssertEqual(Set(snapshots.map(\.source)), Set([.codex, .claudeCode]))
+    }
+
     func testEqualSequenceReverseInsertionUsesStableLexicalTieBreak() async {
         let coordinator = SessionCoordinator()
         await coordinator.accept(event(source: .cursor, session: "beta", state: .working, sequence: 7))
@@ -102,6 +127,18 @@ final class SessionCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(winner?.sessionID, "beta")
         XCTAssertEqual(snapshots.map(\.sessionID), ["beta", "alpha"])
+    }
+
+    func testEqualSequenceAndSessionAcrossProvidersUsesSourceLexicalTieBreak() async {
+        let coordinator = SessionCoordinator()
+        await coordinator.accept(event(source: .codex, session: "shared", state: .working, sequence: 7))
+        await coordinator.accept(event(source: .claudeCode, session: "shared", state: .thinking, sequence: 7))
+
+        let winner = await coordinator.currentWinner()
+        let snapshots = await coordinator.snapshots()
+
+        XCTAssertEqual(winner?.source, .codex)
+        XCTAssertEqual(snapshots.map(\.source), [.codex, .claudeCode])
     }
 
     func testEqualSequenceForSameIdentityReplacesPriorEvent() async {

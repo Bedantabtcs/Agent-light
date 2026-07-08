@@ -9,6 +9,9 @@ public enum TuyaTransportError: Error, Equatable, Sendable {
     case invalidResponseOrigin
 }
 
+@available(*, deprecated, renamed: "TuyaTransportError")
+public typealias TuyaHTTPTransportError = TuyaTransportError
+
 enum TuyaRedirectPolicy {
     static func redirectedRequest(from original: URLRequest, to proposed: URLRequest) -> URLRequest? {
         nil
@@ -38,13 +41,63 @@ enum TuyaRedirectPolicy {
     }
 }
 
-private final class TuyaRedirectRejectingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-    typealias DecisionObserver = @Sendable (URLRequest, URLRequest?) -> Void
+private final class TuyaSessionDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    typealias RedirectDecisionObserver = @Sendable (URLRequest, URLRequest?) -> Void
+    typealias DataReceiptObserver = @Sendable (Int) -> Void
+    typealias AcceptedBodyObserver = @Sendable (Int) -> Void
+    typealias CompletionObserver = @Sendable () -> Void
 
-    private let decisionObserver: DecisionObserver?
+    private struct TaskState {
+        let originalURL: URL
+        let continuation: CheckedContinuation<(Data, HTTPURLResponse), Error>
+        var response: HTTPURLResponse?
+        var body = Data()
+        var rejection: TuyaTransportError?
+        var responseAllowed = false
+    }
 
-    init(decisionObserver: DecisionObserver? = nil) {
-        self.decisionObserver = decisionObserver
+    private let lock = NSLock()
+    private let redirectDecisionObserver: RedirectDecisionObserver?
+    private let dataReceiptObserver: DataReceiptObserver?
+    private let acceptedBodyObserver: AcceptedBodyObserver?
+    private let completionObserver: CompletionObserver?
+    private var states: [Int: TaskState] = [:]
+
+    init(
+        redirectDecisionObserver: RedirectDecisionObserver? = nil,
+        dataReceiptObserver: DataReceiptObserver? = nil,
+        acceptedBodyObserver: AcceptedBodyObserver? = nil,
+        completionObserver: CompletionObserver? = nil
+    ) {
+        self.redirectDecisionObserver = redirectDecisionObserver
+        self.dataReceiptObserver = dataReceiptObserver
+        self.acceptedBodyObserver = acceptedBodyObserver
+        self.completionObserver = completionObserver
+    }
+
+    func data(
+        for request: URLRequest,
+        session: URLSession
+    ) async throws -> (Data, HTTPURLResponse) {
+        guard let originalURL = request.url else {
+            throw TuyaTransportError.invalidResponse
+        }
+        let cancellation = TuyaTaskCancellation()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let task = session.dataTask(with: request)
+                lock.withLock {
+                    states[task.taskIdentifier] = TaskState(
+                        originalURL: originalURL,
+                        continuation: continuation
+                    )
+                }
+                cancellation.install(task)
+                task.resume()
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
     }
 
     func urlSession(
@@ -58,43 +111,139 @@ private final class TuyaRedirectRejectingDelegate: NSObject, URLSessionTaskDeleg
             from: task.originalRequest ?? request,
             to: request
         )
-        decisionObserver?(request, redirectedRequest)
+        redirectDecisionObserver?(request, redirectedRequest)
         completionHandler(redirectedRequest)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        let disposition: URLSession.ResponseDisposition = lock.withLock {
+            guard var state = states[dataTask.taskIdentifier] else { return .cancel }
+            guard let response = response as? HTTPURLResponse else {
+                state.rejection = .invalidResponse
+                states[dataTask.taskIdentifier] = state
+                return .cancel
+            }
+            guard let responseURL = response.url,
+                  TuyaRedirectPolicy.hasSameOrigin(state.originalURL, responseURL) else {
+                state.rejection = .invalidResponseOrigin
+                states[dataTask.taskIdentifier] = state
+                return .cancel
+            }
+            state.response = response
+            state.responseAllowed = true
+            states[dataTask.taskIdentifier] = state
+            return .allow
+        }
+        completionHandler(disposition)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive data: Data
+    ) {
+        dataReceiptObserver?(data.count)
+        let acceptedByteCount: Int? = lock.withLock {
+            guard var state = states[dataTask.taskIdentifier],
+                  state.responseAllowed,
+                  state.rejection == nil else {
+                return nil
+            }
+            state.body.append(data)
+            states[dataTask.taskIdentifier] = state
+            return data.count
+        }
+        if let acceptedByteCount {
+            acceptedBodyObserver?(acceptedByteCount)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: (any Error)?
+    ) {
+        guard let state = lock.withLock({ states.removeValue(forKey: task.taskIdentifier) }) else {
+            return
+        }
+        completionObserver?()
+        if let rejection = state.rejection {
+            state.continuation.resume(throwing: rejection)
+        } else if let error {
+            state.continuation.resume(throwing: error)
+        } else if let response = state.response {
+            state.continuation.resume(returning: (state.body, response))
+        } else {
+            state.continuation.resume(throwing: TuyaTransportError.invalidResponse)
+        }
+    }
+}
+
+private final class TuyaTaskCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionTask?
+    private var isCancelled = false
+
+    func install(_ task: URLSessionTask) {
+        let shouldCancel = lock.withLock {
+            self.task = task
+            return isCancelled
+        }
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+
+    func cancel() {
+        let task = lock.withLock {
+            isCancelled = true
+            return self.task
+        }
+        task?.cancel()
     }
 }
 
 public struct URLSessionTuyaHTTPTransport: TuyaHTTPTransport {
     private let session: URLSession
+    private let delegate: TuyaSessionDelegate
 
     public init(session: URLSession = .shared) {
+        let delegate = TuyaSessionDelegate()
+        self.delegate = delegate
         self.session = URLSession(
             configuration: session.configuration,
-            delegate: TuyaRedirectRejectingDelegate(),
+            delegate: delegate,
             delegateQueue: nil
         )
     }
 
     init(
         configuration: URLSessionConfiguration,
-        redirectDecisionObserver: @escaping @Sendable (URLRequest, URLRequest?) -> Void
+        redirectDecisionObserver: @escaping @Sendable (URLRequest, URLRequest?) -> Void,
+        dataReceiptObserver: (@Sendable (Int) -> Void)? = nil,
+        acceptedBodyObserver: (@Sendable (Int) -> Void)? = nil,
+        completionObserver: (@Sendable () -> Void)? = nil
     ) {
+        let delegate = TuyaSessionDelegate(
+            redirectDecisionObserver: redirectDecisionObserver,
+            dataReceiptObserver: dataReceiptObserver,
+            acceptedBodyObserver: acceptedBodyObserver,
+            completionObserver: completionObserver
+        )
+        self.delegate = delegate
         session = URLSession(
             configuration: configuration,
-            delegate: TuyaRedirectRejectingDelegate(decisionObserver: redirectDecisionObserver),
+            delegate: delegate,
             delegateQueue: nil
         )
     }
 
     public func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let (data, response) = try await session.data(for: request)
-        guard let response = response as? HTTPURLResponse else {
-            throw TuyaTransportError.invalidResponse
-        }
-        guard let requestURL = request.url,
-              let responseURL = response.url,
-              TuyaRedirectPolicy.hasSameOrigin(requestURL, responseURL) else {
-            throw TuyaTransportError.invalidResponseOrigin
-        }
-        return (data, response)
+        try await delegate.data(for: request, session: session)
     }
 }

@@ -43,6 +43,19 @@ public actor SessionCoordinator {
         sessions.removeValue(forKey: identity)
     }
 
+    @available(*, deprecated, message: "Use expireTerminalState(source:sessionID:sequence:)")
+    public func expireTerminalState(sessionID: String, sequence: UInt64) {
+        var matchedIdentity: SessionIdentity?
+        for (identity, event) in sessions where identity.sessionID == sessionID
+            && event.sequence == sequence
+            && (event.state == .completed || event.state == .error) {
+            guard matchedIdentity == nil else { return }
+            matchedIdentity = identity
+        }
+        guard let matchedIdentity else { return }
+        sessions.removeValue(forKey: matchedIdentity)
+    }
+
     public func currentWinner() -> AgentEvent? {
         sessions.values.max(by: isOrderedBefore)
     }
