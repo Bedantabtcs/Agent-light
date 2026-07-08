@@ -40,11 +40,34 @@ public enum PersistentCredentialOwnership: String, Codable, Equatable, Sendable 
     case replacedWithBackup
 }
 
-public enum PersistentLoginOwnership: String, Codable, Equatable, Sendable {
+public enum PersistentLoginOwnership: String, Equatable, Sendable {
     case none
-    case owned
+    case registered
     case pendingApproval
+
+    public init(from decoder: any Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        switch value {
+        case Self.none.rawValue:
+            self = .none
+        case Self.registered.rawValue, "owned":
+            self = .registered
+        case Self.pendingApproval.rawValue:
+            self = .pendingApproval
+        default:
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "Invalid login ownership")
+            )
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
+
+extension PersistentLoginOwnership: Codable {}
 
 public struct SetupOwnershipReceipt: Codable, Equatable, Sendable {
     public static let currentVersion = 1

@@ -35,6 +35,12 @@ public enum IntegrationSourceOwnership: String, Codable, Equatable, Sendable {
     case partial
 }
 
+public enum IntegrationTrustStatus: String, Codable, Equatable, Sendable {
+    case notRequired
+    case required
+    case userConfirmed
+}
+
 public enum IntegrationOverallOwnership: Equatable, Sendable {
     case fresh
     case fullyPreexisting
@@ -46,17 +52,53 @@ public struct IntegrationSourceReceipt: Codable, Equatable, Sendable {
     public let ownership: IntegrationSourceOwnership
     public let marker: String?
     public let installedContentFingerprint: String?
+    public let trust: IntegrationTrustStatus
 
     public init(
         source: AgentSource,
         ownership: IntegrationSourceOwnership,
         marker: String? = nil,
-        installedContentFingerprint: String? = nil
+        installedContentFingerprint: String? = nil,
+        trust: IntegrationTrustStatus? = nil
     ) {
         self.source = source
         self.ownership = ownership
         self.marker = marker
         self.installedContentFingerprint = installedContentFingerprint
+        self.trust = trust ?? (source == .codex ? .required : .notRequired)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case source
+        case ownership
+        case marker
+        case installedContentFingerprint
+        case trust
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        source = try container.decode(AgentSource.self, forKey: .source)
+        ownership = try container.decode(IntegrationSourceOwnership.self, forKey: .ownership)
+        marker = try container.decodeIfPresent(String.self, forKey: .marker)
+        installedContentFingerprint = try container.decodeIfPresent(
+            String.self,
+            forKey: .installedContentFingerprint
+        )
+        trust = try container.decodeIfPresent(IntegrationTrustStatus.self, forKey: .trust)
+            ?? (source == .codex ? .required : .notRequired)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(source, forKey: .source)
+        try container.encode(ownership, forKey: .ownership)
+        try container.encodeIfPresent(marker, forKey: .marker)
+        try container.encodeIfPresent(
+            installedContentFingerprint,
+            forKey: .installedContentFingerprint
+        )
+        try container.encode(trust, forKey: .trust)
     }
 }
 
@@ -95,7 +137,10 @@ public struct IntegrationInstallReceipt: Codable, Equatable, Sendable {
             guard source.marker == AppIdentity.integrationIdentifier,
                   let fingerprint = source.installedContentFingerprint,
                   fingerprint.count == 64 else { return false }
-            return fingerprint.utf8.allSatisfy {
+            let hasExpectedTrustBoundary = source.source == .codex
+                ? source.trust != .notRequired
+                : source.trust == .notRequired
+            return hasExpectedTrustBoundary && fingerprint.utf8.allSatisfy {
                 ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))
                     || ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "f"))
             }
@@ -879,6 +924,15 @@ private struct AtomicConfigurationChange {
     let destination: URL
     let before: IntegrationFileSnapshot
     let after: Data
+
+    var intendedMode: mode_t {
+        switch before {
+        case .missing:
+            0o600
+        case let .file(record):
+            record.mode & mode_t(0o777)
+        }
+    }
 }
 
 private struct PreparedConfigurationChange {
@@ -910,7 +964,11 @@ private struct AtomicConfigurationWriter {
                     try fileOperations.setMode(0o600, at: item.staged)
                 }
                 try fileOperations.syncDirectory(at: item.change.destination.deletingLastPathComponent())
-                try verify(item.change.after, mode: 0o600, at: item.change.destination)
+                try verify(
+                    item.change.after,
+                    mode: item.change.intendedMode,
+                    at: item.change.destination
+                )
             }
         } catch {
             if let recoveryFailure = error as? IntegrationAtomicRecoveryFailure {
@@ -944,7 +1002,8 @@ private struct AtomicConfigurationWriter {
 
         do {
             try fileOperations.writeProtected(change.after, to: staged)
-            try verify(change.after, mode: 0o600, at: staged)
+            try fileOperations.setMode(change.intendedMode, at: staged)
+            try verify(change.after, mode: change.intendedMode, at: staged)
             if let rollback {
                 try fileOperations.writeProtected(change.before.data, to: rollback)
                 try verify(change.before.data, mode: 0o600, at: rollback)
@@ -1017,7 +1076,7 @@ private struct AtomicConfigurationWriter {
         try verifySnapshot(
             installedSnapshot,
             expectedData: item.change.after,
-            mode: 0o600,
+            mode: item.change.intendedMode,
             path: item.change.destination.path
         )
         switch item.change.before {

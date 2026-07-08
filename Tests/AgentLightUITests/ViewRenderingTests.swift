@@ -119,6 +119,52 @@ final class ViewRenderingTests: XCTestCase {
         XCTAssertFalse(visibleText.localizedCaseInsensitiveContains("timing"))
     }
 
+    func testSettingsRendersHonestCodexTrustFlowAndUserConfirmation() async throws {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        let hosting = host(SettingsView(viewModel: harness.viewModel))
+        await nextMainTurn()
+
+        var rendered = renderedText(in: hosting)
+        XCTAssertTrue(rendered.contains("Trust required"), "\(rendered)")
+        XCTAssertTrue(rendered.contains { $0.contains("/hooks") }, "\(rendered)")
+        XCTAssertTrue(rendered.contains { $0.contains(AppIdentity.integrationIdentifier) }, "\(rendered)")
+
+        try renderedButton("settings.integrations.confirmCodexTrust", in: hosting).performClick(nil)
+        await nextMainTurn()
+        hosting.layoutSubtreeIfNeeded()
+
+        rendered = renderedText(in: hosting)
+        XCTAssertTrue(rendered.contains("User confirmed"), "\(rendered)")
+        let installCount = await harness.integrations.counts().install
+        XCTAssertEqual(installCount, 1)
+    }
+
+    func testPendingLoginApprovalRendersExactGuidanceAndStatusOnlyRetryControl() async throws {
+        let harness = ViewModelHarness()
+        harness.loginItem.registerResult = .requiresApproval
+        await harness.viewModel.connect(using: harness.validDraft)
+        await harness.viewModel.approveIntegrations()
+        let hosting = host(SettingsView(viewModel: harness.viewModel))
+
+        let rendered = renderedText(in: hosting)
+        XCTAssertTrue(
+            rendered.contains("Open System Settings > General > Login Items, then allow Agent Light."),
+            "\(rendered)"
+        )
+        _ = try renderedButton("settings.general.retryLoginStatus", in: hosting)
+    }
+
+    func testREADMEExplainsManualCodexTrustSequenceAndSkippedHooks() throws {
+        let readmeURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: "README.md")
+        let readme = try String(contentsOf: readmeURL, encoding: .utf8)
+
+        XCTAssertTrue(readme.contains("/hooks"))
+        XCTAssertTrue(readme.contains(AppIdentity.integrationIdentifier))
+        XCTAssertTrue(readme.localizedCaseInsensitiveContains("untrusted hooks are skipped"))
+    }
+
     func testVerifyingAndApprovingProgressRender() async {
         let verifyingHarness = ViewModelHarness()
         await verifyingHarness.verifier.block(call: 1)

@@ -21,6 +21,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     var repairPreviews: [IntegrationPreview] { get }
     var integrationInstalled: Bool { get }
     var integrationStatus: IntegrationInstallationStatus { get }
+    var codexTrustStatus: IntegrationTrustStatus { get }
     var monitoringActive: Bool { get }
     func connect(using draft: ConnectionDraft) async
     func approveIntegrations() async
@@ -32,6 +33,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     func observeMonitoring() async
     func synchronizeOwnership() async
     func requestLaunchAtLogin() async
+    func confirmCodexTrust()
     func reconnect() async
     func previewIntegrationRepair() async
     func uninstallIntegrations() async
@@ -44,11 +46,13 @@ public extension AppViewModeling {
     func synchronizeOwnership() async {}
     var loginItemStatus: LoginItemStatus { .unknown }
     func requestLaunchAtLogin() async {}
+    func confirmCodexTrust() {}
     var maskedAccessID: String? { nil }
     var maskedDeviceID: String? { nil }
     var repairPreviews: [IntegrationPreview] { [] }
     var integrationInstalled: Bool { false }
     var integrationStatus: IntegrationInstallationStatus { .notInstalled }
+    var codexTrustStatus: IntegrationTrustStatus { .notRequired }
     var monitoringActive: Bool { false }
     func reconnect() async {}
     func previewIntegrationRepair() async {}
@@ -136,6 +140,7 @@ public final class AppViewModel: AppViewModeling {
     public private(set) var repairPreviews: [IntegrationPreview] = []
     public private(set) var integrationInstalled = false
     public private(set) var integrationStatus: IntegrationInstallationStatus = .notInstalled
+    public private(set) var codexTrustStatus: IntegrationTrustStatus = .notRequired
     public private(set) var monitoringActive = false
     public private(set) var canResetOwnershipReceipt = false
 
@@ -693,13 +698,34 @@ public final class AppViewModel: AppViewModeling {
     public func requestLaunchAtLogin() async {
         guard phase == .monitoring || phase == .paused || phase == .repairRequired,
               let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        let snapshot = await ownershipLedger.snapshot()
+        if snapshot.login == .pendingApproval {
+            loginItemStatus = loginItem.status()
+            if loginItemStatus == .enabled {
+                do {
+                    try await ownershipLedger.update(.login(.registered))
+                    syncOwnership(await ownershipLedger.snapshot())
+                    presentedError = nil
+                } catch {
+                    syncOwnership(await ownershipLedger.snapshot())
+                    phase = .repairRequired
+                    presentedError = .operationFailed
+                }
+            } else if loginItemStatus == .requiresApproval {
+                presentedError = .loginApprovalRequired
+            } else {
+                presentedError = .operationFailed
+            }
+            await ownershipLedger.releaseLease(lease)
+            return
+        }
         do {
             let transition = try loginItem.setEnabled(true)
             loginItemStatus = transition.current
             if transition.didRegister {
                 do {
                     try await ownershipLedger.update(.login(
-                        transition.current == .requiresApproval ? .pendingApproval : .owned
+                        transition.current == .requiresApproval ? .pendingApproval : .registered
                     ))
                     loginRegistrationOwned = true
                 } catch {
@@ -707,7 +733,7 @@ public final class AppViewModel: AppViewModeling {
                         _ = try loginItem.setEnabled(false)
                     } catch {
                         _ = await Self.persist([
-                            .login(transition.current == .requiresApproval ? .pendingApproval : .owned),
+                            .login(transition.current == .requiresApproval ? .pendingApproval : .registered),
                             .insertObligation(.loginRegistrationCleanup)
                         ], to: ownershipLedger)
                     }
@@ -725,6 +751,11 @@ public final class AppViewModel: AppViewModeling {
             presentedError = .operationFailed
         }
         await ownershipLedger.releaseLease(lease)
+    }
+
+    public func confirmCodexTrust() {
+        guard codexTrustStatus == .required else { return }
+        codexTrustStatus = .userConfirmed
     }
 
     public func reconnect() async {
@@ -1266,21 +1297,23 @@ public final class AppViewModel: AppViewModeling {
             if transition.didRegister {
                 do {
                     try await ledger.update(.login(
-                        transition.current == .requiresApproval ? .pendingApproval : .owned
+                        transition.current == .requiresApproval ? .pendingApproval : .registered
                     ))
                 } catch {
                     do {
                         _ = try loginItem.setEnabled(false)
                     } catch {
                         _ = await persist([
-                            .login(transition.current == .requiresApproval ? .pendingApproval : .owned),
+                            .login(transition.current == .requiresApproval ? .pendingApproval : .registered),
                             .insertObligation(.loginRegistrationCleanup)
                         ], to: ledger)
                     }
                     throw error
                 }
             }
-            guard transition.current == .enabled else { throw InternalError.loginApprovalRequired }
+            guard transition.current == .enabled
+                    || (transition.didRegister && transition.current == .requiresApproval)
+            else { throw InternalError.loginApprovalRequired }
 
             try Task.checkCancellation()
             try await monitor.start()
@@ -1525,7 +1558,7 @@ public final class AppViewModel: AppViewModeling {
             monitoringActive = snapshot.monitoringOwned
             installObservation(observation)
             phase = .monitoring
-            presentedError = nil
+            presentedError = snapshot.login == .pendingApproval ? .loginApprovalRequired : nil
         case let .failure(error, snapshot):
             syncOwnership(snapshot)
             loginItemStatus = loginItem.status()
@@ -1544,6 +1577,11 @@ public final class AppViewModel: AppViewModeling {
         integrationOwnership = snapshot.integration
         integrationInstalled = snapshot.integration != .none
         integrationStatus = Self.installationStatus(for: snapshot)
+        let recordedCodexTrust = snapshot.integration.receipt?.sources
+            .first(where: { $0.source == .codex })?.trust ?? .notRequired
+        if recordedCodexTrust == .notRequired || codexTrustStatus != .userConfirmed {
+            codexTrustStatus = recordedCodexTrust
+        }
         credentialOwnership = snapshot.credentials
         loginRegistrationOwned = snapshot.loginRegistrationOwned
         outstandingObligations = snapshot.obligations
@@ -2611,7 +2649,7 @@ public actor AppOwnershipLedger {
         try await update(.credentials(ownership))
     }
     func setLoginOwned(_ owned: Bool) async throws {
-        try await update(.login(owned ? .owned : .none))
+        try await update(.login(owned ? .registered : .none))
     }
     func setMonitoringOwned(_ owned: Bool) { value.monitoringOwned = owned }
     func insert(_ obligation: OutstandingObligation) async throws {

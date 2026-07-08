@@ -1392,7 +1392,7 @@ private final class PathLifecycleFixture {
         seededReceipt = SetupOwnershipReceipt(
             integration: .uninstallable(integrationReceipt),
             credential: .created,
-            login: .owned
+            login: .registered
         )
         credentialStore = PathCredentialStore(stored: credentials)
         integrations = PathIntegrationInstaller(receipt: integrationReceipt)

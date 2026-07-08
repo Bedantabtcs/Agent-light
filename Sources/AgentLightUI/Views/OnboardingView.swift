@@ -148,7 +148,7 @@ extension PresentationError {
         case .integrationConflict: "An agent configuration conflicts with the required hook entries. Review it before retrying."
         case .bulbOffline: "The bulb or Tuya service is offline. No new light command was sent."
         case .rateLimited: "Tuya is rate limiting requests. Wait, then retry."
-        case .loginApprovalRequired: "Allow Agent Light in System Settings > General > Login Items."
+        case .loginApprovalRequired: "Open System Settings > General > Login Items, then allow Agent Light."
         case .operationFailed: "The operation could not be completed. Retry from this screen."
         }
     }

@@ -1,3 +1,4 @@
+import AgentLightProtocol
 import SwiftUI
 
 public struct SettingsView: View {
@@ -56,9 +57,28 @@ public struct SettingsView: View {
                 }
 
                 Section("Integrations") {
-                    LabeledContent("Codex", value: viewModel.integrationStatus.displayName)
+                    LabeledContent("Codex", value: codexStatusTitle)
                     LabeledContent("Claude Code", value: viewModel.integrationStatus.displayName)
                     LabeledContent("Cursor", value: viewModel.integrationStatus.displayName)
+                    if viewModel.codexTrustStatus == .required {
+                        NativeWrappingText(
+                            text: "Trust required. Open Codex, run /hooks, review the Agent Light command with integration ID \(AppIdentity.integrationIdentifier), trust it in Codex, then return here.",
+                            accessibilityIdentifier: "settings.integrations.codexTrustGuidance",
+                            isSelectable: true
+                        )
+                        NativeActionButton(
+                            title: "I Confirmed in Codex",
+                            accessibilityIdentifier: AmbientAccessibilityID.settingsConfirmCodexTrust
+                        ) {
+                            viewModel.confirmCodexTrust()
+                        }
+                    } else if viewModel.codexTrustStatus == .userConfirmed {
+                        NativeWrappingText(
+                            text: "User confirmed in Codex. Agent Light cannot independently verify Codex trust.",
+                            accessibilityIdentifier: "settings.integrations.codexTrustGuidance",
+                            isSelectable: false
+                        )
+                    }
                     NativeActionButton(
                         title: "Preview Repair",
                         accessibilityIdentifier: AmbientAccessibilityID.settingsRepair
@@ -132,7 +152,19 @@ public struct SettingsView: View {
                 Section("General") {
                     LabeledContent("Launch at login", value: loginStatusTitle)
                         .accessibilityIdentifier("settings.general.loginStatus")
-                    if viewModel.loginItemStatus != .enabled {
+                    if viewModel.loginItemStatus == .requiresApproval {
+                        NativeWrappingText(
+                            text: "Open System Settings > General > Login Items, then allow Agent Light.",
+                            accessibilityIdentifier: "settings.general.loginApprovalGuidance",
+                            isSelectable: false
+                        )
+                        NativeActionButton(
+                            title: "Retry Status",
+                            accessibilityIdentifier: AmbientAccessibilityID.settingsRetryLoginStatus
+                        ) {
+                            Task { await viewModel.requestLaunchAtLogin() }
+                        }
+                    } else if viewModel.loginItemStatus != .enabled {
                         NativeActionButton(
                             title: "Enable Launch at Login",
                             accessibilityIdentifier: AmbientAccessibilityID.settingsEnableLogin
@@ -174,6 +206,17 @@ public struct SettingsView: View {
         case .requiresApproval: "Approval required"
         case .notRegistered, .notFound: "Not enabled"
         case .unknown: "Status unavailable"
+        }
+    }
+
+    private var codexStatusTitle: String {
+        guard viewModel.integrationStatus == .installed else {
+            return viewModel.integrationStatus.displayName
+        }
+        return switch viewModel.codexTrustStatus {
+        case .notRequired: "Installed"
+        case .required: "Trust required"
+        case .userConfirmed: "User confirmed"
         }
     }
 

@@ -65,6 +65,39 @@ final class IntegrationInstallerTests: XCTestCase {
         XCTAssertTrue(String(decoding: beforeAttempt, as: UTF8.self).contains("--externally-changed"))
     }
 
+    func testInstallReceiptRecordsCodexTrustAsRequiredWithoutAffectingOtherSources() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = IntegrationConfigurationPaths(homeDirectory: root)
+        let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+
+        let receipt = try await installer.installWithReceipt()
+        let encoded = try JSONEncoder().encode(receipt)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let sources = try XCTUnwrap(object["sources"] as? [[String: Any]])
+        let trustBySource: [String: String] = Dictionary(
+            uniqueKeysWithValues: sources.compactMap { source -> (String, String)? in
+            guard let name = source["source"] as? String,
+                  let trust = source["trust"] as? String else { return nil }
+            return (name, trust)
+            }
+        )
+
+        XCTAssertEqual(trustBySource[AgentSource.codex.rawValue], "required")
+        XCTAssertEqual(trustBySource[AgentSource.claudeCode.rawValue], "notRequired")
+        XCTAssertEqual(trustBySource[AgentSource.cursor.rawValue], "notRequired")
+    }
+
+    func testLegacyReceiptWithoutTrustDecodesToConservativeSourceDefaults() throws {
+        let legacy = Data(
+            #"{"source":"codex","ownership":"fresh","marker":"com.bbatchas.agentlight.hook.v1","installedContentFingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#.utf8
+        )
+
+        let receipt = try JSONDecoder().decode(IntegrationSourceReceipt.self, from: legacy)
+
+        XCTAssertEqual(receipt.trust, .required)
+    }
+
     func testVerifiedUninstallAllowsUnrelatedConfigChangesAndRemovesExactOwnedHooks() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -313,6 +346,24 @@ final class IntegrationInstallerTests: XCTestCase {
             XCTAssertEqual(try JSONValue.decode(Data(contentsOf: url)), .object([:]))
         }
         XCTAssertTrue(try temporaryArtifacts(in: root).isEmpty)
+    }
+
+    func testSuccessfulReplacementPreservesExistingRegularFilePermissionBits() async throws {
+        for originalMode: mode_t in [0o600, 0o640, 0o644] {
+            let root = temporaryRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = IntegrationConfigurationPaths(homeDirectory: root)
+            for path in paths.all.map(\.url) {
+                try write(Data(#"{"unrelated":true}"#.utf8), to: path, mode: originalMode)
+            }
+            let installer = IntegrationInstaller(relayPath: "/tmp/CANARY_RELAY", paths: paths)
+
+            try await installer.install()
+
+            for path in paths.all.map(\.url) {
+                XCTAssertEqual(try mode(at: path), originalMode, "path: \(path.path)")
+            }
+        }
     }
 
     func testBlindUninstallRequiresPersistedReceiptAndDoesNotMutateHooks() async throws {

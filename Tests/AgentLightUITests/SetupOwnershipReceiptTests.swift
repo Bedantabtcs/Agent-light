@@ -6,6 +6,20 @@ import AgentLightProtocol
 @testable import AgentLightUI
 
 final class SetupOwnershipReceiptTests: XCTestCase {
+    func testLegacyOwnedLoginValueDecodesAsRegistered() throws {
+        let current = SetupOwnershipReceipt(login: .registered)
+        let encoded = try JSONEncoder().encode(current)
+        let legacy = Data(
+            String(decoding: encoded, as: UTF8.self)
+                .replacingOccurrences(of: "\"registered\"", with: "\"owned\"")
+                .utf8
+        )
+
+        let decoded = try JSONDecoder().decode(SetupOwnershipReceipt.self, from: legacy)
+
+        XCTAssertEqual(decoded.login, .registered)
+    }
+
     func testVersionOneReceiptRoundTripsWithoutCredentialMaterial() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -106,7 +120,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
 
         try await first.update(.integration(integration))
         try await first.update(.credentials(.created))
-        try await first.update(.login(.owned))
+        try await first.update(.login(.registered))
         try await first.update(.insertObligation(.integrationArtifactCleanup))
 
         let relaunched = AppOwnershipLedger(store: store)
@@ -114,7 +128,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         let snapshot = await relaunched.snapshot()
         XCTAssertEqual(snapshot.integration, integration)
         XCTAssertEqual(snapshot.credentials, .created)
-        XCTAssertEqual(snapshot.login, .owned)
+        XCTAssertEqual(snapshot.login, .registered)
         XCTAssertEqual(snapshot.obligations, [.integrationArtifactCleanup])
         XCTAssertFalse(snapshot.monitoringOwned)
     }
@@ -197,7 +211,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         await store.blockFirstSave()
         let first = Task { try await ledger.update(.credentials(.created)) }
         await store.waitForFirstSave()
-        let second = Task { try await ledger.update(.login(.owned)) }
+        let second = Task { try await ledger.update(.login(.registered)) }
         for _ in 0..<100 { await Task.yield() }
 
         await store.releaseFirstSave()
@@ -208,7 +222,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         try await relaunched.hydrate()
         let snapshot = await relaunched.snapshot()
         XCTAssertEqual(snapshot.credentials, .created)
-        XCTAssertEqual(snapshot.login, .owned)
+        XCTAssertEqual(snapshot.login, .registered)
     }
 
     func testAutomaticSaveAndDeletePreserveMalformedOwnerOwnedReceiptBytes() async throws {
@@ -319,7 +333,7 @@ final class SetupOwnershipReceiptTests: XCTestCase {
             version: SetupOwnershipReceipt.currentVersion,
             integration: .uninstallable(makeIntegrationReceipt()),
             credential: .replacedWithBackup,
-            login: .owned,
+            login: .registered,
             obligations: [.integrationArtifactCleanup]
         )
     }

@@ -1076,33 +1076,42 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertEqual(harness.loginItem.disableCount, 0)
     }
 
-    func testNewApprovalPendingRegistrationIsUnregisteredDuringCompensation() async {
-        let harness = ViewModelHarness()
+    func testNewApprovalPendingRegistrationIsDurableMonitorsAndPromotesOnStatusRetry() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
         harness.loginItem.registerResult = .requiresApproval
         await harness.viewModel.connect(using: harness.validDraft)
 
         await harness.viewModel.approveIntegrations()
 
         XCTAssertEqual(harness.viewModel.presentedError, .loginApprovalRequired)
-        XCTAssertEqual(harness.loginItem.currentStatus, .notRegistered)
-        XCTAssertEqual(harness.loginItem.disableCount, 1)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertEqual(harness.loginItem.currentStatus, .requiresApproval)
+        XCTAssertEqual(harness.loginItem.disableCount, 0)
+        let pendingReceipt = try await store.load()
+        let monitoringStartCount = await harness.monitor.metrics().start
+        XCTAssertEqual(pendingReceipt?.login, .pendingApproval)
+        XCTAssertEqual(monitoringStartCount, 1)
+
+        harness.loginItem.currentStatus = .enabled
+        await harness.viewModel.requestLaunchAtLogin()
+
+        XCTAssertEqual(harness.viewModel.loginItemStatus, .enabled)
+        XCTAssertEqual(harness.loginItem.enableCount, 1, "Retry Status must not register again")
+        let registeredReceipt = try await store.load()
+        XCTAssertEqual(registeredReceipt?.login.rawValue, "registered")
     }
 
-    func testNewApprovalPendingUnregisterFailurePreservesOriginalErrorAndTypedObligation() async {
+    func testExplicitDisconnectCanRemoveVerifiedPendingRegistration() async throws {
         let harness = ViewModelHarness()
         harness.loginItem.registerResult = .requiresApproval
-        harness.loginItem.disableError = HarnessSensitiveError("CANARY_UNREGISTER_FAILURE")
         await harness.viewModel.connect(using: harness.validDraft)
-
         await harness.viewModel.approveIntegrations()
 
-        XCTAssertEqual(harness.viewModel.presentedError, .loginApprovalRequired)
-        XCTAssertEqual(harness.viewModel.outstandingObligations, [.loginRegistrationCleanup])
-        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
-
-        harness.loginItem.disableError = nil
         await harness.viewModel.disconnect()
+
         XCTAssertEqual(harness.loginItem.currentStatus, .notRegistered)
+        XCTAssertEqual(harness.loginItem.disableCount, 1)
         XCTAssertEqual(harness.viewModel.outstandingObligations, [])
     }
 

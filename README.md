@@ -57,6 +57,14 @@ Agent Light reviews and, after approval, updates these global user configuration
 
 Existing JSON is parsed and unrelated hook semantics are preserved. Agent Light owns only commands containing its stable integration identifier. The installed commands use an absolute, shell-quoted path to the bundled `AgentLightRelay`. Repair and uninstall actions apply the same ownership rule.
 
+Codex trust remains a separate manual decision after installation:
+
+1. Open Codex and run `/hooks`.
+2. Review the exact Agent Light hook command and integration identifier `com.bbatchas.agentlight.hook.v1`.
+3. Trust the hook in Codex, then return to Agent Light and select **I Confirmed in Codex**.
+
+Agent Light records only that the user confirmed this step; it cannot verify or modify Codex trust. Until the hook is trusted, Codex may silently skip it—untrusted hooks are skipped rather than treated as active monitoring. Claude Code and Cursor do not use this Codex-specific trust step.
+
 ## Privacy and security boundaries
 
 - Tuya connection values are stored in Keychain, never in project files, hook arguments, UserDefaults, or logs.
