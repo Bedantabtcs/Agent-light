@@ -18,18 +18,20 @@ struct AgentLightApp: App {
 
     var body: some Scene {
         MenuBarExtra("Agent Light", systemImage: "lightbulb.led.fill") {
-            Group {
-                switch environment.status {
-                case .ready:
-                    MenuBarContentView(viewModel: viewModel) {
-                        environment.requestQuit()
+            AmbientDarkAppearance {
+                Group {
+                    switch environment.status {
+                    case .ready:
+                        MenuBarContentView(viewModel: viewModel) {
+                            environment.requestQuit()
+                        }
+                    case .loading, .failed, .credentialResetFailed:
+                        StartupStatusView(
+                            status: environment.status,
+                            retry: environment.requestStart,
+                            quit: environment.requestQuit
+                        )
                     }
-                case .loading, .failed, .credentialResetFailed:
-                    StartupStatusView(
-                        status: environment.status,
-                        retry: environment.requestStart,
-                        quit: environment.requestQuit
-                    )
                 }
             }
         }

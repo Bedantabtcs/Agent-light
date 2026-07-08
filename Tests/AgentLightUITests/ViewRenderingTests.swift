@@ -23,6 +23,35 @@ final class ViewRenderingTests: XCTestCase {
         }
     }
 
+    func testMenuBarContentOverridesLightHostAppearance() throws {
+        NSApplication.shared.setActivationPolicy(.regular)
+        let hosting = NSHostingView(rootView: AmbientDarkAppearance {
+            MenuBarContentView(viewModel: PreviewViewModel.onboarding())
+        })
+        hosting.frame = NSRect(x: 0, y: 0, width: 380, height: 540)
+        let window = NSWindow(
+            contentRect: hosting.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.appearance = NSAppearance(named: .aqua)
+        window.contentView = hosting
+        window.makeKeyAndOrderFront(nil)
+        windows.append(window)
+        hosting.layoutSubtreeIfNeeded()
+
+        let match = window.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
+        XCTAssertEqual(match, .darkAqua)
+        let picker = try XCTUnwrap(
+            descendants(of: hosting).compactMap { $0 as? NSPopUpButton }.first
+        )
+        XCTAssertEqual(
+            picker.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]),
+            .darkAqua
+        )
+    }
+
     func testMonitoringViewRendersAtCompactSizeWithLongContent() async {
         let sessions = (0..<14).map { index in
             AgentEvent(
