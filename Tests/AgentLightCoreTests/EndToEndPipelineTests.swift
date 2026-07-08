@@ -22,6 +22,30 @@ final class EndToEndPipelineTests: XCTestCase {
         XCTAssertEqual(applied, DesiredLightState(color: try XCTUnwrap(AgentState.error.color)))
     }
 
+    func testCodexReadFixtureReachesFakeLightAsReadingThroughSocket() async throws {
+        let applied = try await runFixtureThroughProductionPipeline(named: "codex-read")
+
+        XCTAssertEqual(applied, DesiredLightState(color: try XCTUnwrap(AgentState.reading.color)))
+    }
+
+    func testClaudeEditFixtureReachesFakeLightAsEditingThroughSocket() async throws {
+        let applied = try await runFixtureThroughProductionPipeline(named: "claude-edit")
+
+        XCTAssertEqual(applied, DesiredLightState(color: try XCTUnwrap(AgentState.editing.color)))
+    }
+
+    func testCursorTestFixtureReachesFakeLightAsTestingThroughSocket() async throws {
+        let applied = try await runFixtureThroughProductionPipeline(named: "cursor-test")
+
+        XCTAssertEqual(applied, DesiredLightState(color: try XCTUnwrap(AgentState.testing.color)))
+    }
+
+    func testCursorCancelledFixtureReachesFakeLightAsCancelledThroughSocket() async throws {
+        let applied = try await runFixtureThroughProductionPipeline(named: "cursor-cancelled")
+
+        XCTAssertEqual(applied, DesiredLightState(color: try XCTUnwrap(AgentState.cancelled.color)))
+    }
+
     private func runFixtureThroughProductionPipeline(named name: String) async throws -> DesiredLightState? {
         let fixture = try fixtureData(named: name)
         let path = FileManager.default.temporaryDirectory

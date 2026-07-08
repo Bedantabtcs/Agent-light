@@ -158,7 +158,11 @@ final class AgentAdapterTests: XCTestCase {
         let cases: [(String, AgentSource, AgentState)] = [
             ("codex-user-prompt", .codex, .thinking),
             ("claude-permission", .claudeCode, .needsYou),
-            ("cursor-stop-error", .cursor, .error)
+            ("cursor-stop-error", .cursor, .error),
+            ("codex-read", .codex, .reading),
+            ("claude-edit", .claudeCode, .editing),
+            ("cursor-test", .cursor, .testing),
+            ("cursor-cancelled", .cursor, .cancelled)
         ]
 
         for (name, source, expectedState) in cases {

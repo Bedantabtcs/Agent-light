@@ -1,6 +1,6 @@
 # Agent Light
 
-Agent Light is a dark-mode macOS menu-bar app that reflects the newest local Codex, Claude Code, or Cursor agent state on one Wipro bulb through the Tuya Developer Platform. It maps Thinking, Working, Needs You, Completed, and Error to the approved palette, then restores the bulb's previous state.
+Agent Light is a dark-mode macOS menu-bar app that reflects the newest local Codex, Claude Code, or Cursor agent state on one Wipro bulb through the Tuya Developer Platform. It maps agent and activity states to the approved palette, then restores the bulb's previous state.
 
 This repository is under local development. The app bundle is ad-hoc signed, not notarized, and is ready for local testing only after the manual acceptance checks below. Building or installing the app never pushes to GitHub; no GitHub push occurs automatically.
 
@@ -65,11 +65,29 @@ Codex trust remains a separate manual decision after installation:
 
 Agent Light records only that the user confirmed this step; it cannot verify or modify Codex trust. Until the hook is trusted, Codex may silently skip it—untrusted hooks are skipped rather than treated as active monitoring. Claude Code and Cursor do not use this Codex-specific trust step.
 
+### State colors and activity classification
+
+| State | Color | Hex |
+| --- | --- | --- |
+| Thinking | Violet | `#8B5CF6` |
+| Working | Blue | `#3B82F6` |
+| Reading | Cyan | `#06B6D4` |
+| Editing | Teal | `#14B8A6` |
+| Testing | Pink | `#EC4899` |
+| Needs You | Amber | `#F59E0B` |
+| Completed | Green | `#22C55E` |
+| Cancelled | Orange | `#F97316` |
+| Error | Red | `#EF4444` |
+
+Activity classification is local and ephemeral. The bundled relay inspects a tool name or shell command only long enough to classify it as Reading, Editing, Testing, or generic Working, then discards the raw value and sends only the sanitized category to the app. Unknown and generic activity falls back to Working blue. Explicit cancellation is currently supported only for Cursor's `stop` event with `aborted` status; the owned Codex and Claude Code hook event sets do not report an explicit cancellation state.
+
+Rapid states inside the one-second outbound-command throttle window may collapse to the newest state, so a brief intermediate color may not reach the bulb.
+
 ## Privacy and security boundaries
 
 - Tuya connection values are stored in Keychain, never in project files, hook arguments, UserDefaults, or logs.
 - Signed Tuya requests can go only to an allowlisted regional HTTPS origin. The Access Secret is used for local request signing and is not sent as a request field.
-- Hook input is reduced to source, event, session identifier, workspace basename, status, and emission time. Prompt text, response text, reasoning, tool arguments, and source code are neither persisted nor sent by Agent Light.
+- Hook input is reduced to source, event, session identifier, workspace basename, status, emission time, and an optional sanitized activity category. Prompt text, response text, reasoning, raw tool names, commands, tool arguments, and source code are neither persisted nor sent to the app or Tuya.
 - The relay accepts at most 1 MiB of hook input and emits a validated envelope of at most 2,048 bytes.
 - Relay delivery uses a nonblocking Unix datagram send with a 100 ms monotonic transport budget. Missing, refused, or overloaded sockets fail open; process launch, scheduling, and bounded input parsing are outside that transport-only budget and remain part of the manual end-to-end 200 ms check.
 - The local Unix datagram socket is created with mode `0600` inside `~/Library/Application Support/Agent Light`.
@@ -103,7 +121,12 @@ These checks intentionally are not performed by build or test scripts because th
 1. Open `build/Agent Light.app` and confirm it appears only in the menu bar.
 2. Enter deliberately invalid Tuya credentials and confirm nothing is saved.
 3. Verify valid credentials, record the discovered power, mode, and color DP codes without recording credentials, review all hook changes, and approve installation.
-4. Start local Codex, Claude Code, and Cursor sessions and confirm the newest accepted event controls the bulb across sources.
+4. Start local Codex, Claude Code, and Cursor sessions and confirm the newest accepted event controls the bulb across sources. Within those sessions:
+   - Read a file and confirm Reading cyan.
+   - Edit a file and confirm Editing teal.
+   - Run a test command and confirm Testing pink.
+   - Run a generic tool or unclassified command and confirm fallback Working blue.
+   - Abort a Cursor run and confirm Cancelled orange; do not expect an explicit Cancelled transition from the current Codex or Claude Code hook event sets.
 5. Trigger supported permission waits, completion, error, pause, quit, and reconnect behavior.
 6. Confirm Completed holds for 8 seconds, Error holds for 12 seconds, and the original bulb state is restored from both powered-on and powered-off baselines.
 7. Close the app and invoke every installed hook. Each must exit successfully within 200 ms.
