@@ -320,6 +320,8 @@ final class ViewRenderingTests: XCTestCase {
         XCTAssertTrue(readme.contains("/hooks"))
         XCTAssertTrue(readme.contains("com.bbatchas.agentlight.hook.v1"))
         XCTAssertTrue(readme.localizedCaseInsensitiveContains("untrusted hooks are skipped"))
+        XCTAssertTrue(readme.contains("All monitoring colors use 80% value/brightness."))
+        XCTAssertTrue(readme.contains("Cancelled holds for 8 seconds"))
     }
 
     func testVerifyingAndApprovingProgressRender() async {

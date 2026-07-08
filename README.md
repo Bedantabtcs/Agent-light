@@ -79,6 +79,8 @@ Agent Light records only that the user confirmed this step; it cannot verify or 
 | Cancelled | Orange | `#F97316` |
 | Error | Red | `#EF4444` |
 
+All monitoring colors use 80% value/brightness.
+
 Activity classification is local and ephemeral. The bundled relay inspects a tool name or shell command only long enough to classify it as Reading, Editing, Testing, or generic Working, then discards the raw value and sends only the sanitized category to the app. Unknown and generic activity falls back to Working blue. Explicit cancellation is currently supported only for Cursor's `stop` event with `aborted` status; the owned Codex and Claude Code hook event sets do not report an explicit cancellation state.
 
 Rapid states inside the one-second outbound-command throttle window may collapse to the newest state, so a brief intermediate color may not reach the bulb.
@@ -128,7 +130,7 @@ These checks intentionally are not performed by build or test scripts because th
    - Run a generic tool or unclassified command and confirm fallback Working blue.
    - Abort a Cursor run and confirm Cancelled orange; do not expect an explicit Cancelled transition from the current Codex or Claude Code hook event sets.
 5. Trigger supported permission waits, completion, error, pause, quit, and reconnect behavior.
-6. Confirm Completed holds for 8 seconds, Error holds for 12 seconds, and the original bulb state is restored from both powered-on and powered-off baselines.
+6. Confirm Completed holds for 8 seconds, Cancelled holds for 8 seconds, Error holds for 12 seconds, and the original bulb state is restored from both powered-on and powered-off baselines.
 7. Close the app and invoke every installed hook. Each must exit successfully within 200 ms.
 8. Inspect all three config files and confirm unrelated hooks remain semantically unchanged after install, repair, and uninstall.
 9. Confirm launch at login is enabled only after approved setup and that relaunch resumes monitoring.
