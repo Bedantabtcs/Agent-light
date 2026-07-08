@@ -176,7 +176,19 @@ public struct SettingsView: View {
                             Task { await viewModel.retrySavingDisabledLoginState() }
                         }
                     }
-                    if viewModel.loginItemStatus == .requiresApproval {
+                    if viewModel.loginStatusReconciliationRequired {
+                        NativeWrappingText(
+                            text: "macOS has not confirmed that the saved login registration is enabled. Retry Status does not change registration.",
+                            accessibilityIdentifier: "settings.general.loginStatusReconciliationGuidance",
+                            isSelectable: false
+                        )
+                        NativeActionButton(
+                            title: "Retry Status",
+                            accessibilityIdentifier: AmbientAccessibilityID.settingsRetryLoginStatus
+                        ) {
+                            Task { await viewModel.requestLaunchAtLogin() }
+                        }
+                    } else if viewModel.loginItemStatus == .requiresApproval {
                         NativeWrappingText(
                             text: "Open System Settings > General > Login Items, then allow Agent Light.",
                             accessibilityIdentifier: "settings.general.loginApprovalGuidance",

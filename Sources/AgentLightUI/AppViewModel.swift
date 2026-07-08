@@ -25,6 +25,7 @@ public protocol AppViewModeling: AnyObject, Sendable {
     var monitoringActive: Bool { get }
     var automaticSetupResumeAuthorized: Bool { get }
     var loginDisabledStatePersistenceRetryRequired: Bool { get }
+    var loginStatusReconciliationRequired: Bool { get }
     func connect(using draft: ConnectionDraft) async
     func approveIntegrations() async
     func pause() async
@@ -62,6 +63,7 @@ public extension AppViewModeling {
     var monitoringActive: Bool { false }
     var automaticSetupResumeAuthorized: Bool { false }
     var loginDisabledStatePersistenceRetryRequired: Bool { false }
+    var loginStatusReconciliationRequired: Bool { false }
     func reconnect() async {}
     func previewIntegrationRepair() async {}
     func uninstallIntegrations() async {}
@@ -153,6 +155,7 @@ public final class AppViewModel: AppViewModeling {
     public private(set) var automaticSetupResumeAuthorized = false
     public private(set) var canResetOwnershipReceipt = false
     public private(set) var loginDisabledStatePersistenceRetryRequired = false
+    public private(set) var loginStatusReconciliationRequired = false
 
     @ObservationIgnored private let credentials: any CredentialStoring
     @ObservationIgnored private let integrations: any IntegrationInstalling
@@ -710,8 +713,8 @@ public final class AppViewModel: AppViewModeling {
         guard phase == .monitoring || phase == .paused || phase == .repairRequired,
               let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
         let snapshot = await ownershipLedger.snapshot()
+        syncOwnership(snapshot)
         if snapshot.login == .pendingApproval {
-            loginItemStatus = loginItem.status()
             if loginItemStatus == .enabled {
                 do {
                     try await ownershipLedger.update(.login(.registered))
@@ -730,6 +733,17 @@ public final class AppViewModel: AppViewModeling {
             await ownershipLedger.releaseLease(lease)
             return
         }
+        if snapshot.login == .registered {
+            if loginItemStatus == .enabled {
+                await ownershipLedger.releaseLease(lease)
+                return
+            }
+            if loginStatusReconciliationRequired {
+                presentedError = .operationFailed
+                await ownershipLedger.releaseLease(lease)
+                return
+            }
+        }
         do {
             let transition = try loginItem.setEnabled(true)
             loginItemStatus = transition.current
@@ -738,7 +752,7 @@ public final class AppViewModel: AppViewModeling {
                     try await ownershipLedger.update(.login(
                         transition.current == .requiresApproval ? .pendingApproval : .registered
                     ))
-                    loginRegistrationOwned = true
+                    syncOwnership(await ownershipLedger.snapshot())
                 } catch {
                     do {
                         _ = try loginItem.setEnabled(false)
@@ -777,12 +791,16 @@ public final class AppViewModel: AppViewModeling {
         do {
             let transition = try loginItem.setEnabled(false)
             loginItemStatus = transition.current
+            let snapshot = await ownershipLedger.snapshot()
+            syncOwnership(snapshot)
             guard transition.current == .notRegistered || transition.current == .notFound else {
+                if hasLoginReconciliation {
+                    phase = .repairRequired
+                }
                 presentedError = .operationFailed
                 await ownershipLedger.releaseLease(lease)
                 return
             }
-            let snapshot = await ownershipLedger.snapshot()
             if snapshot.login != .none {
                 do {
                     try await ownershipLedger.update(.login(.none))
@@ -813,15 +831,17 @@ public final class AppViewModel: AppViewModeling {
         guard loginDisabledStatePersistenceRetryRequired,
               phase == .repairRequired,
               let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
-        loginItemStatus = loginItem.status()
-        guard loginItemStatus == .notRegistered || loginItemStatus == .notFound else {
-            presentedError = .operationFailed
+        let current = await ownershipLedger.snapshot()
+        syncOwnership(current)
+        guard loginDisabledStatePersistenceRetryRequired else {
+            if loginStatusReconciliationRequired {
+                presentedError = .operationFailed
+            }
             await ownershipLedger.releaseLease(lease)
             return
         }
         do {
-            let snapshot = await ownershipLedger.snapshot()
-            if snapshot.login != .none {
+            if current.login != .none {
                 try await ownershipLedger.update(.login(.none))
             } else {
                 await ownershipLedger.clearTransientPersistenceRepair()
@@ -845,7 +865,6 @@ public final class AppViewModel: AppViewModeling {
             await ownershipLedger.clearTransientPersistenceRepair()
             let restored = await ownershipLedger.snapshot()
             syncOwnership(restored)
-            loginDisabledStatePersistenceRetryRequired = false
             if restored.obligations.isEmpty {
                 phase = loginOptOutRecoveryPhase
                     ?? (monitoringActive ? .monitoring : .paused)
@@ -854,16 +873,23 @@ public final class AppViewModel: AppViewModeling {
                 phase = .repairRequired
             }
         } else {
-            syncOwnership(await ownershipLedger.snapshot())
-            loginDisabledStatePersistenceRetryRequired = true
-            phase = .repairRequired
+            let restored = await ownershipLedger.snapshot()
+            syncOwnership(restored)
+            if hasLoginReconciliation {
+                phase = .repairRequired
+            } else {
+                phase = loginOptOutRecoveryPhase
+                    ?? (monitoringActive ? .monitoring : .paused)
+                loginOptOutRecoveryPhase = nil
+            }
         }
-        presentedError = .operationFailed
+        presentedError = loginItemStatus == .requiresApproval && !hasLoginReconciliation
+            ? .loginApprovalRequired
+            : .operationFailed
     }
 
     private func finishDisabledLoginPersistence(_ snapshot: OwnershipSnapshot) {
         syncOwnership(snapshot)
-        loginDisabledStatePersistenceRetryRequired = false
         loginRegistrationOwned = false
         if snapshot.obligations.isEmpty {
             phase = loginOptOutRecoveryPhase
@@ -1096,11 +1122,6 @@ public final class AppViewModel: AppViewModeling {
             await ownershipLedger.releaseLease(lease)
             return
         }
-        loginItemStatus = loginItem.status()
-        let loginReconciliationRequired = refreshLoginPersistenceReconciliation(
-            snapshot: snapshot,
-            status: loginItemStatus
-        )
         syncOwnership(snapshot)
         hydrateMaskedIdentifiersIfOwned(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
@@ -1139,7 +1160,7 @@ public final class AppViewModel: AppViewModeling {
                 phase = .paused
                 presentedError = Self.presentationError(for: error)
             }
-            if loginReconciliationRequired {
+            if hasLoginReconciliation {
                 phase = .repairRequired
                 presentedError = .operationFailed
             }
@@ -1159,7 +1180,7 @@ public final class AppViewModel: AppViewModeling {
             phase = .repairRequired
             presentedError = Self.presentationError(for: snapshot)
         }
-        if loginReconciliationRequired {
+        if hasLoginReconciliation {
             phase = .repairRequired
             presentedError = .operationFailed
         }
@@ -1175,16 +1196,11 @@ public final class AppViewModel: AppViewModeling {
         guard let lease = await ownershipLedger.acquireLeaseForCaller() else { return false }
         await ownershipLedger.registerPresentationHandle(presentationHandle)
         let snapshot = await ownershipLedger.snapshot()
-        loginItemStatus = loginItem.status()
-        let loginReconciliationRequired = refreshLoginPersistenceReconciliation(
-            snapshot: snapshot,
-            status: loginItemStatus
-        )
         syncOwnership(snapshot)
         ownsMonitoring = snapshot.monitoringOwned
         guard !snapshot.obligations.isEmpty else {
             reconcileEmptyLedgerPresentation(snapshot)
-            if loginReconciliationRequired {
+            if hasLoginReconciliation {
                 phase = .repairRequired
                 presentedError = .operationFailed
             }
@@ -1196,7 +1212,7 @@ public final class AppViewModel: AppViewModeling {
         connectTask?.cancel()
         phase = .repairRequired
         presentedError = Self.presentationError(for: snapshot)
-        if loginReconciliationRequired {
+        if hasLoginReconciliation {
             presentedError = .operationFailed
         }
         await ownershipLedger.releaseLease(lease)
@@ -1212,26 +1228,47 @@ public final class AppViewModel: AppViewModeling {
         presentedError = nil
     }
 
-    @discardableResult
-    private func refreshLoginPersistenceReconciliation(
+    private var hasLoginReconciliation: Bool {
+        loginDisabledStatePersistenceRetryRequired || loginStatusReconciliationRequired
+    }
+
+    private func recomputeLoginReconciliation(
         snapshot: OwnershipSnapshot,
         status: LoginItemStatus
-    ) -> Bool {
-        guard snapshot.login != .none else {
+    ) {
+        let wasReconciling = hasLoginReconciliation
+        switch (snapshot.login, status) {
+        case (.none, _),
+             (.registered, .enabled),
+             (.pendingApproval, .enabled),
+             (.pendingApproval, .requiresApproval):
             loginDisabledStatePersistenceRetryRequired = false
-            return false
+            loginStatusReconciliationRequired = false
+        case (.registered, .notRegistered),
+             (.registered, .notFound),
+             (.pendingApproval, .notRegistered),
+             (.pendingApproval, .notFound):
+            loginDisabledStatePersistenceRetryRequired = true
+            loginStatusReconciliationRequired = false
+        case (.registered, .requiresApproval),
+             (.registered, .unknown),
+             (.pendingApproval, .unknown):
+            loginDisabledStatePersistenceRetryRequired = false
+            loginStatusReconciliationRequired = true
         }
-        let required: Bool
-        switch status {
-        case .notRegistered, .notFound, .unknown:
-            required = true
-        case .requiresApproval:
-            required = snapshot.login == .registered
-        case .enabled:
-            required = false
+        if snapshot.login == .none {
+            loginOptOutRecoveryPhase = nil
         }
-        loginDisabledStatePersistenceRetryRequired = required
-        return required
+        guard wasReconciling,
+              !hasLoginReconciliation,
+              phase == .repairRequired,
+              snapshot.obligations.isEmpty else { return }
+        phase = loginOptOutRecoveryPhase
+            ?? (monitoringActive ? .monitoring : .paused)
+        loginOptOutRecoveryPhase = nil
+        presentedError = snapshot.login == .pendingApproval && status == .requiresApproval
+            ? .loginApprovalRequired
+            : nil
     }
 
     private func claimMonitoringLifecycleEntry() -> UInt64? {
@@ -1758,6 +1795,8 @@ public final class AppViewModel: AppViewModeling {
         outstandingObligations = snapshot.obligations
         canResetOwnershipReceipt = snapshot.ownershipReceiptResetEligible
         automaticSetupResumeAuthorized = snapshot.canAutomaticallyResumeApprovedSetup
+        loginItemStatus = loginItem.status()
+        recomputeLoginReconciliation(snapshot: snapshot, status: loginItemStatus)
     }
 
     private func hydrateMaskedIdentifiersIfOwned(_ snapshot: OwnershipSnapshot) {

@@ -152,7 +152,11 @@ final class ViewRenderingTests: XCTestCase {
             rendered.contains("Open System Settings > General > Login Items, then allow Agent Light."),
             "\(rendered)"
         )
+        XCTAssertFalse(harness.viewModel.loginDisabledStatePersistenceRetryRequired)
         _ = try renderedButton("settings.general.retryLoginStatus", in: hosting)
+        XCTAssertNil(descendants(of: hosting).compactMap { $0 as? NSButton }.first {
+            $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsRetryDisabledLoginState
+        })
     }
 
     func testRenderedLaunchAtLoginToggleDisablesPendingRegistrationAccessibly() async throws {
@@ -532,6 +536,82 @@ final class ViewRenderingTests: XCTestCase {
         XCTAssertEqual(relaunched.phase, .monitoring)
         XCTAssertEqual(harness.loginItem.enableCount, loginCounts.0)
         XCTAssertEqual(harness.loginItem.disableCount, loginCounts.1)
+    }
+
+    func testRenderedUnknownMismatchOffersStatusRetryOnlyAndResolvesWithoutLoginMutation() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.currentStatus = .unknown
+        let relaunched = AppViewModel(
+            credentials: harness.credentials,
+            integrations: harness.integrations,
+            monitor: harness.monitor,
+            loginItem: harness.loginItem,
+            verifier: harness.verifier,
+            ownershipLedger: AppOwnershipLedger(store: store)
+        )
+        await relaunched.synchronizeOwnership()
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+        let hosting = host(SettingsView(viewModel: relaunched))
+
+        XCTAssertNil(descendants(of: hosting).compactMap { $0 as? NSButton }.first {
+            $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsRetryDisabledLoginState
+        })
+        let statusRetry = try renderedButton(
+            AmbientAccessibilityID.settingsRetryLoginStatus,
+            in: hosting
+        )
+        harness.loginItem.currentStatus = .enabled
+        statusRetry.performClick(nil)
+        for _ in 0..<100 where relaunched.loginStatusReconciliationRequired {
+            await nextMainTurn()
+        }
+        hosting.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(relaunched.phase, .monitoring)
+        XCTAssertNil(relaunched.presentedError)
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+        XCTAssertNil(descendants(of: hosting).compactMap { $0 as? NSButton }.first {
+            $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsRetryLoginStatus
+        })
+    }
+
+    func testRenderedRequiresApprovalMismatchStatusRetryResolvesWithoutLoginMutation() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.currentStatus = .requiresApproval
+        let relaunched = AppViewModel(
+            credentials: harness.credentials,
+            integrations: harness.integrations,
+            monitor: harness.monitor,
+            loginItem: harness.loginItem,
+            verifier: harness.verifier,
+            ownershipLedger: AppOwnershipLedger(store: store)
+        )
+        await relaunched.synchronizeOwnership()
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+        let hosting = host(SettingsView(viewModel: relaunched))
+
+        XCTAssertNil(descendants(of: hosting).compactMap { $0 as? NSButton }.first {
+            $0.accessibilityIdentifier() == AmbientAccessibilityID.settingsRetryDisabledLoginState
+        })
+        let statusRetry = try renderedButton(
+            AmbientAccessibilityID.settingsRetryLoginStatus,
+            in: hosting
+        )
+        harness.loginItem.currentStatus = .enabled
+        statusRetry.performClick(nil)
+        for _ in 0..<100 where relaunched.loginStatusReconciliationRequired {
+            await nextMainTurn()
+        }
+
+        XCTAssertEqual(relaunched.phase, .monitoring)
+        XCTAssertNil(relaunched.presentedError)
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
     }
 
     func testRenderedPrimaryControlsHaveStableAccessibilityIdentifiers() async {

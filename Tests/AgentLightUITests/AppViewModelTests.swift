@@ -1222,6 +1222,7 @@ final class AppViewModelTests: XCTestCase {
 
         XCTAssertEqual(relaunched.phase, .repairRequired)
         XCTAssertTrue(relaunched.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertFalse(relaunched.loginStatusReconciliationRequired)
         XCTAssertTrue(relaunched.monitoringActive)
         XCTAssertEqual(harness.loginItem.enableCount, loginCallsBeforeRelaunch.enable)
         XCTAssertEqual(harness.loginItem.disableCount, loginCallsBeforeRelaunch.disable)
@@ -1252,10 +1253,106 @@ final class AppViewModelTests: XCTestCase {
         let receipt = try await store.load()
         XCTAssertEqual(relaunched.phase, .repairRequired)
         XCTAssertEqual(relaunched.presentedError, .operationFailed)
-        XCTAssertTrue(relaunched.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertFalse(relaunched.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertTrue(relaunched.loginStatusReconciliationRequired)
         XCTAssertEqual(receipt?.login, .registered)
         XCTAssertEqual(harness.loginItem.disableCount, 0)
         XCTAssertEqual(harness.loginItem.enableCount, 1)
+    }
+
+    func testUnknownLoginStatusRetryResolvesToMonitoringWithoutLoginMutation() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.currentStatus = .unknown
+        let relaunched = makeRelaunchedViewModel(using: harness, store: store)
+        await relaunched.synchronizeOwnership()
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+
+        XCTAssertFalse(relaunched.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertTrue(relaunched.loginStatusReconciliationRequired)
+        harness.loginItem.currentStatus = .enabled
+        await relaunched.requestLaunchAtLogin()
+
+        XCTAssertEqual(relaunched.phase, .monitoring)
+        XCTAssertNil(relaunched.presentedError)
+        XCTAssertFalse(relaunched.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertFalse(relaunched.loginStatusReconciliationRequired)
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+        let receipt = try await store.load()
+        XCTAssertEqual(receipt?.login, .registered)
+    }
+
+    func testRequiresApprovalStatusRetryResolvesToMonitoringWithoutLoginMutation() async throws {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.currentStatus = .requiresApproval
+        let relaunched = makeRelaunchedViewModel(using: harness, store: store)
+        await relaunched.synchronizeOwnership()
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+
+        XCTAssertFalse(relaunched.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertTrue(relaunched.loginStatusReconciliationRequired)
+        harness.loginItem.currentStatus = .enabled
+        await relaunched.requestLaunchAtLogin()
+
+        XCTAssertEqual(relaunched.phase, .monitoring)
+        XCTAssertNil(relaunched.presentedError)
+        XCTAssertFalse(relaunched.loginStatusReconciliationRequired)
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+    }
+
+    func testAmbiguousLoginResolutionReturnsToPausedWithoutLoginMutation() async {
+        let harness = ViewModelHarness()
+        await harness.connectAndApprove()
+        await harness.viewModel.pause()
+        harness.loginItem.currentStatus = .unknown
+        await harness.viewModel.synchronizeOwnership()
+        let counts = (harness.loginItem.enableCount, harness.loginItem.disableCount)
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertTrue(harness.viewModel.loginStatusReconciliationRequired)
+
+        harness.loginItem.currentStatus = .enabled
+        await harness.viewModel.requestLaunchAtLogin()
+
+        XCTAssertEqual(harness.viewModel.phase, .paused)
+        XCTAssertNil(harness.viewModel.presentedError)
+        XCTAssertFalse(harness.viewModel.loginStatusReconciliationRequired)
+        XCTAssertEqual(harness.loginItem.enableCount, counts.0)
+        XCTAssertEqual(harness.loginItem.disableCount, counts.1)
+    }
+
+    func testDisconnectAndNewSetupClearStaleLoginReconciliation() async {
+        let store = MemorySetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        harness.loginItem.currentStatus = .notRegistered
+        let model = makeRelaunchedViewModel(using: harness, store: store)
+        await model.synchronizeOwnership()
+        XCTAssertTrue(model.loginDisabledStatePersistenceRetryRequired)
+
+        await model.disconnect()
+
+        XCTAssertEqual(model.phase, .onboarding)
+        XCTAssertFalse(model.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertFalse(model.loginStatusReconciliationRequired)
+        let reconnected = AppViewModel(
+            credentials: harness.credentials,
+            integrations: harness.integrations,
+            monitor: harness.monitor,
+            loginItem: harness.loginItem,
+            verifier: harness.verifier,
+            ownershipLedger: AppOwnershipLedger(store: store)
+        )
+        await reconnected.connect(using: harness.validDraft)
+        await reconnected.approveIntegrations()
+
+        XCTAssertEqual(reconnected.phase, .monitoring)
+        XCTAssertFalse(reconnected.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertFalse(reconnected.loginStatusReconciliationRequired)
     }
 
     func testPendingApprovalCompensationKeepsAuthorityUntilAConfirmedDisable() async throws {
@@ -1272,7 +1369,8 @@ final class AppViewModelTests: XCTestCase {
         var receipt = await store.current()
         XCTAssertEqual(harness.viewModel.phase, .repairRequired)
         XCTAssertEqual(harness.viewModel.loginItemStatus, .requiresApproval)
-        XCTAssertTrue(harness.viewModel.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertFalse(harness.viewModel.loginDisabledStatePersistenceRetryRequired)
+        XCTAssertTrue(harness.viewModel.loginStatusReconciliationRequired)
         XCTAssertEqual(receipt?.login, .registered)
         XCTAssertEqual(harness.loginItem.disableCount, 1)
         XCTAssertEqual(harness.loginItem.enableCount, 2)

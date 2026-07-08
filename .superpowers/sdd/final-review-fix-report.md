@@ -77,3 +77,19 @@ The final UX review found that a successful login-item unregister followed by re
 - Focused: `AppViewModelTests` 152/152, `ViewRenderingTests` 25/25, `AppEnvironmentTests` 33/33, and setup-receipt/login-controller tests 31/31.
 - Stress: compensation/retry/relaunch/ambiguous model cases 20/20; rendered switch/button/relaunch target-action cases 10/10.
 - Full gate: `swift test --parallel` 598/598 before the final release and artifact verification pass.
+
+## Latched login-reconciliation correction
+
+The last review found that the reconciliation flag could remain latched after macOS status changed, and that Unknown/Approval required incorrectly exposed an absent-state receipt action. RED tests first failed on the missing ambiguous-state model and then demonstrated the stale action/state.
+
+- Login reconciliation is now recomputed from the current durable login ownership and current macOS status whenever ownership presentation synchronizes. Durable-owned plus Not registered/Not found is the only state that exposes **Retry saving disabled login state**.
+- Durable Registered plus Unknown/Approval required is an ambiguous status reconciliation. Settings renders read-only **Retry Status** guidance and never offers the receipt-only action. Pending Approval plus Approval required remains the existing approval flow.
+- When a status retry later observes Enabled with durable Registered ownership, reconciliation and its sanitized error clear and the app returns to Monitoring or Paused based on actual monitoring activity, with zero register/unregister calls.
+- Receipt retry rechecks status before writing, so an absent-to-ambiguous change cannot use a stale button to clear authority.
+- Successful disconnect, explicit receipt reset, and new approval recompute from their new ownership snapshots, preventing stale reconciliation from surviving a new setup.
+
+### Latched-state verification
+
+- Focused: `AppViewModelTests` 156/156, `ViewRenderingTests` 27/27, and AppEnvironment/setup-receipt/login-controller tests 64/64.
+- Added model and rendered target/action coverage for Unknown-to-Enabled, Approval-required-to-Enabled, Paused restoration, pending approval, disconnect/new setup cleanup, button absence, and zero login mutations.
+- Stress: derived-state model cases 20/20 and rendered action-selection cases 10/10. Full parallel gate: 604/604.
