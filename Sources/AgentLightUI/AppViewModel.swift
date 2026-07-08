@@ -175,6 +175,7 @@ public final class AppViewModel: AppViewModeling {
     @ObservationIgnored private var integrationOwnership: PersistentIntegrationOwnership = .none
     @ObservationIgnored private var credentialOwnership: PersistentCredentialOwnership = .none
     @ObservationIgnored private var loginRegistrationOwned = false
+    @ObservationIgnored private var loginOptOutRecoveryPhase: AppPhase?
     @ObservationIgnored private var ownsMonitoring = false
 #if DEBUG
     @ObservationIgnored private var actionEntryCounts: [OperationKind: Int] = [:]
@@ -765,6 +766,9 @@ public final class AppViewModel: AppViewModeling {
         }
         guard phase == .monitoring || phase == .paused || phase == .repairRequired,
               let lease = await ownershipLedger.acquireLeaseForCaller() else { return }
+        if phase == .monitoring || phase == .paused {
+            loginOptOutRecoveryPhase = phase
+        }
         do {
             let transition = try loginItem.setEnabled(false)
             loginItemStatus = transition.current
@@ -778,7 +782,12 @@ public final class AppViewModel: AppViewModeling {
                 try await ownershipLedger.update(.login(.none))
                 let updated = await ownershipLedger.snapshot()
                 syncOwnership(updated)
-                if !updated.obligations.isEmpty {
+                if updated.obligations.isEmpty {
+                    phase = loginOptOutRecoveryPhase
+                        ?? (monitoringActive ? .monitoring : .paused)
+                    loginOptOutRecoveryPhase = nil
+                    presentedError = nil
+                } else {
                     phase = .repairRequired
                     presentedError = .operationFailed
                 }
@@ -2380,6 +2389,7 @@ public actor AppOwnershipLedger {
     private var hydrationFailure: SetupOwnershipStoreError?
     private var ownershipReceiptResetEligible = false
     private var authenticatedDurableReceipt = false
+    private var transientPersistenceRepair = false
     private var emergencyIntegrationRecovery: EmergencyIntegrationRecovery?
     private var persistenceBusy = false
     private var persistenceWaiters: [CheckedContinuation<Void, Never>] = []
@@ -2431,12 +2441,14 @@ public actor AppOwnershipLedger {
             hydrated = true
             hydrationFailure = nil
             ownershipReceiptResetEligible = false
+            transientPersistenceRepair = false
         } catch let error as SetupOwnershipStoreError {
             value = OwnershipSnapshot(obligations: [.ownershipReceiptRepair])
             authenticatedDurableReceipt = false
             hydrated = true
             hydrationFailure = error
             ownershipReceiptResetEligible = Self.isResetEligible(error)
+            transientPersistenceRepair = false
             throw error
         } catch {
             value = OwnershipSnapshot(obligations: [.ownershipReceiptRepair])
@@ -2444,6 +2456,7 @@ public actor AppOwnershipLedger {
             hydrated = true
             hydrationFailure = .readFailed
             ownershipReceiptResetEligible = false
+            transientPersistenceRepair = false
             throw SetupOwnershipStoreError.readFailed
         }
     }
@@ -2453,6 +2466,9 @@ public actor AppOwnershipLedger {
         snapshot.ownershipReceiptResetEligible = ownershipReceiptResetEligible
         snapshot.emergencyIntegrationRecovery = emergencyIntegrationRecovery
         snapshot.authenticatedDurableReceipt = authenticatedDurableReceipt
+        if transientPersistenceRepair {
+            snapshot.obligations.insert(.ownershipReceiptRepair)
+        }
         if let emergencyIntegrationRecovery {
             snapshot.obligations.insert(emergencyIntegrationRecovery.obligation)
         }
@@ -2494,12 +2510,13 @@ public actor AppOwnershipLedger {
             authenticatedDurableReceipt = !receipt.isEmpty
             hydrationFailure = nil
             ownershipReceiptResetEligible = false
+            transientPersistenceRepair = false
         } catch let error as SetupOwnershipStoreError {
-            value.obligations.insert(.ownershipReceiptRepair)
+            transientPersistenceRepair = true
             ownershipReceiptResetEligible = false
             throw error
         } catch {
-            value.obligations.insert(.ownershipReceiptRepair)
+            transientPersistenceRepair = true
             ownershipReceiptResetEligible = false
             throw SetupOwnershipStoreError.writeFailed
         }
@@ -2518,6 +2535,7 @@ public actor AppOwnershipLedger {
         hydrated = true
         hydrationFailure = nil
         ownershipReceiptResetEligible = false
+        transientPersistenceRepair = false
     }
 
     fileprivate func setEmergencyIntegrationRecovery(_ recovery: EmergencyIntegrationRecovery) {

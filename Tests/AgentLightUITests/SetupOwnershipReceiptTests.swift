@@ -133,6 +133,56 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         XCTAssertEqual(relaunched, replacement)
     }
 
+    func testRepeatedDisplacedRenameFailureUsesOnlyFixedBoundedArtifactsAndLaterCleansUp() async throws {
+        let root = temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try createPrivateDirectory(at: root)
+        let url = root.appending(path: "setup-ownership-v1.json")
+        try await FileSetupOwnershipStore(url: url).save(makeReceipt())
+        let failingStore = FileSetupOwnershipStore(
+            url: url,
+            synchronizeDirectory: { descriptor, _ in
+                guard fsync(descriptor) == 0 else {
+                    throw SetupOwnershipStoreError.writeFailed
+                }
+            },
+            renameDisplacedArtifact: { _, _, _ in false }
+        )
+        let fixedNames: Set<String> = [
+            "setup-ownership-v1.json",
+            ".setup-ownership-v1.json.agent-light-stage",
+            ".setup-ownership-v1.json.agent-light-cleanup"
+        ]
+
+        for index in 0..<12 {
+            var replacement = makeReceipt()
+            replacement.obligations = index.isMultiple(of: 2)
+                ? [.credentialDelete]
+                : [.integrationUninstallRetry]
+
+            let outcome = try await failingStore.saveCommitted(replacement)
+            let loaded = try await failingStore.load()
+
+            XCTAssertEqual(outcome, .committedCleanupPending)
+            XCTAssertEqual(loaded, replacement)
+            let names = Set(try FileManager.default.contentsOfDirectory(atPath: root.path))
+            XCTAssertTrue(names.isSubset(of: fixedNames), "Unexpected artifacts: \(names)")
+            XCTAssertEqual(
+                names,
+                ["setup-ownership-v1.json", ".setup-ownership-v1.json.agent-light-stage"]
+            )
+        }
+
+        var final = makeReceipt()
+        final.obligations = [.credentialRestore]
+        try await FileSetupOwnershipStore(url: url).save(final)
+
+        let names = Set(try FileManager.default.contentsOfDirectory(atPath: root.path))
+        let relaunched = try await FileSetupOwnershipStore(url: url).load()
+        XCTAssertEqual(names, ["setup-ownership-v1.json"])
+        XCTAssertEqual(relaunched, final)
+    }
+
     func testCommittedDeleteFinalSyncFailureNeverRestoresRemovedAuthority() async throws {
         let root = temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -241,6 +291,38 @@ final class SetupOwnershipReceiptTests: XCTestCase {
         XCTAssertFalse(snapshot.ownershipReceiptResetEligible)
         let stored = await store.current()
         XCTAssertEqual(stored, durable)
+    }
+
+    func testSuccessfulRetryClearsOnlyTransientWriteRepairObligation() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let ledger = AppOwnershipLedger(store: store)
+        try await ledger.hydrate()
+        try await ledger.update([
+            .login(.registered),
+            .insertObligation(.integrationArtifactCleanup)
+        ])
+        await store.failEveryWrite()
+
+        do {
+            try await ledger.update(.login(.none))
+            XCTFail("Expected persistence failure")
+        } catch let error as SetupOwnershipStoreError {
+            XCTAssertEqual(error, .writeFailed)
+        }
+        var snapshot = await ledger.snapshot()
+        XCTAssertEqual(
+            snapshot.obligations,
+            [.integrationArtifactCleanup, .ownershipReceiptRepair]
+        )
+        XCTAssertFalse(snapshot.ownershipReceiptResetEligible)
+
+        await store.allowWrites()
+        try await ledger.update(.login(.none))
+
+        snapshot = await ledger.snapshot()
+        XCTAssertEqual(snapshot.login, PersistentLoginOwnership.none)
+        XCTAssertEqual(snapshot.obligations, [.integrationArtifactCleanup])
+        XCTAssertFalse(snapshot.ownershipReceiptResetEligible)
     }
 
     func testLedgerAdoptsCommittedSaveEvenWhenCleanupRemainsPending() async throws {

@@ -1765,12 +1765,29 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         for record: MonitoringRecoveryRecord,
         now: Date
     ) -> Duration? {
-        guard let terminal = record.terminal else { return nil }
+        guard let terminal = record.terminal,
+              now >= terminal.appliedAt,
+              let maximumHold = maximumTerminalHold(for: record.lastCommand) else {
+            return nil
+        }
         let total = terminal.deadline.timeIntervalSince(terminal.appliedAt)
-        guard total >= 0, total <= 12 else { return nil }
+        guard total >= 0, total <= maximumHold else { return nil }
         let remaining = terminal.deadline.timeIntervalSince(now)
-        guard remaining > 0 else { return nil }
+        guard remaining > 0, remaining <= maximumHold else { return nil }
         return .milliseconds(Int64((remaining * 1_000).rounded(.up)))
+    }
+
+    private func maximumTerminalHold(for command: DesiredLightState?) -> TimeInterval? {
+        guard let command else { return nil }
+        if let color = AgentState.completed.color,
+           command == DesiredLightState(color: color) {
+            return terminalHoldInterval(for: .completed)
+        }
+        if let color = AgentState.error.color,
+           command == DesiredLightState(color: color) {
+            return terminalHoldInterval(for: .error)
+        }
+        return nil
     }
 
     private func expireTerminal(token: AppliedTerminalToken) async {

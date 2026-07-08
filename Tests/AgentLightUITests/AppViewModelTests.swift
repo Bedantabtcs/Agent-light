@@ -1160,8 +1160,37 @@ final class AppViewModelTests: XCTestCase {
 
         let receipt = await store.current()
         XCTAssertEqual(harness.viewModel.loginItemStatus, .notRegistered)
-        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertEqual(harness.viewModel.phase, .monitoring)
+        XCTAssertNil(harness.viewModel.presentedError)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.isEmpty)
+        XCTAssertTrue(harness.viewModel.monitoringActive)
         XCTAssertEqual(receipt?.login, PersistentLoginOwnership.none)
+    }
+
+    func testLaunchAtLoginOptOutPersistenceRetryReturnsToPausedState() async throws {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        await harness.viewModel.pause()
+        XCTAssertEqual(harness.viewModel.phase, .paused)
+        await store.failEveryWrite()
+
+        await harness.viewModel.setLaunchAtLoginEnabled(false)
+
+        XCTAssertEqual(harness.viewModel.phase, .repairRequired)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.contains(.ownershipReceiptRepair))
+
+        await store.allowWrites()
+        await harness.viewModel.setLaunchAtLoginEnabled(false)
+
+        let receipt = await store.current()
+        XCTAssertEqual(harness.viewModel.phase, .paused)
+        XCTAssertNil(harness.viewModel.presentedError)
+        XCTAssertTrue(harness.viewModel.outstandingObligations.isEmpty)
+        XCTAssertFalse(harness.viewModel.monitoringActive)
+        XCTAssertEqual(receipt?.login, PersistentLoginOwnership.none)
+        XCTAssertNotEqual(receipt?.integration, PersistentIntegrationOwnership.none)
+        XCTAssertNotNil(harness.credentials.storedCredentials())
     }
 
     func testNewPendingApprovalIsCompensatedWhenMonitoringFails() async throws {

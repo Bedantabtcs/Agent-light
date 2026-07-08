@@ -412,6 +412,32 @@ final class ViewRenderingTests: XCTestCase {
         XCTAssertNil(reset)
     }
 
+    func testRenderedLoginOptOutWriteRetryClearsTransientRepairGuidance() async {
+        let store = ControllableSetupOwnershipStore()
+        let harness = ViewModelHarness(ownershipStore: store)
+        await harness.connectAndApprove()
+        let hosting = host(SettingsView(viewModel: harness.viewModel))
+        await store.failEveryWrite()
+
+        await harness.viewModel.setLaunchAtLoginEnabled(false)
+        hosting.layoutSubtreeIfNeeded()
+
+        var rendered = renderedText(in: hosting)
+        XCTAssertTrue(
+            rendered.contains("Ownership state could not be read or saved. Retry, then inspect Application Support permissions if the problem continues."),
+            "\(rendered)"
+        )
+
+        await store.allowWrites()
+        await harness.viewModel.setLaunchAtLoginEnabled(false)
+        hosting.layoutSubtreeIfNeeded()
+
+        rendered = renderedText(in: hosting)
+        XCTAssertFalse(rendered.contains { $0.contains("Ownership state could not be read or saved") })
+        XCTAssertTrue(rendered.contains("Not enabled"), "\(rendered)")
+        XCTAssertTrue(rendered.contains("Monitoring is enabled"), "\(rendered)")
+    }
+
     func testRenderedPrimaryControlsHaveStableAccessibilityIdentifiers() async {
         let onboarding = host(OnboardingView(viewModel: PreviewViewModel.onboarding()))
         let review = host(MenuBarContentView(viewModel: await PreviewViewModel.integrationReview()))

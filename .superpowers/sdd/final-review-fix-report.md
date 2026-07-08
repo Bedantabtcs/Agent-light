@@ -45,3 +45,19 @@ Implementation complete from base `b81c8c586797`; ready for independent re-revie
 ## Manual limitations
 
 The following remain manual: app install/open, Keychain credential entry, HOME hook installation and semantic inspection, Codex `/hooks` trust, macOS login approval/relaunch, live Wipro/Tuya command timing, powered-on/off baseline restoration, end-to-end hook latency, Developer ID signing, notarization, and formal readiness assessment.
+
+## Last-correction addendum
+
+The final independent review identified four additional edge cases. All four were reproduced with deterministic failing tests before correction:
+
+- The Tuya command gate reserved a future slot before timestamp/nonce request construction and could charge canceled work. Request construction now finishes first; the gate records an actual start only after its final monotonic-clock and cancellation checks, then invokes transport in the same actor continuation. Blocked timestamp, blocked nonce, canceled waiter, auth refresh, and slow-response coverage passes.
+- Recovery accepted wall-clock values before `appliedAt` and allowed a completed record to inherit the error state's 12-second ceiling. Backward dates now restore immediately, and terminal metadata is validated against the command's original completed/error hold of 8/12 seconds.
+- A transient ownership-receipt write failure was inserted into the durable obligation set, so a successful launch-at-login opt-out retry could not leave Repair. Transient persistence provenance is now in-memory and clears only after a successful write; durable/manual/corrupt obligations remain independent. Monitoring and Paused retry paths plus rendered warning removal pass.
+- A post-commit displaced-receipt rename failure could leave a new UUID artifact on every attempt. Save/delete now use fixed authenticated `stage` and `cleanup` slots. Twelve consecutive injected rename failures remained bounded to the active file plus one stage file, and a later successful save removed all artifacts while preserving relaunch authority.
+
+### Last-correction verification
+
+- Focused suites: `TuyaClientTests` 31/31, `MonitoringOrchestratorTests` 117/117, `AppViewModelTests` 149/149, and receipt/render suites 46/46.
+- Stress: Tuya construction/cancellation cases 20/20; backward/excessive recovery, monitoring/paused login retry, and fixed-artifact rename failure cases 10/10 each.
+- Full gate: `swift test --parallel` 593/593; release build, app bundle build, strict code-sign verification, plist lint, package dump, shell syntax, diff check, bundle inventory, and source security scans passed.
+- The bundle remains ad hoc signed with no Team ID. Live app, HOME/login/Keychain/bulb, Developer ID, notarization, and formal readiness checks remain manual and were not performed.

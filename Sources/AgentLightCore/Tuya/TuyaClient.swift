@@ -2,20 +2,37 @@ import Foundation
 
 private actor TuyaCommandRequestGate {
     private let clock: any AgentLightClock
-    private var nextAllowedStart: Duration?
+    private var lastActualStart: Duration?
 
     init(clock: any AgentLightClock) {
         self.clock = clock
     }
 
-    func awaitPermit() async throws {
-        let current = await clock.now()
-        let reservedStart = max(current, nextAllowedStart ?? current)
-        nextAllowedStart = reservedStart + .seconds(1)
-        if reservedStart > current {
-            try await clock.sleep(for: reservedStart - current)
+    func perform<Value: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        while true {
+            try Task.checkCancellation()
+            let current = await clock.now()
+            if let lastActualStart {
+                let elapsed = current - lastActualStart
+                if elapsed < .seconds(1) {
+                    try await clock.sleep(for: .seconds(1) - elapsed)
+                    continue
+                }
+            }
+
+            try Task.checkCancellation()
+            let actualStart = await clock.now()
+            if let lastActualStart,
+               actualStart - lastActualStart < .seconds(1) {
+                continue
+            }
+
+            try Task.checkCancellation()
+            lastActualStart = actualStart
+            return try await operation()
         }
-        try Task.checkCancellation()
     }
 }
 
@@ -232,9 +249,6 @@ public actor TuyaClient {
         body: Data,
         token: String?
     ) async throws -> JSONValue {
-        if method == "POST", pathComponents.last == "commands" {
-            try await commandRequestGate.awaitPermit()
-        }
         let builtRequest = try await makeRequest(
             method: method,
             pathComponents: pathComponents,
@@ -244,8 +258,15 @@ public actor TuyaClient {
         )
         let data: Data
         let response: HTTPURLResponse
+        let transport = self.transport
         do {
-            (data, response) = try await transport.data(for: builtRequest)
+            if method == "POST", pathComponents.last == "commands" {
+                (data, response) = try await commandRequestGate.perform {
+                    try await transport.data(for: builtRequest)
+                }
+            } else {
+                (data, response) = try await transport.data(for: builtRequest)
+            }
         } catch {
             throw TuyaClientError.transport
         }

@@ -186,21 +186,33 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
     }
 
     typealias DirectorySynchronizer = @Sendable (Int32, DirectorySyncPoint) throws -> Void
+    typealias DisplacedArtifactRenamer = @Sendable (Int32, String, String) -> Bool
 
     private static let maximumEncodedSize = 64 * 1024
     private let url: URL
     private let synchronizeDirectory: DirectorySynchronizer
+    private let renameDisplacedArtifact: DisplacedArtifactRenamer
 
     public init(url: URL) {
         self.url = url
         synchronizeDirectory = { descriptor, _ in
             guard fsync(descriptor) == 0 else { throw SetupOwnershipStoreError.writeFailed }
         }
+        renameDisplacedArtifact = { directory, from, to in
+            renameat(directory, from, directory, to) == 0
+        }
     }
 
-    init(url: URL, synchronizeDirectory: @escaping DirectorySynchronizer) {
+    init(
+        url: URL,
+        synchronizeDirectory: @escaping DirectorySynchronizer,
+        renameDisplacedArtifact: @escaping DisplacedArtifactRenamer = { directory, from, to in
+            renameat(directory, from, directory, to) == 0
+        }
+    ) {
         self.url = url
         self.synchronizeDirectory = synchronizeDirectory
+        self.renameDisplacedArtifact = renameDisplacedArtifact
     }
 
     public func load() async throws -> SetupOwnershipReceipt? {
@@ -279,15 +291,12 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
         let directory = try openDirectory()
         defer { _ = close(directory) }
         let name = url.lastPathComponent
+        let stage = ".\(name).agent-light-stage"
         let cleanup = ".\(name).agent-light-cleanup"
         let existing = try authenticatedReceipt(name: name, in: directory)?.identity
-        if try authenticatedReceipt(name: cleanup, in: directory) != nil {
-            guard unlinkat(directory, cleanup, 0) == 0 else {
-                throw SetupOwnershipStoreError.writeFailed
-            }
-            try synchronizeDirectory(directory, .cleanup)
-        }
-        let temporary = ".\(name).agent-light-\(UUID().uuidString)"
+        try removeAuthenticatedArtifactIfPresent(name: cleanup, in: directory)
+        try removeAuthenticatedArtifactIfPresent(name: stage, in: directory)
+        let temporary = stage
         let descriptor = openat(
             directory,
             temporary,
@@ -351,7 +360,7 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
                     }
                     throw SetupOwnershipStoreError.writeFailed
                 }
-                guard renameat(directory, temporary, directory, cleanup) == 0 else {
+                guard renameDisplacedArtifact(directory, temporary, cleanup) else {
                     return .committedCleanupPending
                 }
                 temporaryIsOwned = false
@@ -401,13 +410,10 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
         let directory = try openDirectory()
         defer { _ = close(directory) }
         let name = url.lastPathComponent
+        let stage = ".\(name).agent-light-stage"
         let quarantine = ".\(name).agent-light-cleanup"
-        if try authenticatedReceipt(name: quarantine, in: directory) != nil {
-            guard unlinkat(directory, quarantine, 0) == 0 else {
-                throw SetupOwnershipStoreError.writeFailed
-            }
-            try synchronizeDirectory(directory, .cleanup)
-        }
+        try removeAuthenticatedArtifactIfPresent(name: stage, in: directory)
+        try removeAuthenticatedArtifactIfPresent(name: quarantine, in: directory)
         guard let existing = try authenticatedReceipt(name: name, in: directory)?.identity else {
             return .complete
         }
@@ -524,6 +530,17 @@ public actor FileSetupOwnershipStore: SetupOwnershipStoring {
             throw SetupOwnershipStoreError.readFailed
         }
         return try validatedIdentity(metadata)
+    }
+
+    private func removeAuthenticatedArtifactIfPresent(
+        name: String,
+        in directory: Int32
+    ) throws {
+        guard try authenticatedReceipt(name: name, in: directory) != nil else { return }
+        guard unlinkat(directory, name, 0) == 0 else {
+            throw SetupOwnershipStoreError.writeFailed
+        }
+        try synchronizeDirectory(directory, .cleanup)
     }
 
     private func inspectRequired(name: String, in directory: Int32) throws -> FileIdentity {

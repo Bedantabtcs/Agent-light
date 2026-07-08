@@ -293,6 +293,66 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncEqual(await clock.sleepRequestCount(), 0)
     }
 
+    func testRecoveryTreatsBackwardWallClockAsInvalidAndRestoresImmediately() async throws {
+        let applied = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = MonitoringRecoveryRecord(
+            baseline: .testBaseline,
+            lastCommand: desired(.completed),
+            terminal: MonitoringTerminalRecovery(
+                appliedAt: applied,
+                deadline: applied.addingTimeInterval(8)
+            )
+        )
+        let light = RecordingLightController(matchResults: [.success(true)])
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(
+            light: light,
+            store: MemoryRecoveryStore(record: record),
+            clock: clock,
+            wallNow: { applied.addingTimeInterval(-3_600) }
+        )
+
+        let recovery = Task { try await orchestrator.recoverIfNeeded() }
+        let restoredImmediately = await eventually { await light.restoreCount() == 1 }
+        XCTAssertTrue(restoredImmediately)
+        if !restoredImmediately {
+            await clock.advance(by: .seconds(3_608))
+        }
+        try await recovery.value
+
+        await XCTAssertAsyncEqual(await clock.sleepRequestCount(), 0)
+    }
+
+    func testRecoveryRejectsCompletedHoldLongerThanOriginalEightSeconds() async throws {
+        let applied = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = MonitoringRecoveryRecord(
+            baseline: .testBaseline,
+            lastCommand: desired(.completed),
+            terminal: MonitoringTerminalRecovery(
+                appliedAt: applied,
+                deadline: applied.addingTimeInterval(12)
+            )
+        )
+        let light = RecordingLightController(matchResults: [.success(true)])
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(
+            light: light,
+            store: MemoryRecoveryStore(record: record),
+            clock: clock,
+            wallNow: { applied }
+        )
+
+        let recovery = Task { try await orchestrator.recoverIfNeeded() }
+        let restoredImmediately = await eventually { await light.restoreCount() == 1 }
+        XCTAssertTrue(restoredImmediately)
+        if !restoredImmediately {
+            await clock.advance(by: .seconds(12))
+        }
+        try await recovery.value
+
+        await XCTAssertAsyncEqual(await clock.sleepRequestCount(), 0)
+    }
+
     func testRecoveryDoesNotRestoreWhenBulbChangesDuringRemainingTerminalHold() async throws {
         let applied = Date(timeIntervalSince1970: 1_700_000_000)
         let external = BulbBaseline(values: ["switch_led": .bool(false)])
