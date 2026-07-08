@@ -4,7 +4,7 @@
 
 **Goal:** Remove apparent bulb resizing while preserving ambient motion and prove the new activity colours reach the real light.
 
-**Architecture:** `AmbientBulbView` will use a small internal motion model so animation geometry is explicit and testable. The glow keeps a constant scale and pulses only its opacity; SF Symbols render as resizable, aspect-fit images inside one square frame. Existing protocol, coordinator, and Tuya paths remain unchanged and are verified through focused pipeline tests plus a live relay colour cycle.
+**Architecture:** `AmbientBulbView` will use a small internal motion model so animation geometry is explicit and testable. The glow keeps a constant scale and pulses only its opacity; the large illustration remains `lightbulb.led.fill`, while state-specific SF Symbols remain beside state labels. Existing protocol, coordinator, and Tuya paths remain unchanged and are verified through focused pipeline tests plus a live relay colour cycle.
 
 **Tech Stack:** Swift 6.2, SwiftUI, AppKit, Swift Package Manager, XCTest, Unix datagram relay, Tuya cloud control.
 
@@ -12,7 +12,8 @@
 
 - Keep the menu panel fixed at `380 × 540` points.
 - Preserve Reading cyan `#06B6D4`, Editing teal `#14B8A6`, Testing pink `#EC4899`, and Cancelled orange `#F97316`.
-- Preserve the 2.4-second pulse cadence, state symbols, high-contrast treatment, and Reduce Motion behavior.
+- Preserve the 2.4-second pulse cadence, high-contrast treatment, and Reduce Motion behavior.
+- Keep the large top illustration as `lightbulb.led.fill`; change symbols only beside state labels.
 - Do not change relay classification, lifecycle holds, credentials, integrations, or Tuya capability resolution.
 - Do not log or persist raw tool names, commands, paths, prompts, credentials, or device identifiers.
 
@@ -26,7 +27,7 @@
 
 **Interfaces:**
 - Consumes: `AmbientBulbView(state:)`, `AgentState.bulbSymbolName`, SwiftUI Reduce Motion environment.
-- Produces: internal `AmbientBulbMotion.glowScale`, `glowOpacity(isPulsing:reduceMotion:)`, `duration`, and `iconFrameSide` values used directly by the view and its tests.
+- Produces: internal `AmbientBulbMotion.glowScale`, `glowOpacity(isPulsing:reduceMotion:)`, and `duration` values plus `AgentState.ambientBulbSymbolName`, all used directly by the view and its tests.
 
 - [ ] **Step 1: Add failing motion-model tests**
 
@@ -49,8 +50,8 @@ func testAmbientBulbPulseChangesOnlyOpacity() {
     )
 }
 
-func testAmbientBulbUsesFixedIconFrame() {
-    XCTAssertEqual(AmbientBulbMotion.iconFrameSide, 48)
+func testAmbientBulbUsesOneStableTopIcon() {
+    XCTAssertEqual(AgentState.ambientBulbSymbolName, "lightbulb.led.fill")
 }
 ```
 
@@ -74,7 +75,6 @@ enum AmbientBulbMotion {
     static let restingGlowOpacity = 0.62
     static let activeGlowOpacity = 1.0
     static let duration = 2.4
-    static let iconFrameSide: CGFloat = 48
 
     static func glowOpacity(isPulsing: Bool, reduceMotion: Bool) -> Double {
         guard !reduceMotion else { return activeGlowOpacity }
@@ -93,19 +93,14 @@ Update the glow modifiers to use a fixed scale and opacity-only pulse:
 ))
 ```
 
-Render the symbol inside a stable square:
+Render the unchanged top bulb symbol with its original styling:
 
 ```swift
-Image(systemName: state.bulbSymbolName)
-    .resizable()
-    .scaledToFit()
-    .frame(
-        width: AmbientBulbMotion.iconFrameSide,
-        height: AmbientBulbMotion.iconFrameSide
-    )
+Image(systemName: AgentState.ambientBulbSymbolName)
+    .font(.system(size: 48, weight: .medium))
 ```
 
-Use `AmbientBulbMotion.duration` in the existing repeating animation and retain all current colour, shadow, accessibility, and outer-frame modifiers.
+Define `AgentState.ambientBulbSymbolName` as `lightbulb.led.fill`. Keep `AgentState.symbolName` state-specific for the label. Use `AmbientBulbMotion.duration` in the existing repeating animation and retain all current colour, shadow, accessibility, and outer-frame modifiers.
 
 - [ ] **Step 4: Run focused and complete UI tests**
 
@@ -182,7 +177,7 @@ Use events `preToolUse`, `preToolUse`, `beforeShellExecution`, and `stop` respec
 
 - [ ] **Step 5: Verify the real panel remains fixed during the cycle**
 
-Use macOS Accessibility to sample the AgentLight window at 200 ms intervals for at least 3.2 seconds. Expected: every sample is `380 × 540`; the glow changes opacity without changing size and state glyphs stay inside the fixed icon frame.
+Use macOS Accessibility to sample the AgentLight window at 200 ms intervals for at least 3.2 seconds. Expected: every sample is `380 × 540`; the glow changes opacity without changing size, the top icon remains a bulb, and only the state-label icon changes.
 
 - [ ] **Step 6: Record the verification result**
 

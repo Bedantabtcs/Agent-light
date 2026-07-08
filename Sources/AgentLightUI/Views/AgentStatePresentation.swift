@@ -31,16 +31,5 @@ extension AgentState {
         }
     }
 
-    var bulbSymbolName: String {
-        switch self {
-        case .reading: "book.closed.fill"
-        case .editing: "pencil"
-        case .testing: "checkmark.seal.fill"
-        case .cancelled: "xmark.octagon.fill"
-        case .completed: "checkmark.circle.fill"
-        case .error: "exclamationmark.triangle.fill"
-        case .idle: "lightbulb.slash"
-        case .thinking, .working, .needsYou: "lightbulb.led.fill"
-        }
-    }
+    static let ambientBulbSymbolName = "lightbulb.led.fill"
 }

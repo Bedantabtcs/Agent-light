@@ -24,17 +24,16 @@ final class ViewRenderingTests: XCTestCase {
     }
 
     func testActivityStatePresentationIsExplicit() {
-        let cases: [(AgentState, String, String, String)] = [
-            (.reading, "Reading", "book.closed.fill", "book.closed.fill"),
-            (.editing, "Editing", "pencil", "pencil"),
-            (.testing, "Testing", "checkmark.seal.fill", "checkmark.seal.fill"),
-            (.cancelled, "Cancelled", "xmark.octagon.fill", "xmark.octagon.fill")
+        let cases: [(AgentState, String, String)] = [
+            (.reading, "Reading", "book.closed.fill"),
+            (.editing, "Editing", "pencil"),
+            (.testing, "Testing", "checkmark.seal.fill"),
+            (.cancelled, "Cancelled", "xmark.octagon.fill")
         ]
 
-        for (state, label, symbol, bulbSymbol) in cases {
+        for (state, label, symbol) in cases {
             XCTAssertEqual(state.displayName, label)
             XCTAssertEqual(state.symbolName, symbol)
-            XCTAssertEqual(state.bulbSymbolName, bulbSymbol)
         }
     }
 
@@ -54,8 +53,8 @@ final class ViewRenderingTests: XCTestCase {
         )
     }
 
-    func testAmbientBulbUsesFixedIconFrame() {
-        XCTAssertEqual(AmbientBulbMotion.iconFrameSide, 48)
+    func testAmbientBulbUsesOneStableTopIcon() {
+        XCTAssertEqual(AgentState.ambientBulbSymbolName, "lightbulb.led.fill")
     }
 
     func testMenuBarContentOverridesLightHostAppearance() throws {

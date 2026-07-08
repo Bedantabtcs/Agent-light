@@ -6,7 +6,6 @@ enum AmbientBulbMotion {
     static let restingGlowOpacity = 0.62
     static let activeGlowOpacity = 1.0
     static let duration = 2.4
-    static let iconFrameSide: CGFloat = 48
 
     static func glowOpacity(isPulsing: Bool, reduceMotion: Bool) -> Double {
         guard !reduceMotion else { return activeGlowOpacity }
@@ -61,13 +60,8 @@ public struct AmbientBulbView: View {
                 .overlay {
                     Circle().stroke(color.opacity(isHighContrast ? 1 : 0.65), lineWidth: 2)
                 }
-            Image(systemName: state.bulbSymbolName)
-                .resizable()
-                .scaledToFit()
-                .frame(
-                    width: AmbientBulbMotion.iconFrameSide,
-                    height: AmbientBulbMotion.iconFrameSide
-                )
+            Image(systemName: AgentState.ambientBulbSymbolName)
+                .font(.system(size: 48, weight: .medium))
                 .foregroundStyle(.white)
                 .shadow(color: color.opacity(0.9), radius: isHighContrast ? 8 : 18)
         }
