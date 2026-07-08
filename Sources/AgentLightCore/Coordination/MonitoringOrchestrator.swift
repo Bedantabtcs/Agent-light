@@ -228,11 +228,17 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         let lifecycleGeneration: UInt64
     }
 
+    private struct TerminalIdentityKey: Hashable, Sendable {
+        let source: AgentSource
+        let sessionID: String
+    }
+
     private struct PhysicalCommandRequest: Equatable, Sendable {
         let desired: DesiredLightState
         let winner: AgentEvent
         let winnerGeneration: UInt64
         let acceptanceEpoch: UInt64
+        let terminalIdentityKey: TerminalIdentityKey
         let terminalMutationEpoch: UInt64
         let terminalTimerToken: AppliedTerminalToken?
         let operationID: UUID
@@ -253,7 +259,8 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     private var desiredGeneration: UInt64 = 0
     private var desiredWinnerSequence: UInt64?
     private var acceptanceEpoch: UInt64 = 0
-    private var terminalMutationEpoch: UInt64 = 0
+    private var terminalMutationEpochs: [TerminalIdentityKey: UInt64] = [:]
+    private var activePhysicalCommandKey: TerminalIdentityKey?
     private var lifecycleRequest: UInt64 = 0
     private var lifecycleRequestWaiters: [(UInt64, CheckedContinuation<Void, Never>)] = []
     private var lifecycleTail: MonitoringResultCompletion?
@@ -1179,19 +1186,29 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         if let reconnectID, reconnectOperation?.id == reconnectID {
             reconnectOperation?.phase = .applying
         }
+        let terminalIdentityKey = TerminalIdentityKey(
+            source: winner.source,
+            sessionID: winner.sessionID
+        )
         let commandRequest = PhysicalCommandRequest(
             desired: desired,
             winner: winner,
             winnerGeneration: winnerGeneration,
             acceptanceEpoch: commandAcceptanceEpoch,
-            terminalMutationEpoch: terminalMutationEpoch,
+            terminalIdentityKey: terminalIdentityKey,
+            terminalMutationEpoch: terminalMutationEpochs[terminalIdentityKey, default: 0],
             terminalTimerToken: activeTerminalTimerToken(for: winner),
             operationID: id,
             lifecycleGeneration: token,
             reconnectID: reconnectID
         )
+        activePhysicalCommandKey = terminalIdentityKey
         throttleOperationStarted = true
         let outcome = await apply(commandRequest)
+        if activePhysicalCommandKey == terminalIdentityKey {
+            activePhysicalCommandKey = nil
+        }
+        pruneTerminalMutationEpochs()
         throttleOperationStarted = false
         finishThrottle(id: id)
 
@@ -1554,7 +1571,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         guard let commandRequest else { return }
         guard commandRequest.winnerGeneration == desiredGeneration,
               commandRequest.acceptanceEpoch == acceptanceEpoch,
-              commandRequest.terminalMutationEpoch == terminalMutationEpoch,
+              commandRequest.terminalIdentityKey == TerminalIdentityKey(
+                  source: commandRequest.winner.source,
+                  sessionID: commandRequest.winner.sessionID
+              ),
+              commandRequest.terminalMutationEpoch
+                == terminalMutationEpochs[commandRequest.terminalIdentityKey, default: 0],
               desiredWinnerSequence == commandRequest.winner.sequence,
               latestSessionSequence[commandRequest.winner.sessionID]
                 == commandRequest.winner.sequence,
@@ -1669,8 +1691,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
               generation == token.lifecycleGeneration,
               latestSessionSequence[token.sessionID] == token.sequence,
               terminalTasks[token.sessionID]?.token == token else { return }
-        terminalMutationEpoch = Self.requiredNextCounterValue(
-            after: terminalMutationEpoch,
+        let identityKey = TerminalIdentityKey(
+            source: token.source,
+            sessionID: token.sessionID
+        )
+        terminalMutationEpochs[identityKey] = Self.requiredNextCounterValue(
+            after: terminalMutationEpochs[identityKey, default: 0],
             name: "terminal mutation epoch"
         )
         terminalTasks[token.sessionID] = nil
@@ -1776,7 +1802,28 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             sessions: sessions,
             connection: connection
         )
+        pruneTerminalMutationEpochs()
         subscribers.yield(snapshot)
+    }
+
+    private func pruneTerminalMutationEpochs() {
+        var retainedKeys = Set(snapshot.sessions.map {
+            TerminalIdentityKey(source: $0.source, sessionID: $0.sessionID)
+        })
+        for timer in terminalTasks.values {
+            retainedKeys.insert(
+                TerminalIdentityKey(
+                    source: timer.token.source,
+                    sessionID: timer.token.sessionID
+                )
+            )
+        }
+        if let activePhysicalCommandKey {
+            retainedKeys.insert(activePhysicalCommandKey)
+        }
+        terminalMutationEpochs = terminalMutationEpochs.filter {
+            retainedKeys.contains($0.key)
+        }
     }
 
     private func stableWinnerSnapshot(
@@ -2019,5 +2066,6 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         }
         terminalTasks.removeAll()
         lastAppliedTerminalToken = nil
+        terminalMutationEpochs.removeAll()
     }
 }

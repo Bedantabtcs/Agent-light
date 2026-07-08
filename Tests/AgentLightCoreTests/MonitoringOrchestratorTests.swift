@@ -567,6 +567,56 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await reconnect.value
     }
 
+    func testUnrelatedTerminalExpiryPreservesWinnerSuspendedAtFinalPermitNow() async throws {
+        let clock = ManualClock()
+        let light = RecordingLightController(
+            attemptClock: clock,
+            applyResults: [.success(()), .success(())]
+        )
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+
+        await orchestrator.accept(
+            makeEvent(source: .codex, session: "terminal-a", state: .completed)
+        )
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await orchestrator.waitForLastApplied(desired(.completed))
+        await clock.waitForSleepCount(2)
+
+        await orchestrator.accept(
+            makeEvent(source: .claudeCode, session: "winner-b", state: .working)
+        )
+        await clock.waitForSleepCount(3)
+        await clock.blockNextNow()
+        await clock.advance(by: .seconds(1))
+        await clock.waitUntilNowIsBlocked()
+
+        await clock.advance(by: .seconds(7))
+        await XCTAssertAsyncTrue(await eventually {
+            let sessions = await orchestrator.currentSnapshot().sessions
+            return sessions.count == 1
+                && sessions.first?.source == .claudeCode
+                && sessions.first?.sessionID == "winner-b"
+        })
+        await clock.releaseNow()
+        await clock.waitUntilBlockedNowCompletes()
+
+        await XCTAssertAsyncTrue(await eventually {
+            await light.appliedStates().count == 2
+        })
+        await drainScheduledTasks(iterations: 200)
+        await XCTAssertAsyncEqual(
+            await light.appliedStates(),
+            [desired(.completed), desired(.working)]
+        )
+        await XCTAssertAsyncEqual(
+            await light.commandAttemptNanoseconds,
+            [1_000_000_000, 9_000_000_000]
+        )
+    }
+
     func testEveryCommandAttemptIsAtLeastOneSecondApart() async throws {
         let clock = ManualClock()
         let light = RecordingLightController(

@@ -126,6 +126,38 @@ The final review finding was addressed with another deterministic RED/GREEN cycl
 
 Next phase: Task 6 — bounded recovery-generation rotation. Use the ready-to-paste Task 6 prompt above in a fresh chat or agent so this reviewed Task 5 state remains a clean checkpoint.
 
+## Cross-session terminal-invalidation correction
+
+The cross-session review finding was addressed with a deterministic RED/GREEN cycle.
+
+### Cross-session RED evidence
+
+- `testUnrelatedTerminalExpiryPreservesWinnerSuspendedAtFinalPermitNow` applied terminal A with an active hold, selected B from a different source and session, and suspended B at final `clock.now()`.
+- A then expired completely, including coordinator removal and snapshot refresh, while B remained the exact winner with unchanged desired generation.
+- The global terminal-mutation epoch incorrectly invalidated B. Before the correction, only A entered the controller at t=1 second; B never entered at t=9 seconds.
+
+### Cross-session implementation
+
+- Terminal mutation epochs are keyed by exact `(AgentSource, sessionID)` identity instead of one global counter.
+- `PhysicalCommandRequest` captures only its winner identity key and that key's current epoch. Synchronous post-`clock.now()` validation compares only the captured winner key.
+- Valid expiry advances only the expiring token's identity epoch before token removal or the first await. Same-terminal expiry still invalidates a suspended reapply; unrelated expiry cannot invalidate the current winner.
+- Epoch tombstones are retained while their identity appears in the current snapshot, owns an active terminal timer, or has the active physical request. Snapshot refresh and request completion prune obsolete entries; lifecycle terminal reset clears the map.
+
+### Cross-session verification
+
+- Same-terminal invalidation and unrelated-terminal preservation regressions: 2 tests, 0 failures.
+- Six timer/dispatch/epoch/gate/terminal-identity regressions: 20/20 stress iterations passed.
+- `swift test --filter MonitoringOrchestratorTests`: 112 tests, 0 failures.
+- `swift test --filter EndToEndPipelineTests`: 3 tests, 0 failures.
+- `swift test --parallel --num-workers 2`: 526 tests executed, exit 0. A four-worker run hit only the known unrelated relay subprocess wall-clock threshold (0.78 seconds versus 0.2 seconds); the isolated test passed in 0.070 seconds before the clean two-worker run.
+- `swift build -c release`: passed.
+- `./scripts/build-app.sh release`: passed.
+- Code-sign verification and plist validation: passed.
+
+## Next Step
+
+Next phase: Task 6 — bounded recovery-generation rotation. Use the ready-to-paste Task 6 prompt above in a fresh chat or agent so this reviewed Task 5 state remains a clean checkpoint.
+
 ## Final timer-invalidation correction
 
 The final terminal-expiry race was addressed with a deterministic RED/GREEN cycle.
