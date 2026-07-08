@@ -454,6 +454,55 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await newer.value
     }
 
+    func testRetryIntervalStartsAtControllerEntryAfterBlockedFinalValidation() async throws {
+        let coordinator = SnapshotBlockingSessionCoordinator()
+        let clock = ManualClock()
+        let light = RecordingLightController(
+            attemptClock: clock,
+            applyResults: [.failure(.transient), .failure(.transient), .success(())]
+        )
+        await light.setApplyBlocked(true)
+        let orchestrator = MonitoringOrchestrator(
+            light: light,
+            recoveryStore: MemoryRecoveryStore(),
+            coordinator: coordinator,
+            clock: clock,
+            jitter: { _ in .zero },
+            isTransient: { ($0 as? TestLightError) == .transient }
+        )
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await light.releaseApply()
+        await clock.waitForSleepCount(2)
+
+        await coordinator.blockCurrentWinner(afterCalls: 2)
+        await clock.advance(by: .seconds(1))
+        await coordinator.waitUntilCurrentWinnerIsBlocked()
+        await clock.advance(by: .seconds(5))
+        await coordinator.releaseCurrentWinner()
+        await light.waitForOperationCount(3)
+        await drainScheduledTasks(iterations: 500)
+
+        let entriesBeforeFinalRetry = await light.commandAttemptNanoseconds
+        if entriesBeforeFinalRetry.count == 3 {
+            XCTAssertGreaterThanOrEqual(
+                entriesBeforeFinalRetry[2] - entriesBeforeFinalRetry[1],
+                1_000_000_000
+            )
+            return
+        }
+        XCTAssertEqual(entriesBeforeFinalRetry, [1_000_000_000, 7_000_000_000])
+
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+        let allEntries = await light.commandAttemptNanoseconds
+        XCTAssertEqual(allEntries, [1_000_000_000, 7_000_000_000, 8_000_000_000])
+    }
+
     func testEveryCommandAttemptIsAtLeastOneSecondApart() async throws {
         let clock = ManualClock()
         let light = RecordingLightController(

@@ -91,3 +91,37 @@ Review findings were addressed with a second RED/GREEN cycle.
 - `swift build -c release`: passed.
 - `./scripts/build-app.sh release`: passed.
 - Code-sign verification and plist validation: passed.
+
+## Final dispatch-timestamp correction
+
+The final review finding was addressed with another deterministic RED/GREEN cycle.
+
+### Final RED evidence
+
+- `testRetryIntervalStartsAtControllerEntryAfterBlockedFinalValidation` blocked the final stable-winner lookup after a rate sleep, advanced `ManualClock` by five seconds while blocked, then released it and forced a transient controller failure.
+- Before the correction, the following retry entered the controller at the same instant as the failed attempt. The assertion failed with an observed gap of 0 ns instead of the required 1,000,000,000 ns, proving that the permit timestamp was captured before the blocked async validation rather than at physical dispatch.
+
+### Final correction implementation
+
+- Every physical apply attempt completes stable async winner validation before reading its dispatch instant.
+- After the dispatch-time `clock.now()` returns, the actor performs only synchronous checks: task cancellation, lifecycle/throttle/reconnect context, desired generation, acceptance epoch, and exact desired/winner request identity.
+- The exact identity includes desired state, full winner event, winner generation, acceptance epoch, throttle operation, lifecycle generation, and reconnect operation. It is checked against the actor's current snapshot and per-session sequence before permit consumption.
+- The post-validation instant is stored as `lastCommandAttempt`, followed immediately by controller dispatch in the same actor continuation. No async winner lookup occurs between timestamp capture and controller entry.
+
+### Final correction verification
+
+- New deterministic regression: passed after first failing with a 0 ns retry gap.
+- `swift test --filter MonitoringOrchestratorTests`: 110 tests, 0 failures.
+- Five dispatch/epoch/gate/hold/terminal-identity regressions: 20/20 stress iterations passed.
+- `swift test --filter EndToEndPipelineTests`: 3 tests, 0 failures.
+- `swift test --parallel`: 524 tests executed, exit 0 on the final run. An initial run had one unrelated relay subprocess wall-clock threshold failure under parallel load (0.64 seconds versus 0.2 seconds); the isolated test passed in 0.07 seconds and the immediate full rerun passed.
+- `swift build -c release`: passed.
+- `./scripts/build-app.sh release`: passed.
+- `codesign --verify --deep --strict "build/Agent Light.app"`: passed.
+- `plutil -lint "build/Agent Light.app/Contents/Info.plist"`: OK.
+- `git diff --check`: passed.
+- Changed-source scans found no debug logging, dynamic evaluation, hardcoded access-secret/private-key material, or backup/reject artifacts; no orphaned Swift/XCTest processes remain.
+
+## Next Step
+
+Next phase: Task 6 — bounded recovery-generation rotation. Use the ready-to-paste Task 6 prompt above in a fresh chat or agent so this reviewed Task 5 state remains a clean checkpoint.

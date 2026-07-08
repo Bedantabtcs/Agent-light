@@ -228,6 +228,16 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
         let lifecycleGeneration: UInt64
     }
 
+    private struct PhysicalRequestIdentity: Equatable, Sendable {
+        let desired: DesiredLightState
+        let winner: AgentEvent
+        let winnerGeneration: UInt64
+        let acceptanceEpoch: UInt64
+        let operationID: UUID
+        let lifecycleGeneration: UInt64
+        let reconnectID: UUID?
+    }
+
     private let light: any TuyaLightControlling
     private let recoveryStore: any MonitoringRecoveryStoring
     private let coordinator: any SessionCoordinating
@@ -1267,8 +1277,15 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             }
 
             try await retryPhysicalValue(
-                expectedDesiredGeneration: winnerGeneration,
-                expectedAcceptanceEpoch: acceptanceEpoch,
+                requestIdentity: PhysicalRequestIdentity(
+                    desired: desired,
+                    winner: winner,
+                    winnerGeneration: winnerGeneration,
+                    acceptanceEpoch: acceptanceEpoch,
+                    operationID: operationID,
+                    lifecycleGeneration: token,
+                    reconnectID: reconnectID
+                ),
                 isStillCurrent: {
                     await self.isCurrent(
                         desired,
@@ -1469,8 +1486,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
     }
 
     private func retryPhysicalValue<T: Sendable>(
-        expectedDesiredGeneration: UInt64? = nil,
-        expectedAcceptanceEpoch: UInt64? = nil,
+        requestIdentity: PhysicalRequestIdentity? = nil,
         isStillCurrent: @escaping @Sendable () async -> Bool = { true },
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
@@ -1482,8 +1498,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             do {
                 return try await performPhysicalAttempt(
                     additionalDelay: additionalDelay,
-                    expectedDesiredGeneration: expectedDesiredGeneration,
-                    expectedAcceptanceEpoch: expectedAcceptanceEpoch,
+                    requestIdentity: requestIdentity,
                     isStillCurrent: isStillCurrent,
                     operation: operation
                 )
@@ -1497,14 +1512,12 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
 
     private func performPhysicalAttempt<T: Sendable>(
         additionalDelay: Duration,
-        expectedDesiredGeneration: UInt64?,
-        expectedAcceptanceEpoch: UInt64?,
+        requestIdentity: PhysicalRequestIdentity?,
         isStillCurrent: @escaping @Sendable () async -> Bool,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await validatePhysicalAttempt(
-            expectedDesiredGeneration: expectedDesiredGeneration,
-            expectedAcceptanceEpoch: expectedAcceptanceEpoch,
+        try await validatePhysicalAttemptAsynchronously(
+            requestIdentity: requestIdentity,
             isStillCurrent: isStillCurrent
         )
         if let lastCommandAttempt {
@@ -1514,44 +1527,47 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
             if elapsed < requiredInterval {
                 try await clock.sleep(for: requiredInterval - elapsed)
             }
-            try await validatePhysicalAttempt(
-                expectedDesiredGeneration: expectedDesiredGeneration,
-                expectedAcceptanceEpoch: expectedAcceptanceEpoch,
+            try await validatePhysicalAttemptAsynchronously(
+                requestIdentity: requestIdentity,
                 isStillCurrent: isStillCurrent
             )
         }
-        let attemptInstant = await clock.now()
-        try await validatePhysicalAttempt(
-            expectedDesiredGeneration: expectedDesiredGeneration,
-            expectedAcceptanceEpoch: expectedAcceptanceEpoch,
+        try await validatePhysicalAttemptAsynchronously(
+            requestIdentity: requestIdentity,
             isStillCurrent: isStillCurrent
         )
+        let attemptInstant = await clock.now()
+        try validatePhysicalAttemptSynchronously(requestIdentity: requestIdentity)
         lastCommandAttempt = attemptInstant
         return try await operation()
     }
 
-    private func validatePhysicalAttempt(
-        expectedDesiredGeneration: UInt64?,
-        expectedAcceptanceEpoch: UInt64?,
+    private func validatePhysicalAttemptAsynchronously(
+        requestIdentity: PhysicalRequestIdentity?,
         isStillCurrent: @escaping @Sendable () async -> Bool
     ) async throws {
-        try Task.checkCancellation()
-        guard expectedDesiredGeneration == nil
-            || expectedDesiredGeneration == desiredGeneration else {
-            throw CancellationError()
-        }
-        guard expectedAcceptanceEpoch == nil
-            || expectedAcceptanceEpoch == acceptanceEpoch else {
-            throw CancellationError()
-        }
+        try validatePhysicalAttemptSynchronously(requestIdentity: requestIdentity)
         guard await isStillCurrent() else { throw CancellationError() }
+        try validatePhysicalAttemptSynchronously(requestIdentity: requestIdentity)
+    }
+
+    private func validatePhysicalAttemptSynchronously(
+        requestIdentity: PhysicalRequestIdentity?
+    ) throws {
         try Task.checkCancellation()
-        guard expectedDesiredGeneration == nil
-            || expectedDesiredGeneration == desiredGeneration else {
-            throw CancellationError()
-        }
-        guard expectedAcceptanceEpoch == nil
-            || expectedAcceptanceEpoch == acceptanceEpoch else {
+        guard let requestIdentity else { return }
+        guard requestIdentity.winnerGeneration == desiredGeneration,
+              requestIdentity.acceptanceEpoch == acceptanceEpoch,
+              desiredWinnerSequence == requestIdentity.winner.sequence,
+              latestSessionSequence[requestIdentity.winner.sessionID]
+                == requestIdentity.winner.sequence,
+              snapshot.sessions.first == requestIdentity.winner,
+              requestIdentity.winner.state.color == requestIdentity.desired.color,
+              isSendContextCurrent(
+                  operationID: requestIdentity.operationID,
+                  generation: requestIdentity.lifecycleGeneration,
+                  reconnectID: requestIdentity.reconnectID
+              ) else {
             throw CancellationError()
         }
     }
