@@ -55,3 +55,39 @@ Ready-to-paste prompt:
 ```text
 Implement Task 6 from .superpowers/sdd/task-6-brief.md using strict TDD. Preserve Tasks 1–5, especially recovery CAS semantics, physical terminal holds, and the shared one-second physical command-attempt gate. Run the named focused tests, full recovery/orchestrator suites, deterministic stress, full parallel suite, release verification, diff/security/orphan scans, write .superpowers/sdd/task-6-report.md, and commit locally without push. Do not touch live bulbs, credentials, HOME configuration, login items, the installed application, or GitHub.
 ```
+
+## Review correction
+
+Review findings were addressed with a second RED/GREEN cycle.
+
+### Additional RED evidence
+
+- A repeated same-session Completed event was deduplicated solely because its color matched the prior command; no second physical apply, committed save, or fresh timer occurred.
+- Equivalent repeated Error and cross-source/cross-session Completed/Error regressions exposed the same color-only identity gap.
+- After a successful terminal apply followed by committed-save failure, reconnect treated matching bulb color as sufficient and completed without reapplying, committing, or starting a hold.
+- With the old command suspended in the final `clock.now()`, a newer accept blocked at its first coordinator await did not change desired generation yet; the stale command consumed the permit and reached the controller.
+- Boundary tests initially failed to compile because counter overflow handling and ManualClock saturation did not exist.
+
+### Correction implementation
+
+- Terminal dedup now requires the exact source/session/sequence/winner-generation/lifecycle-generation token to be both the last durably applied terminal identity and the owner of an active terminal timer. A new terminal identity always performs a gated physical command and durable commit before its fresh hold begins.
+- Physical success followed by committed-save failure clears terminal identity. Matching-color reconnect therefore reapplies, commits, and only then schedules the hold.
+- `acceptanceEpoch` advances synchronously before `accept`'s first await. Physical attempts carry the captured epoch.
+- The gate owns validation, permit consumption, and physical dispatch. It revalidates cancellation, generation, acceptance epoch, and stable winner after the rate sleep and again after the final monotonic `now()` suspension; stale work exits before updating the last-attempt instant or calling the controller.
+- UInt64 monitoring counters use checked increment with an explicit exhaustion precondition instead of wrapping.
+- ManualClock deadline, advancement, and Duration conversion arithmetic saturate at Int64 boundaries.
+- Main Completed/Error tests now wait for terminal-timer sleep registration before advancing ManualClock.
+
+### Correction verification
+
+- Correction-focused and original timing/gate tests: 12 tests, 0 failures.
+- `swift test --filter MonitoringOrchestratorTests`: 109 tests, 0 failures.
+- Completed hold stress: 20/20.
+- Shared command gate stress: 20/20.
+- Final-permit acceptance-epoch race stress: 20/20.
+- Repeated terminal-identity stress: 20/20.
+- `swift test --filter EndToEndPipelineTests`: 3 tests, 0 failures.
+- `swift test --parallel`: 523 tests executed, exit 0.
+- `swift build -c release`: passed.
+- `./scripts/build-app.sh release`: passed.
+- Code-sign verification and plist validation: passed.

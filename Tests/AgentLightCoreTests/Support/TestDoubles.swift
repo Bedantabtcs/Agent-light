@@ -23,6 +23,15 @@ actor ManualClock: AgentLightClock {
     private var sleepRegistrationBlockedWaiters: [CheckedContinuation<Void, Never>] = []
     private var sleepRegistrationCompleted = false
     private var sleepRegistrationCompletedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var shouldBlockNextNow = false
+    private var blockedNow: CheckedContinuation<Void, Never>?
+    private var nowBlockedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var nowCompleted = false
+    private var nowCompletedWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(nowNanoseconds: Int64 = 0) {
+        self.nowNanoseconds = nowNanoseconds
+    }
 
     func sleep(for duration: Duration) async throws {
         let id = UUID()
@@ -49,7 +58,7 @@ actor ManualClock: AgentLightClock {
             try await withCheckedThrowingContinuation { continuation in
                 sleepers[id] = Sleeper(
                     id: id,
-                    deadline: nowNanoseconds + nanoseconds,
+                    deadline: saturatingAddition(nowNanoseconds, nanoseconds),
                     continuation: continuation
                 )
             }
@@ -59,7 +68,7 @@ actor ManualClock: AgentLightClock {
     }
 
     func advance(by duration: Duration) async {
-        nowNanoseconds += duration.nanoseconds
+        nowNanoseconds = saturatingAddition(nowNanoseconds, duration.nanoseconds)
         let ready = sleepers.values.filter { $0.deadline <= nowNanoseconds }
         for sleeper in ready {
             sleepers.removeValue(forKey: sleeper.id)
@@ -71,8 +80,21 @@ actor ManualClock: AgentLightClock {
         nowNanoseconds
     }
 
-    func now() -> Duration {
-        .nanoseconds(nowNanoseconds)
+    func now() async -> Duration {
+        if shouldBlockNextNow {
+            shouldBlockNextNow = false
+            let waiters = nowBlockedWaiters
+            nowBlockedWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            await withCheckedContinuation { continuation in
+                blockedNow = continuation
+            }
+            nowCompleted = true
+            let completedWaiters = nowCompletedWaiters
+            nowCompletedWaiters.removeAll()
+            for waiter in completedWaiters { waiter.resume() }
+        }
+        return .nanoseconds(nowNanoseconds)
     }
 
     func sleeperCount() -> Int {
@@ -115,6 +137,30 @@ actor ManualClock: AgentLightClock {
         }
     }
 
+    func blockNextNow() {
+        shouldBlockNextNow = true
+        nowCompleted = false
+    }
+
+    func waitUntilNowIsBlocked() async {
+        if blockedNow != nil { return }
+        await withCheckedContinuation { continuation in
+            nowBlockedWaiters.append(continuation)
+        }
+    }
+
+    func releaseNow() {
+        blockedNow?.resume()
+        blockedNow = nil
+    }
+
+    func waitUntilBlockedNowCompletes() async {
+        if nowCompleted { return }
+        await withCheckedContinuation { continuation in
+            nowCompletedWaiters.append(continuation)
+        }
+    }
+
     private func cancel(id: UUID) {
         guard let sleeper = sleepers.removeValue(forKey: id) else { return }
         sleeper.continuation.resume(throwing: CancellationError())
@@ -134,10 +180,18 @@ private extension Duration {
     var nanoseconds: Int64 {
         let components = self.components
         let seconds = components.seconds.multipliedReportingOverflow(by: 1_000_000_000)
-        precondition(!seconds.overflow)
+        if seconds.overflow {
+            return components.seconds >= 0 ? Int64.max : Int64.min
+        }
         let attoseconds = components.attoseconds / 1_000_000_000
-        return seconds.partialValue + attoseconds
+        return saturatingAddition(seconds.partialValue, attoseconds)
     }
+}
+
+private func saturatingAddition(_ left: Int64, _ right: Int64) -> Int64 {
+    let result = left.addingReportingOverflow(right)
+    guard result.overflow else { return result.partialValue }
+    return right >= 0 ? Int64.max : Int64.min
 }
 
 actor RecordingLightController: TuyaLightControlling {

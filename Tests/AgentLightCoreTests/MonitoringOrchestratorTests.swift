@@ -163,6 +163,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
 
         await clock.advance(by: .seconds(1))
         await orchestrator.waitForLastApplied(desired(.completed))
+        await clock.waitForSleepCount(2)
 
         await clock.advance(by: .milliseconds(7_999))
         await drainScheduledTasks()
@@ -193,6 +194,7 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await drainScheduledTasks()
         await clock.advance(by: .seconds(1))
         await orchestrator.waitForLastApplied(desired(.error))
+        await clock.waitForSleepCount(3)
 
         await clock.advance(by: .milliseconds(11_999))
         await drainScheduledTasks()
@@ -259,6 +261,197 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await clock.advance(by: .seconds(4))
         await light.waitForOperationCount(4)
         await XCTAssertAsyncEqual(await light.restoreCount(), 1)
+    }
+
+    func testRepeatedSameSessionCompletedRequiresFreshApplyCommitAndHold() async throws {
+        let clock = ManualClock()
+        let light = RecordingLightController(attemptClock: clock)
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(session: "same", state: .completed))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await clock.waitForSleepCount(2)
+
+        await orchestrator.accept(makeEvent(session: "same", state: .completed))
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await drainScheduledTasks(iterations: 500)
+        guard await light.appliedStates().count == 2 else {
+            XCTFail("Repeated Completed identity was deduplicated by color")
+            return
+        }
+        await clock.waitForSleepCount(4)
+
+        await clock.advance(by: .milliseconds(7_999))
+        await drainScheduledTasks()
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .completed)
+        await XCTAssertAsyncEqual(await light.restoreCount(), 0)
+        await clock.advance(by: .milliseconds(1))
+        await light.waitForOperationCount(4)
+        await XCTAssertAsyncEqual(await light.appliedStates().count, 2)
+    }
+
+    func testRepeatedSameSessionErrorRequiresFreshApplyCommitAndHold() async throws {
+        let clock = ManualClock()
+        let light = RecordingLightController(attemptClock: clock)
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(session: "same", state: .error))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await clock.waitForSleepCount(2)
+
+        await orchestrator.accept(makeEvent(session: "same", state: .error))
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await drainScheduledTasks(iterations: 500)
+        guard await light.appliedStates().count == 2 else {
+            XCTFail("Repeated Error identity was deduplicated by color")
+            return
+        }
+        await clock.waitForSleepCount(4)
+
+        await clock.advance(by: .milliseconds(11_999))
+        await drainScheduledTasks()
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .error)
+        await XCTAssertAsyncEqual(await light.restoreCount(), 0)
+        await clock.advance(by: .milliseconds(1))
+        await light.waitForOperationCount(4)
+        await XCTAssertAsyncEqual(await light.appliedStates().count, 2)
+    }
+
+    func testCrossSourceSessionCompletedSameColorRequiresFreshApplyAndHold() async throws {
+        let clock = ManualClock()
+        let light = RecordingLightController(attemptClock: clock)
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(source: .codex, session: "first", state: .completed))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await clock.waitForSleepCount(2)
+
+        await orchestrator.accept(makeEvent(source: .cursor, session: "second", state: .completed))
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await drainScheduledTasks(iterations: 500)
+        guard await light.appliedStates().count == 2 else {
+            XCTFail("Cross-source Completed identity was deduplicated by color")
+            return
+        }
+        await clock.waitForSleepCount(4)
+
+        await clock.advance(by: .seconds(7))
+        await drainScheduledTasks()
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .completed)
+        await XCTAssertAsyncEqual(await light.restoreCount(), 0)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+        await XCTAssertAsyncEqual(await light.appliedStates().count, 2)
+    }
+
+    func testCrossSourceSessionErrorSameColorRequiresFreshApplyAndHold() async throws {
+        let clock = ManualClock()
+        let light = RecordingLightController(attemptClock: clock)
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(source: .codex, session: "first", state: .error))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await clock.waitForSleepCount(2)
+
+        await orchestrator.accept(makeEvent(source: .cursor, session: "second", state: .error))
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await drainScheduledTasks(iterations: 500)
+        guard await light.appliedStates().count == 2 else {
+            XCTFail("Cross-source Error identity was deduplicated by color")
+            return
+        }
+        await clock.waitForSleepCount(4)
+
+        await clock.advance(by: .seconds(11))
+        await drainScheduledTasks()
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .error)
+        await XCTAssertAsyncEqual(await light.restoreCount(), 0)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+        await XCTAssertAsyncEqual(await light.appliedStates().count, 2)
+    }
+
+    func testReconnectAfterTerminalCommitFailureReappliesCommitsThenStartsHold() async throws {
+        let clock = ManualClock()
+        let light = RecordingLightController(attemptClock: clock)
+        let store = MemoryRecoveryStore(saveFailureCalls: [3])
+        let orchestrator = makeOrchestrator(light: light, store: store, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .completed))
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(2)
+        await orchestrator.waitForConnection(.disconnected)
+
+        let completions = CompletionCounter()
+        let reconnect = Task {
+            await orchestrator.reconnect()
+            await completions.increment()
+        }
+        await clock.waitForSleepCount(2)
+        await clock.advance(by: .seconds(1))
+        await drainScheduledTasks(iterations: 5_000)
+        guard await completions.value() == 0 else {
+            XCTFail("Reconnect deduplicated a terminal color without a durable committed identity")
+            await reconnect.value
+            return
+        }
+        await clock.waitForSleepCount(3)
+        await clock.advance(by: .seconds(1))
+        await light.waitForOperationCount(4)
+        await reconnect.value
+        await clock.waitForSleepCount(4)
+
+        await clock.advance(by: .milliseconds(7_999))
+        await drainScheduledTasks()
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .completed)
+        await clock.advance(by: .milliseconds(1))
+        await light.waitForOperationCount(5)
+        await XCTAssertAsyncEqual(await light.appliedStates().count, 2)
+    }
+
+    func testAcceptEpochInvalidatesCommandSuspendedAtFinalPermitNow() async throws {
+        let coordinator = BlockingSessionCoordinator()
+        let clock = ManualClock()
+        let light = RecordingLightController(attemptClock: clock)
+        let orchestrator = MonitoringOrchestrator(
+            light: light,
+            recoveryStore: MemoryRecoveryStore(),
+            coordinator: coordinator,
+            clock: clock,
+            jitter: { _ in .zero },
+            isTransient: { ($0 as? TestLightError) == .transient }
+        )
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .thinking))
+        await clock.waitForSleepCount(1)
+        await clock.blockNextNow()
+        await clock.advance(by: .seconds(1))
+        await clock.waitUntilNowIsBlocked()
+
+        await coordinator.blockNextAccept()
+        let newer = Task { await orchestrator.accept(makeEvent(state: .working)) }
+        await coordinator.waitUntilAcceptIsBlocked()
+        await clock.releaseNow()
+        await clock.waitUntilBlockedNowCompletes()
+        await drainScheduledTasks()
+
+        await XCTAssertAsyncEqual(await light.appliedStates(), [])
+        await XCTAssertAsyncEqual(await light.commandAttemptNanoseconds, [])
+        await coordinator.releaseAccept()
+        await newer.value
     }
 
     func testEveryCommandAttemptIsAtLeastOneSecondApart() async throws {
@@ -2525,6 +2718,24 @@ final class MonitoringOrchestratorTests: XCTestCase {
         XCTAssertTrue(MonitoringOrchestrator.defaultTransientClassifier(TuyaClientError.httpStatus(503)))
         XCTAssertFalse(MonitoringOrchestrator.defaultTransientClassifier(TuyaClientError.httpStatus(400)))
         XCTAssertFalse(MonitoringOrchestrator.defaultTransientClassifier(TuyaClientError.authenticationFailure))
+    }
+
+    func testCounterIncrementReportsBoundaryInsteadOfWrapping() {
+        XCTAssertEqual(
+            MonitoringOrchestrator.nextCounterValue(after: UInt64.max - 1),
+            UInt64.max
+        )
+        XCTAssertNil(MonitoringOrchestrator.nextCounterValue(after: UInt64.max))
+    }
+
+    func testManualClockSaturatesNanosecondArithmeticAtBoundaries() async {
+        let upper = ManualClock(nowNanoseconds: Int64.max - 1)
+        await upper.advance(by: .nanoseconds(10))
+        await XCTAssertAsyncEqual(await upper.currentNanoseconds(), Int64.max)
+
+        let lower = ManualClock(nowNanoseconds: Int64.min + 1)
+        await lower.advance(by: .nanoseconds(-10))
+        await XCTAssertAsyncEqual(await lower.currentNanoseconds(), Int64.min)
     }
 
     func testOlderAcceptCannotInstallTerminalTimerAfterNewerSameSessionEvent() async throws {
