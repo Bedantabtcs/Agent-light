@@ -49,6 +49,28 @@ final class SessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(winner?.state, .error)
     }
 
+    func testCancelledExpiryRemovesExactSequence() async {
+        let coordinator = SessionCoordinator()
+        await coordinator.accept(event(source: .codex, session: "same", state: .cancelled, sequence: 1))
+
+        await coordinator.expireTerminalState(source: .codex, sessionID: "same", sequence: 1)
+
+        let snapshots = await coordinator.snapshots()
+        XCTAssertEqual(snapshots, [])
+    }
+
+    func testCancelledExpiryCannotRemoveNewerReadingEventForSameIdentity() async {
+        let coordinator = SessionCoordinator()
+        await coordinator.accept(event(source: .codex, session: "same", state: .cancelled, sequence: 1))
+        await coordinator.accept(event(source: .codex, session: "same", state: .reading, sequence: 2))
+
+        await coordinator.expireTerminalState(source: .codex, sessionID: "same", sequence: 1)
+
+        let winner = await coordinator.currentWinner()
+        XCTAssertEqual(winner?.sequence, 2)
+        XCTAssertEqual(winner?.state, .reading)
+    }
+
     func testTerminalExpiryCannotRemoveNewerNonterminalEventForSameIdentity() async {
         let coordinator = SessionCoordinator()
         await coordinator.accept(event(source: .codex, session: "same", state: .completed, sequence: 1))

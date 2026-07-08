@@ -36,4 +36,11 @@ public enum AgentState: String, Codable, Sendable {
         case .idle: nil
         }
     }
+
+    public var isTerminal: Bool {
+        switch self {
+        case .completed, .cancelled, .error: true
+        default: false
+        }
+    }
 }

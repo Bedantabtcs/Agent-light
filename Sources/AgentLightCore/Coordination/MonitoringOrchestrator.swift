@@ -1779,13 +1779,11 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
 
     private func maximumTerminalHold(for command: DesiredLightState?) -> TimeInterval? {
         guard let command else { return nil }
-        if let color = AgentState.completed.color,
-           command == DesiredLightState(color: color) {
-            return terminalHoldInterval(for: .completed)
-        }
-        if let color = AgentState.error.color,
-           command == DesiredLightState(color: color) {
-            return terminalHoldInterval(for: .error)
+        for state in [AgentState.completed, .cancelled, .error] {
+            if let color = state.color,
+               command == DesiredLightState(color: color) {
+                return terminalHoldInterval(for: state)
+            }
         }
         return nil
     }
@@ -1849,7 +1847,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
 
     private func terminalHold(for state: AgentState) -> Duration? {
         switch state {
-        case .completed: .seconds(8)
+        case .completed, .cancelled: .seconds(8)
         case .error: .seconds(12)
         default: nil
         }
@@ -1857,7 +1855,7 @@ public actor MonitoringOrchestrator: MonitoringOrchestrating {
 
     private func terminalHoldInterval(for state: AgentState) -> TimeInterval? {
         switch state {
-        case .completed: 8
+        case .completed, .cancelled: 8
         case .error: 12
         default: nil
         }

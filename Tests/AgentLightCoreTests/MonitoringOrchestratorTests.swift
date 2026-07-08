@@ -178,6 +178,28 @@ final class MonitoringOrchestratorTests: XCTestCase {
         await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .idle)
     }
 
+    func testCancelledPhysicalHoldLastsEightSeconds() async throws {
+        let clock = ManualClock()
+        let light = RecordingLightController(attemptClock: clock)
+        let orchestrator = makeOrchestrator(light: light, clock: clock)
+        try await orchestrator.start()
+        await orchestrator.accept(makeEvent(state: .cancelled))
+        await clock.waitForSleepCount(1)
+
+        await clock.advance(by: .seconds(1))
+        await orchestrator.waitForLastApplied(desired(.cancelled))
+        await clock.waitForSleepCount(2)
+
+        await clock.advance(by: .milliseconds(7_999))
+        await drainScheduledTasks()
+        await XCTAssertAsyncEqual(await light.restoreCount(), 0)
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .cancelled)
+
+        await clock.advance(by: .milliseconds(1))
+        await XCTAssertAsyncTrue(await eventually { await light.restoreCount() == 1 })
+        await XCTAssertAsyncEqual((await orchestrator.currentSnapshot()).state, .idle)
+    }
+
     func testErrorPhysicalHoldStartsAfterSuccessfulRetry() async throws {
         let clock = ManualClock()
         let light = RecordingLightController(
@@ -241,6 +263,38 @@ final class MonitoringOrchestratorTests: XCTestCase {
         let record = MonitoringRecoveryRecord(
             baseline: .testBaseline,
             lastCommand: desired(.completed),
+            terminal: MonitoringTerminalRecovery(
+                appliedAt: applied,
+                deadline: applied.addingTimeInterval(8)
+            )
+        )
+        let light = RecordingLightController(matchResults: [.success(true), .success(true)])
+        let store = MemoryRecoveryStore(record: record)
+        let clock = ManualClock()
+        let orchestrator = makeOrchestrator(
+            light: light,
+            store: store,
+            clock: clock,
+            wallNow: { applied.addingTimeInterval(3) }
+        )
+
+        let recovery = Task { try await orchestrator.recoverIfNeeded() }
+        await clock.waitForSleepCount(1)
+        await clock.advance(by: .milliseconds(4_999))
+        await drainScheduledTasks()
+        await XCTAssertAsyncEqual(await light.restoreCount(), 0)
+        await clock.advance(by: .milliseconds(1))
+        try await recovery.value
+
+        await XCTAssertAsyncEqual(await light.restoreCount(), 1)
+        await XCTAssertAsyncNil(await store.storedRecord())
+    }
+
+    func testCancelledRecoveryHonorsRemainingEightSecondPhysicalTerminalHold() async throws {
+        let applied = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = MonitoringRecoveryRecord(
+            baseline: .testBaseline,
+            lastCommand: desired(.cancelled),
             terminal: MonitoringTerminalRecovery(
                 appliedAt: applied,
                 deadline: applied.addingTimeInterval(8)

@@ -36,7 +36,7 @@ public actor SessionCoordinator {
         guard let event = sessions[identity], event.sequence == sequence else {
             return
         }
-        guard event.state == .completed || event.state == .error else {
+        guard event.state.isTerminal else {
             return
         }
 
@@ -48,7 +48,7 @@ public actor SessionCoordinator {
         var matchedIdentity: SessionIdentity?
         for (identity, event) in sessions where identity.sessionID == sessionID
             && event.sequence == sequence
-            && (event.state == .completed || event.state == .error) {
+            && event.state.isTerminal {
             guard matchedIdentity == nil else { return }
             matchedIdentity = identity
         }
