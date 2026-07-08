@@ -25,6 +25,11 @@ public enum RelayInputSanitizer {
         let workspace = string(in: object, keys: ["cwd", "workspace_root", "workspace"])
             .map { URL(fileURLWithPath: $0).lastPathComponent }
         let status = string(in: object, keys: ["status", "reason", "notification_type"])
+        let activity = RelayActivityClassifier.classify(
+            source: options.source,
+            event: options.event,
+            object: object
+        )
 
         return try RelayEnvelope(
             version: 1,
@@ -34,7 +39,8 @@ public enum RelayInputSanitizer {
             sessionID: session,
             workspace: workspace,
             status: status,
-            emittedAtMilliseconds: nowMilliseconds
+            emittedAtMilliseconds: nowMilliseconds,
+            activity: activity
         ).validated()
     }
 

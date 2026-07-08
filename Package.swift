@@ -20,7 +20,11 @@ let package = Package(
             name: "AgentLightRelay",
             dependencies: ["AgentLightCore", "AgentLightProtocol"]
         ),
-        .testTarget(name: "AgentLightProtocolTests", dependencies: ["AgentLightProtocol"]),
+        .testTarget(
+            name: "AgentLightProtocolTests",
+            dependencies: ["AgentLightProtocol"],
+            resources: [.process("Fixtures")]
+        ),
         .testTarget(
             name: "AgentLightCoreTests",
             dependencies: ["AgentLightCore"],
