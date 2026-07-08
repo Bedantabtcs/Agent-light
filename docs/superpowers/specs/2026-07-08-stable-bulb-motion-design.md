@@ -1,7 +1,7 @@
 # Agent Light Stable Bulb Motion
 
 **Date:** 2026-07-08  
-**Status:** Approved design; written-spec review pending
+**Status:** Approved
 
 ## Problem
 
