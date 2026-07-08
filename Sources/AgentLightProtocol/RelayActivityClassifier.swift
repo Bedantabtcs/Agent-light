@@ -35,16 +35,19 @@ enum RelayActivityClassifier {
         guard isToolStart(source: source, event: event) else { return nil }
         guard let object else { return .working }
 
-        let toolName = uniqueBoundedString(
+        let toolNameResolution = uniqueBoundedString(
             in: object,
             paths: toolNamePaths(for: source),
             maximumBytes: maximumToolNameBytes
         )
+        if case .invalid = toolNameResolution { return .working }
+
+        let toolName = toolNameResolution.value
         let command = uniqueBoundedString(
             in: object,
             paths: commandPaths(for: source),
             maximumBytes: maximumCommandBytes
-        )
+        ).value
 
         if let toolName, isReadingTool(toolName) { return .reading }
         if let toolName, isEditingTool(toolName) { return .editing }
@@ -85,7 +88,7 @@ enum RelayActivityClassifier {
         in object: [String: Any],
         paths: [[String]],
         maximumBytes: Int
-    ) -> String? {
+    ) -> BoundedStringResolution {
         var resolvedValue: String?
 
         for path in paths {
@@ -93,7 +96,7 @@ enum RelayActivityClassifier {
             case .absent:
                 continue
             case .invalid:
-                return nil
+                return .invalid
             case let .value(value):
                 guard
                     resolvedValue == nil,
@@ -101,13 +104,14 @@ enum RelayActivityClassifier {
                     !value.isEmpty,
                     value.utf8.count <= maximumBytes
                 else {
-                    return nil
+                    return .invalid
                 }
                 resolvedValue = value
             }
         }
 
-        return resolvedValue
+        guard let resolvedValue else { return .absent }
+        return .value(resolvedValue)
     }
 
     private static func resolveValue(
@@ -131,6 +135,17 @@ enum RelayActivityClassifier {
         case absent
         case invalid
         case value(Any)
+    }
+
+    private enum BoundedStringResolution {
+        case absent
+        case invalid
+        case value(String)
+
+        var value: String? {
+            guard case let .value(value) = self else { return nil }
+            return value
+        }
     }
 
     private static func isReadingTool(_ toolName: String) -> Bool {

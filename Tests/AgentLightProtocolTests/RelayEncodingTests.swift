@@ -244,6 +244,35 @@ final class RelayEncodingTests: XCTestCase {
         }
     }
 
+    func testBeforeShellExecutionRequiresTrulyAbsentToolNameForCommandOnlyTesting() throws {
+        let invalidToolNames: [[String: Any]] = [
+            ["toolName": 42],
+            ["toolName": ""],
+            [
+                "toolName": String(
+                    repeating: "a",
+                    count: RelayActivityClassifier.maximumToolNameBytes + 1
+                )
+            ],
+            ["toolName": "terminal", "tool_name": "terminal"],
+            ["toolName": "terminal", "tool_name": 42]
+        ]
+
+        for invalidToolName in invalidToolNames {
+            var input = invalidToolName
+            input["session_id"] = "session"
+            input["command"] = "swift test"
+            let data = try JSONSerialization.data(withJSONObject: input)
+            let envelope = try RelayInputSanitizer.makeEnvelope(
+                arguments: validArguments(source: "cursor", event: "beforeShellExecution"),
+                input: data,
+                nowMilliseconds: 1
+            )
+
+            XCTAssertEqual(envelope.activity, .working)
+        }
+    }
+
     func testSanitizerDoesNotEncodeRawActivityInputs() throws {
         let cases: [(AgentSource, String, [String: Any])] = [
             (
