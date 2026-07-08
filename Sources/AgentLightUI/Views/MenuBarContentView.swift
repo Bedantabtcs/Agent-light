@@ -320,20 +320,3 @@ extension AgentSource {
         }
     }
 }
-
-extension AgentState {
-    var symbolName: String {
-        switch self {
-        case .thinking: "brain.head.profile"
-        case .working: "hammer.fill"
-        case .reading: "book.closed.fill"
-        case .editing: "pencil"
-        case .testing: "checkmark.seal.fill"
-        case .needsYou: "person.crop.circle.badge.exclamationmark"
-        case .completed: "checkmark.circle.fill"
-        case .cancelled: "xmark.octagon.fill"
-        case .error: "exclamationmark.triangle.fill"
-        case .idle: "moon.zzz"
-        }
-    }
-}

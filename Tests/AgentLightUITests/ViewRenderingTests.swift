@@ -23,6 +23,21 @@ final class ViewRenderingTests: XCTestCase {
         }
     }
 
+    func testActivityStatePresentationIsExplicit() {
+        let cases: [(AgentState, String, String, String)] = [
+            (.reading, "Reading", "book.closed.fill", "book.closed.fill"),
+            (.editing, "Editing", "pencil", "pencil"),
+            (.testing, "Testing", "checkmark.seal.fill", "checkmark.seal.fill"),
+            (.cancelled, "Cancelled", "xmark.octagon.fill", "xmark.octagon.fill")
+        ]
+
+        for (state, label, symbol, bulbSymbol) in cases {
+            XCTAssertEqual(state.displayName, label)
+            XCTAssertEqual(state.symbolName, symbol)
+            XCTAssertEqual(state.bulbSymbolName, bulbSymbol)
+        }
+    }
+
     func testMenuBarContentOverridesLightHostAppearance() throws {
         NSApplication.shared.setActivationPolicy(.regular)
         let hosting = NSHostingView(rootView: AmbientDarkAppearance {

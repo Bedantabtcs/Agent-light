@@ -44,7 +44,7 @@ public struct AmbientBulbView: View {
                 .overlay {
                     Circle().stroke(color.opacity(isHighContrast ? 1 : 0.65), lineWidth: 2)
                 }
-            Image(systemName: symbolName)
+            Image(systemName: state.bulbSymbolName)
                 .font(.system(size: 48, weight: .medium))
                 .foregroundStyle(.white)
                 .shadow(color: color.opacity(0.9), radius: isHighContrast ? 8 : 18)
@@ -60,36 +60,5 @@ public struct AmbientBulbView: View {
         .accessibilityIdentifier("ambientBulb.status")
         .accessibilityLabel("Light state")
         .accessibilityValue(state.displayName)
-    }
-
-    private var symbolName: String {
-        switch state {
-        case .reading: "book.closed.fill"
-        case .editing: "pencil"
-        case .testing: "checkmark.seal.fill"
-        case .needsYou: "lightbulb.led.fill"
-        case .completed: "checkmark.circle.fill"
-        case .cancelled: "xmark.octagon.fill"
-        case .error: "exclamationmark.triangle.fill"
-        case .idle: "lightbulb.slash"
-        case .thinking, .working: "lightbulb.led.fill"
-        }
-    }
-}
-
-extension AgentState {
-    var displayName: String {
-        switch self {
-        case .thinking: "Thinking"
-        case .working: "Working"
-        case .reading: "Reading"
-        case .editing: "Editing"
-        case .testing: "Testing"
-        case .needsYou: "Needs You"
-        case .completed: "Completed"
-        case .cancelled: "Cancelled"
-        case .error: "Error"
-        case .idle: "Idle"
-        }
     }
 }
