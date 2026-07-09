@@ -10,6 +10,21 @@ import AgentLightUI
 
 @MainActor
 final class AppEnvironmentTests: XCTestCase {
+    func testMenuWindowDisablesAutomaticPresentationAnimation() {
+        let hosting = NSHostingView(rootView: MenuWindowAnimationDisabler())
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 540),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.animationBehavior = .utilityWindow
+        window.contentView = hosting
+        hosting.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(window.animationBehavior, .none)
+    }
+
     func testEveryStartupStateUsesStablePanelSize() {
         for status: AppEnvironmentStatus in [.loading, .failed, .credentialResetFailed] {
             let hosting = NSHostingView(rootView: StartupStatusView(

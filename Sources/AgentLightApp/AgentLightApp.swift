@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import AgentLightUI
 
@@ -34,8 +35,24 @@ struct AgentLightApp: App {
                     }
                 }
             }
+            .background(MenuWindowAnimationDisabler())
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+struct MenuWindowAnimationDisabler: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        WindowAnimationDisablingView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+private final class WindowAnimationDisablingView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.animationBehavior = .none
     }
 }
 
