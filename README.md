@@ -1,51 +1,109 @@
 # Agent Light
 
-Agent Light is a dark-mode macOS menu-bar app that reflects the newest local Codex, Claude Code, or Cursor agent state on one Wipro bulb through the Tuya Developer Platform. It maps agent and activity states to the approved palette, then restores the bulb's previous state.
+Agent Light is a dark-mode macOS menu-bar app that turns a Tuya-compatible color light into a real-time activity indicator for Codex, Claude Code, and Cursor. It maps reading, editing, testing, completion, errors, and other agent states to distinct colors, then restores the light's previous state.
 
-This repository is under local development. The app bundle is ad-hoc signed, not notarized, and is ready for local testing only after the manual acceptance checks below. Building or installing the app never pushes to GitHub; no GitHub push occurs automatically.
+The current build has been tested with a Wipro RGB bulb connected through the Tuya cloud. Compatibility with other models depends on their advertised Tuya datapoints, described below.
+
+The app bundle is built and ad-hoc signed on the user's Mac. It is not notarized or distributed as a prebuilt release.
 
 ## Prerequisites
 
 - macOS 14 or newer.
-- Xcode with the Swift 6.2 toolchain and Command Line Tools selected.
-- A Tuya Developer Platform cloud project containing the Wipro bulb, with permission to read its specification and control it.
+- Xcode with Swift 6.2 or newer and Command Line Tools selected.
+- A Tuya Developer Platform cloud project containing the target light, with permission to read its specification, read its status, and send commands.
 - The Tuya Access ID, Access Secret, Device ID, and data center that match that project. Keep these values out of source files and terminal commands.
 - Codex, Claude Code, or Cursor only for the corresponding manual integration checks. The automated suite uses sanitized fixtures.
 
-## Build and test
+Agent Light currently runs only on macOS. Windows and Linux are not supported.
 
-Run the complete automated suite:
+## Supported smart lights
+
+Agent Light supports Tuya cloud-connected RGB, RGBW, and other HSV-capable color lights that expose the standard lighting datapoints below. Brand name alone does not determine compatibility.
+
+Required datapoints:
+
+| Code | Tuya type | Purpose |
+| --- | --- | --- |
+| `switch_led` | Boolean | Turn the light on or off. |
+| `colour_data_v2` or `colour_data` | JSON | Set HSV color and brightness. |
+
+Optional datapoints:
+
+- `work_mode`, as an Enum containing `colour`.
+- `bright_value_v2` or `bright_value`.
+- `temp_value_v2` or `temp_value`.
+
+The light can connect directly over Wi-Fi or through a Tuya-compatible gateway, provided the individual light appears in the cloud project's device list and advertises the required datapoints. The setup verifier reads the live specification and status before saving credentials.
+
+Commonly unsupported devices include:
+
+- White-only or dimmable lights without an HSV color datapoint.
+- Bluetooth-only lights that are not reachable through the Tuya cloud.
+- Non-Tuya lights, local-only devices, or models using proprietary datapoint codes instead of the standard codes above.
+- Devices whose project region, app account, or API permissions do not match the selected Tuya data center.
+
+## Set up Tuya Developer Platform
+
+1. Pair the light in the **Smart Life** or **Tuya Smart** mobile app. Confirm that power and color control work there before continuing.
+2. Sign in to the [Tuya Developer Platform](https://developer.tuya.com/) using a developer account.
+3. Open **Cloud > Cloud Project > Project Management**, upgrade or activate the IoT Core plan if Tuya requests it, and create a cloud project.
+4. Set **Development Method** to **Smart Home**. Choose the data center that matches the region of the mobile-app account; this must also match the data center selected in Agent Light.
+5. In the project's cloud services, subscribe to and authorize **IoT Core**, **Smart Home Basic Service**, and **Country and City Info**. Tuya may add other default services automatically.
+6. Open **Devices > Link App Account**, choose **Add App Account** and **Tuya App Account Authorization**, then scan the QR code with the same Smart Life or Tuya Smart account that owns the light.
+7. Open **Devices > All Devices** and confirm the light appears. Copy its **Device ID**.
+8. Open the project's overview or authorization-key section and copy the **Access ID/Client ID** and **Access Secret/Client Secret**. Do not place these values in source files, shell commands, screenshots, or GitHub issues.
+
+Tuya's current walkthrough is available in [Request Tuya Cloud API Key](https://developer.tuya.com/en/docs/developer/apply-cloud-api-key?id=Kff30z8sv62ah). The broader project flow is documented in [Smart Home Quick Start](https://developer.tuya.com/en/docs/iot/smart-home-quick-start?id=Kbvwrxn6mngbd).
+
+## Build and run on a Mac
+
+Clone the repository:
+
+```bash
+git clone https://github.com/Bedantabtcs/Agent-light.git
+cd Agent-light
+```
+
+Confirm the active Swift toolchain:
+
+```bash
+swift --version
+xcode-select -p
+```
+
+Run the automated tests:
 
 ```bash
 swift test --parallel
 ```
 
-Build an ad-hoc-signed debug app at `build/Agent Light.app`:
-
-```bash
-./scripts/build-app.sh debug
-```
-
-The build script accepts only `debug` or `release`, compiles both `AgentLight` and `AgentLightRelay`, replaces the previous local bundle, and signs it ad hoc. It does not read Tuya credentials or modify agent configuration.
-
-For local use, build and install the canonical runtime:
+Build and install the release app:
 
 ```bash
 ./scripts/install-local.sh
 ```
 
-Agent Light runs from `~/Applications/Agent Light.app`. The installer quits the prior instance, verifies a staged release bundle, safely replaces the canonical bundle, and opens only that location. On startup, receipt-verified reconciliation updates only Agent Light-owned hook commands when a prior development bundle used a different relay path. Matching hook paths cause no hook or ownership-receipt writes.
+The installer builds `AgentLight` and `AgentLightRelay`, signs the bundle locally, installs it at `~/Applications/Agent Light.app`, replaces only an earlier install at that path, and opens the app. Agent Light appears in the macOS menu bar rather than the Dock.
+
+For a debug bundle without installing it:
+
+```bash
+./scripts/build-app.sh debug
+```
+
+The debug app is written to `build/Agent Light.app`. The build scripts accept only `debug` or `release`; they do not read Tuya credentials.
+
+### Complete setup in Agent Light
+
+1. Open the menu-bar lightbulb icon.
+2. Select the Tuya data center matching the cloud project.
+3. Enter the Access ID, Access Secret, and Device ID.
+4. Select **Verify & Connect**. Verification discovers and validates the light's advertised power and color capabilities without sending a light command.
+5. Review the proposed Codex, Claude Code, and Cursor hook changes, then approve them if the paths are correct.
+6. For Codex, run `/hooks`, review and trust the Agent Light hook, then select **I Confirmed in Codex** in Agent Light. Claude Code and Cursor do not use this Codex-specific trust step.
+7. Run an agent prompt or a test command and confirm the light changes color. Pausing monitoring or quitting the app restores the captured pre-monitoring light state when it is still safe to do so.
 
 The installer does not register a login item. Agent Light enables launch at login only after the user verifies the bulb and approves the in-app integration review. Settings can disable launch at login without disconnecting the bulb, removing hooks, or stopping monitoring.
-
-## Tuya setup
-
-1. In the Tuya Developer Platform, confirm the Wipro bulb is online and linked to the intended cloud project.
-2. Confirm the project's data center. Agent Light permits only the listed Tuya API origins shown in onboarding; arbitrary endpoints are rejected before signing.
-3. Open Agent Light and choose the matching data center.
-4. Enter the Access ID, Access Secret, and Device ID in the app. Do not paste them into this repository, a shell command, or an issue.
-5. Select **Verify & Connect**. Agent Light validates credentials and discovers the bulb's advertised power, mode, and color capabilities without issuing a light command.
-6. Review the exact hook paths and before/after summaries. Approve only if the changes are expected.
 
 Invalid credentials, unsupported schemas, and invalid endpoints remain in onboarding and are not saved. Verified values are stored in the user's macOS Keychain under the Agent Light service only after the integration review is approved.
 
