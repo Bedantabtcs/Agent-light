@@ -131,13 +131,13 @@ Agent Light records only that the user confirmed this step; it cannot verify or 
 | --- | --- | --- |
 | Thinking | Violet | `#8B5CF6` |
 | Working | Blue | `#3B82F6` |
-| Reading | Cyan | `#06B6D4` |
-| Editing | Teal | `#14B8A6` |
+| Reading | Electric cyan | `#00FFFF` |
+| Editing | Yellow | `#FFFF00` |
 | Testing | Pink | `#EC4899` |
 | Needs You | Amber | `#F59E0B` |
 | Completed | Green | `#22C55E` |
-| Cancelled | Orange | `#F97316` |
-| Error | Red | `#EF4444` |
+| Cancelled | Pale orange | `#FFD2A6` |
+| Error | Pure red | `#FF0000` |
 
 All monitoring colors use 80% value/brightness.
 

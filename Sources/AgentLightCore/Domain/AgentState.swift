@@ -26,13 +26,13 @@ public enum AgentState: String, Codable, Sendable {
         switch self {
         case .thinking: RGBColor(hex: 0x8B5CF6)
         case .working: RGBColor(hex: 0x3B82F6)
-        case .reading: RGBColor(hex: 0x06B6D4)
-        case .editing: RGBColor(hex: 0x14B8A6)
+        case .reading: RGBColor(hex: 0x00FFFF)
+        case .editing: RGBColor(hex: 0xFFFF00)
         case .testing: RGBColor(hex: 0xEC4899)
         case .needsYou: RGBColor(hex: 0xF59E0B)
         case .completed: RGBColor(hex: 0x22C55E)
-        case .cancelled: RGBColor(hex: 0xF97316)
-        case .error: RGBColor(hex: 0xEF4444)
+        case .cancelled: RGBColor(hex: 0xFFD2A6)
+        case .error: RGBColor(hex: 0xFF0000)
         case .idle: nil
         }
     }
